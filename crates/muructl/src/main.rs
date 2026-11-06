@@ -18,6 +18,7 @@ mod print_config;
 mod project_commands;
 mod provision;
 mod pstats;
+mod render;
 mod run_admin;
 mod serve;
 mod serve_admin;
@@ -102,6 +103,9 @@ enum Command {
 
     /// Create a release from a source directory and move traffic to it.
     Deploy(Box<admin::DeployArgs>),
+
+    /// Write the release a command line describes as a file to apply, without a daemon.
+    Render(Box<render::RenderArgs>),
 
     /// Manage applications.
     App {
@@ -625,13 +629,6 @@ struct RunArgs {
     #[arg(long)]
     print_config: bool,
 
-    /// Write this run in the daemon's format (appendix C) to standard
-    /// output instead of running. Hidden until the path from a
-    /// development run to the daemon is worked out: the output restates
-    /// what the project's file already says.
-    #[arg(long, hide = true, conflicts_with = "print_config")]
-    print_daemon_config: bool,
-
     /// The project settings file muructl serve was given, read in place
     /// of the one beside the code (section 13.9).
     #[arg(skip)]
@@ -928,7 +925,8 @@ fn main() -> anyhow::Result<()> {
         Command::Runtime { command } => runtime.block_on(provision::run(command)),
         Command::Secret { command } => runtime.block_on(admin::secret(command)),
         Command::Logging { command } => runtime.block_on(admin::logging(command)),
-        Command::Deploy(args) => runtime.block_on(admin::deploy(*args)),
+        Command::Deploy(args) => exit_with(runtime, admin::deploy(*args)),
+        Command::Render(args) => render::render(*args),
         Command::App { command } => runtime.block_on(async move {
             match command {
                 admin::AppCommand::List { socket, output } => {
@@ -1270,22 +1268,6 @@ pub(crate) struct HostTimeouts {
     pub loop_stall: Duration,
     /// How long a worker may run no Python, or send no report.
     pub gil_stall: Duration,
-}
-
-impl HostTimeouts {
-    /// The timeouts as a `[timeouts]` table, for --print-config.
-    pub fn table(&self) -> muru_config::Timeouts {
-        muru_config::Timeouts {
-            soft_timeout: self.soft.map(muru_config::format_duration),
-            hard_timeout: self.hard.map(muru_config::format_duration),
-            hard_drain_grace: Some(muru_config::format_duration(self.hard_drain_grace)),
-            shutdown_timeout: Some(muru_config::format_duration(self.shutdown)),
-            websocket_drain_grace: Some(muru_config::format_duration(self.websocket_drain_grace)),
-            loop_stall_timeout: Some(muru_config::format_duration(self.loop_stall)),
-            gil_stall_timeout: Some(muru_config::format_duration(self.gil_stall)),
-            ..muru_config::Timeouts::default()
-        }
-    }
 }
 
 /// The limits a table sets on the requests it serves (section 4.6), as
@@ -1691,18 +1673,13 @@ struct Resolved {
     /// Section 4.9: the application's own directories of files, the
     /// table's with the flags' over them by prefix.
     static_dirs: Vec<muru_config::StaticDir>,
-    /// Section 4.12: the error pages, override and maintenance
-    /// exemptions from the table.
+    /// Section 4.12: the error pages and the override from the table.
     error_pages: std::collections::BTreeMap<String, muru_config::ErrorPage>,
     error_override: Option<muru_config::ErrorOverride>,
-    maintenance: Option<muru_config::Maintenance>,
     /// The memory table (section 7.7).
     memory: Option<muru_config::Memory>,
     /// Environment variables from the table (section 10.8).
     env: std::collections::BTreeMap<String, muru_config::EnvValue>,
-    /// The scaling table (sections 7.2 and 7.4), written out by
-    /// --print-config; a development run never scales.
-    scaling: Option<muru_config::Scaling>,
     /// How the run serves (section 13.1).
     serving: Serving,
     /// The tables as they were read, for --print-config.
@@ -1955,7 +1932,6 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         static_dirs,
         error_pages: table.error_pages,
         error_override: table.error_override,
-        maintenance: table.maintenance,
         logging: table.logging,
         max_requests,
         max_lifetime: match (args.max_lifetime, &table.max_lifetime) {
@@ -1969,158 +1945,9 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         timeouts: table.timeouts,
         memory: table.memory,
         env: table.env,
-        scaling: table.scaling,
         serving,
         layers,
     })
-}
-
-/// The declarative file equivalent to this run, for the hidden
-/// --print-daemon-config: the release as section 6.8 would define it,
-/// the listeners and the limits.
-fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
-    use muru_config::{App, Document, Listener, Release};
-
-    let name = app_name(&resolved.entrypoint).replace('_', "-");
-    let limits = limits(args, resolved);
-    let (http, https) = addresses(args, &resolved.serving);
-    let mut listeners = vec![Listener {
-        address: http.to_string(),
-        tls: false,
-        h2c: None,
-        limits: None,
-        proxy: None,
-    }];
-
-    if resolved.serving.tls() {
-        listeners.push(Listener {
-            address: https.to_string(),
-            tls: true,
-            h2c: None,
-            limits: None,
-            proxy: None,
-        });
-    }
-
-    // The table's own limits on a request are written with the node's,
-    // in the [limits] table below.
-
-    let release = Release {
-        max_body_size: None,
-        grpc_web_origins: resolved.grpc_web_origins.clone(),
-        kind: None,
-        profile: None,
-        command: Vec::new(),
-        cwd: None,
-        bind: None,
-        instances: None,
-        readiness: None,
-        stop_signal: None,
-        source: Some(resolved.project.display().to_string()),
-        entrypoint: resolved.entrypoint.clone(),
-        interface: (resolved.interface != muru_config::Interface::Auto)
-            .then_some(resolved.interface),
-        reflection: resolved.reflection.then_some(true),
-        handoff: resolved.handoff,
-        factory: resolved.factory.map(|_| true),
-        factory_phase: resolved.factory,
-        python: Some(written_interpreter(
-            &interpreter(args, resolved, false)?.python,
-            &resolved.project,
-        )),
-        build: resolved.build.clone(),
-        bytecode: None,
-        processes: Some(resolved.processes),
-        threads: Some(resolved.threads),
-        sync_threads: Some(resolved.sync_threads),
-        concurrency: Some(resolved.concurrency),
-        preload: Some(resolved.preload),
-        hooks: resolved.hooks.clone(),
-        groups: resolved.groups.clone(),
-        mounts: resolved.mounts.clone(),
-        accel_redirect: resolved.accel_redirect.then_some(true),
-        cgi_local_redirect: resolved.cgi_local_redirect.then_some(true),
-        sendfile_roots: resolved.sendfile_roots.clone(),
-        sendfile_header: resolved.sendfile_header.clone(),
-        static_dirs: resolved.static_dirs.clone(),
-        error_pages: resolved.error_pages.clone(),
-        error_override: resolved.error_override.clone(),
-        maintenance: resolved.maintenance.clone(),
-        logging: resolved.logging.clone(),
-        max_requests: resolved.max_requests,
-        max_lifetime: resolved.max_lifetime.map(muru_config::format_duration),
-        env: resolved.env.clone(),
-        scaling: resolved.scaling.clone(),
-        timeouts: {
-            let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
-            (timeouts.soft.is_some() || timeouts.hard.is_some() || resolved.timeouts.is_some())
-                .then(|| timeouts.table())
-        },
-        memory: {
-            let policy = memory_policy(&args.memory, resolved.memory.as_ref())?;
-            (policy != muru_controller::model::MemoryPolicy::default()).then(|| {
-                muru_config::Memory {
-                    measure: Some(policy.measure),
-                    soft_limit: policy.soft_limit.map(muru_config::format_size),
-                    soft_for: Some(muru_config::format_duration(Duration::from_millis(
-                        policy.soft_for_ms,
-                    ))),
-                    reclaim_first: Some(policy.reclaim_first),
-                    hard_limit: policy.hard_limit.map(muru_config::format_size),
-                    check_interval: Some(muru_config::format_duration(Duration::from_millis(
-                        policy.check_interval_ms,
-                    ))),
-                }
-            })
-        },
-        // The source's own [tool.muru] table carries its commands.
-        commands: std::collections::BTreeMap::new(),
-    };
-    let document = Document {
-        listener: listeners,
-        compression: (!resolved.serving.compression).then(|| muru_config::Compression {
-            enabled: Some(false),
-            ..Default::default()
-        }),
-        limits: Some(muru_config::Limits {
-            max_body_size: Some(muru_config::format_size(limits.max_body_size)),
-            max_header_bytes: Some(muru_config::format_size(limits.max_header_bytes as u64)),
-            max_headers: Some(limits.max_headers),
-            header_read_timeout: Some(muru_config::format_duration(limits.header_read_timeout)),
-            queue_timeout: Some(muru_config::format_duration(limits.queue_timeout)),
-            request_deadline: Some(muru_config::format_duration(limits.request_deadline)),
-            body_idle_timeout: Some(muru_config::format_duration(limits.body_idle_timeout)),
-            response_idle_timeout: Some(muru_config::format_duration(limits.response_idle_timeout)),
-            max_connections: Some(limits.max_connections),
-            max_connections_per_client: Some(limits.max_connections_per_client),
-            keep_alive_timeout: Some(muru_config::format_duration(limits.keep_alive_timeout)),
-            keep_alive_timeout_proxy: Some(muru_config::format_duration(
-                limits.keep_alive_timeout_proxy,
-            )),
-            max_requests_per_connection: Some(limits.max_requests_per_connection),
-            http2: Some(muru_config::Http2Limits {
-                max_concurrent_streams: Some(limits.http2_max_concurrent_streams),
-            }),
-            spool_quota: None,
-        }),
-        app: std::collections::BTreeMap::from([(
-            name,
-            App {
-                release: std::collections::BTreeMap::from([("r1".to_owned(), release)]),
-                ..App::default()
-            },
-        )]),
-        ..Document::default()
-    };
-    let text = document.to_toml().context("writing the configuration")?;
-    Ok(format!(
-        "# This muructl run in the daemon's format. Save it as {name} and give it\n\
-         # to the daemon with: muructl apply -f {name}\n\
-         # It is not the project's muru.toml, which holds different keys.\n\
-         # The release is written as r1; muructl deploy numbers releases itself.\n\
-         # Listeners and limits belong in the daemon configuration file.\n\n{text}",
-        name = muru_config::DAEMON_FILE
-    ))
 }
 
 /// A host's named groups as the edge connects them: each group's sockets
@@ -2802,20 +2629,6 @@ fn interface_label(interface: &str) -> &str {
     }
 }
 
-/// An interpreter as --print-config writes it: relative to the project
-/// when it is inside it (the project's own .venv), so the file works in
-/// another checkout of the project, else absolute.
-fn written_interpreter(python: &Path, project: &Path) -> String {
-    let project = project
-        .canonicalize()
-        .unwrap_or_else(|_| project.to_path_buf());
-
-    match python.strip_prefix(&project) {
-        Ok(relative) => relative.display().to_string(),
-        Err(_) => python.display().to_string(),
-    }
-}
-
 /// Development mode: one host with forked workers behind an embedded edge,
 /// replaced by a new one when --reload sees a source change.
 async fn run(args: RunArgs) -> anyhow::Result<()> {
@@ -2870,13 +2683,15 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         resolved.threads = 1;
     }
 
-    if args.print_config {
-        print!("{}", print_config::for_run(&args, &resolved));
-        return Ok(());
-    }
+    // The interpreter is found as the run would find it, so that one the
+    // run could not use is refused here with the same words.
 
-    if args.print_daemon_config {
-        print!("{}", declarative(&args, &resolved)?);
+    if args.print_config {
+        let python = interpreter(&args, &resolved, false)?;
+        print!(
+            "{}",
+            print_config::for_run(&args, &resolved, &python.describe())
+        );
         return Ok(());
     }
 

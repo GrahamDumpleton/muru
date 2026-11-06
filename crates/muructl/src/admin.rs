@@ -2504,6 +2504,159 @@ pub async fn up(args: DaemonRunArgs) -> anyhow::Result<()> {
     daemon_start(args).await
 }
 
+/// A release's own settings, as `deploy` and `render` both take them,
+/// so that the two cannot come to differ.
+#[derive(Args)]
+pub struct ReleaseArgs {
+    /// The application as module:callable, else from the source's [tool.muru] table.
+    #[arg(long)]
+    pub(crate) entrypoint: Option<String>,
+
+    /// The interface the entrypoint speaks: auto, wsgi or asgi.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) interface: Option<muru_config::Interface>,
+
+    /// The interpreter: a path, or a version request such as 3.13 that
+    /// the daemon resolves with uv (default: the source's .venv, else
+    /// its own request).
+    #[arg(long)]
+    pub(crate) python: Option<PathBuf>,
+
+    /// When the daemon builds the release's environment from uv.lock:
+    /// auto (the default) when the source has a lock and no .venv, always
+    /// when it has a lock, never.
+    #[arg(long, value_name = "MODE")]
+    pub(crate) build: Option<String>,
+
+    /// An extra the built environment includes; repeatable.
+    #[arg(long = "build-extra", value_name = "NAME")]
+    pub(crate) build_extra: Vec<String>,
+
+    /// A dependency group the built environment includes; repeatable.
+    #[arg(long = "build-group", value_name = "NAME")]
+    pub(crate) build_group: Vec<String>,
+
+    /// Where the release's bytecode goes: redirect (the default, a
+    /// directory of its own under the state directory), source (beside
+    /// the source, as Python does) or off.
+    #[arg(long, value_name = "MODE")]
+    pub(crate) bytecode: Option<String>,
+
+    /// Worker processes.
+    #[arg(long)]
+    pub(crate) processes: Option<u32>,
+
+    /// Application threads per worker.
+    #[arg(long)]
+    pub(crate) threads: Option<u32>,
+
+    /// Threads for synchronous code called from an ASGI application.
+    #[arg(long, value_name = "N")]
+    pub(crate) sync_threads: Option<u32>,
+
+    /// Requests an ASGI worker's event loop takes at once.
+    #[arg(long, value_name = "N")]
+    pub(crate) concurrency: Option<u32>,
+
+    /// The preload mode: auto, true or false.
+    #[arg(long, value_name = "MODE")]
+    pub(crate) preload: Option<muru_config::Preload>,
+
+    /// The hooks module.
+    #[arg(long)]
+    pub(crate) hooks: Option<String>,
+
+    /// The entrypoint is a factory returning the application.
+    #[arg(long)]
+    pub(crate) factory: bool,
+
+    /// Replace a worker after this many requests, with jitter.
+    #[arg(long, value_name = "N")]
+    pub(crate) max_requests: Option<u64>,
+
+    /// Replace a worker after this long, for example 1h, with jitter.
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    pub(crate) max_lifetime: Option<Duration>,
+
+    /// A host timeout as NAME=DURATION: soft (interrupt a request that
+    /// runs this long; off), hard (replace a worker whose request runs
+    /// this long; off), hard_drain_grace (10s), shutdown (5s),
+    /// websocket_drain_grace (how long a stopping worker keeps its open
+    /// WebSockets; 0s), loop_stall (replace an ASGI worker whose event
+    /// loop stalls this long; 10s) or gil_stall (replace a worker in
+    /// which no thread has run Python for this long; 30s). Repeatable.
+    #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
+    pub(crate) timeouts: Vec<(String, Duration)>,
+
+    /// A memory setting as KEY=VALUE: measure (uss, pss or rss),
+    /// soft_limit (for example 800MB), soft_for (2m), reclaim_first
+    /// (true), hard_limit (1200MB) or check_interval (5s). Repeatable.
+    #[arg(long = "memory", value_name = "KEY=VALUE", value_parser = crate::parse_memory_setting)]
+    pub(crate) memory: Vec<(String, String)>,
+
+    /// An environment variable for the workers as NAME=VALUE, over the
+    /// source's [tool.muru.env] table. Repeatable.
+    #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env_setting)]
+    pub(crate) env: Vec<(String, String)>,
+
+    /// A secret for the workers as NAME=STORE:KEY, delivered as the
+    /// variable, or NAME=STORE:KEY:file for a file named by NAME_FILE.
+    /// Repeatable.
+    #[arg(long = "secret", value_name = "NAME=STORE:KEY[:file]", value_parser = parse_secret_setting)]
+    pub(crate) secrets: Vec<(String, String, String, bool)>,
+
+    /// Run an HTTP server of this profile instead of workers: gunicorn,
+    /// uvicorn, granian, mod_wsgi-express, uwsgi or generic, with its
+    /// command after `--`.
+    #[arg(long, value_name = "PROFILE")]
+    pub(crate) server: Option<muru_config::ServerProfile>,
+
+    /// How a managed server's instances bind: unix (the default) or port.
+    #[arg(long, value_name = "MODE")]
+    pub(crate) bind: Option<muru_config::ServerBind>,
+
+    /// How many instances of a managed server's command run (default 1).
+    #[arg(long, value_name = "N")]
+    pub(crate) instances: Option<u32>,
+
+    /// The path probed until a managed server's instance answers 2xx or
+    /// 3xx; any answer makes it ready without one.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) readiness: Option<String>,
+
+    /// How long a managed server's instances get to be ready (default 60s).
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    pub(crate) readiness_timeout: Option<Duration>,
+
+    /// The signal that stops a managed server's instance gracefully
+    /// (TERM, INT, QUIT, HUP, USR1, USR2 or WINCH); required by the
+    /// generic profile, the other profiles know their server's.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) stop_signal: Option<String>,
+
+    /// A directory a path in an X-Muru-Sendfile response header must lie
+    /// in for the edge to serve the file; repeatable (default the table's).
+    #[arg(long = "sendfile-root", value_name = "DIR")]
+    pub(crate) sendfile_roots: Vec<String>,
+
+    /// A second response header honoured as X-Muru-Sendfile is, such as
+    /// X-Sendfile.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) sendfile_header: Option<String>,
+
+    /// A directory of the application's own files the edge serves under
+    /// a path prefix, as PREFIX=DIR with DIR relative to the source, over
+    /// the source's [[tool.muru.static]] entries by prefix. Repeatable.
+    #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = crate::parse_static_setting)]
+    pub(crate) static_dirs: Vec<(String, String)>,
+
+    /// The command of a managed server, after `--`, with `{bind}` where
+    /// it takes its address; without `{bind}` the profile adds the
+    /// server's own flags.
+    #[arg(last = true, value_name = "COMMAND")]
+    command: Vec<String>,
+}
+
 /// What `deploy` takes.
 #[derive(Args)]
 pub struct DeployArgs {
@@ -2513,67 +2666,8 @@ pub struct DeployArgs {
     /// The source directory (default: the current directory).
     source: Option<PathBuf>,
 
-    /// The application as module:callable, else from the source's [tool.muru] table.
-    #[arg(long)]
-    entrypoint: Option<String>,
-
-    /// The interface the entrypoint speaks: auto, wsgi or asgi.
-    #[arg(long, value_name = "NAME")]
-    interface: Option<muru_config::Interface>,
-
-    /// The interpreter: a path, or a version request such as 3.13 that
-    /// the daemon resolves with uv (default: the source's .venv, else its
-    /// own request, else the previous release's).
-    #[arg(long)]
-    python: Option<PathBuf>,
-
-    /// When the daemon builds the release's environment from uv.lock:
-    /// auto (the default) when the source has a lock and no .venv, always
-    /// when it has a lock, never.
-    #[arg(long, value_name = "MODE")]
-    build: Option<String>,
-
-    /// An extra the built environment includes; repeatable.
-    #[arg(long = "build-extra", value_name = "NAME")]
-    build_extra: Vec<String>,
-
-    /// A dependency group the built environment includes; repeatable.
-    #[arg(long = "build-group", value_name = "NAME")]
-    build_group: Vec<String>,
-
-    /// Where the release's bytecode goes: redirect (the default, a
-    /// directory of its own under the state directory), source (beside
-    /// the source, as Python does) or off.
-    #[arg(long, value_name = "MODE")]
-    bytecode: Option<String>,
-
-    /// Worker processes.
-    #[arg(long)]
-    processes: Option<u32>,
-
-    /// Application threads per worker.
-    #[arg(long)]
-    threads: Option<u32>,
-
-    /// Threads for synchronous code called from an ASGI application.
-    #[arg(long, value_name = "N")]
-    sync_threads: Option<u32>,
-
-    /// Requests an ASGI worker's event loop takes at once.
-    #[arg(long, value_name = "N")]
-    concurrency: Option<u32>,
-
-    /// The preload mode: auto, true or false.
-    #[arg(long, value_name = "MODE")]
-    preload: Option<muru_config::Preload>,
-
-    /// The hooks module.
-    #[arg(long)]
-    hooks: Option<String>,
-
-    /// The entrypoint is a factory returning the application.
-    #[arg(long)]
-    factory: bool,
+    #[command(flatten)]
+    settings: ReleaseArgs,
 
     /// The release id (default: generated, r1, r2, ...).
     #[arg(long, value_name = "ID")]
@@ -2610,97 +2704,16 @@ pub struct DeployArgs {
     #[arg(long, value_name = "N")]
     retain_workers: Option<u32>,
 
-    /// Replace a worker after this many requests, with jitter.
-    #[arg(long, value_name = "N")]
-    max_requests: Option<u64>,
-
-    /// Replace a worker after this long, for example 1h, with jitter.
-    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
-    max_lifetime: Option<Duration>,
-
-    /// A host timeout as NAME=DURATION: soft (interrupt a request that
-    /// runs this long; off), hard (replace a worker whose request runs
-    /// this long; off), hard_drain_grace (10s), shutdown (5s),
-    /// websocket_drain_grace (how long a stopping worker keeps its open
-    /// WebSockets; 0s), loop_stall (replace an ASGI worker whose event
-    /// loop stalls this long; 10s) or gil_stall (replace a worker in
-    /// which no thread has run Python for this long; 30s). Repeatable.
-    #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
-    timeouts: Vec<(String, Duration)>,
-
-    /// A memory setting as KEY=VALUE: measure (uss, pss or rss),
-    /// soft_limit (for example 800MB), soft_for (2m), reclaim_first
-    /// (true), hard_limit (1200MB) or check_interval (5s). Repeatable.
-    #[arg(long = "memory", value_name = "KEY=VALUE", value_parser = crate::parse_memory_setting)]
-    memory: Vec<(String, String)>,
-
-    /// An environment variable for the workers as NAME=VALUE, over the
-    /// source's [tool.muru.env] table. Repeatable.
-    #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env_setting)]
-    env: Vec<(String, String)>,
-
-    /// A secret for the workers as NAME=STORE:KEY, delivered as the
-    /// variable, or NAME=STORE:KEY:file for a file named by NAME_FILE.
-    /// Repeatable.
-    #[arg(long = "secret", value_name = "NAME=STORE:KEY[:file]", value_parser = parse_secret_setting)]
-    secrets: Vec<(String, String, String, bool)>,
-
-    /// Run an HTTP server of this profile instead of workers: gunicorn,
-    /// uvicorn, granian, mod_wsgi-express, uwsgi or generic, with its
-    /// command after `--`.
-    #[arg(long, value_name = "PROFILE")]
-    server: Option<muru_config::ServerProfile>,
-
-    /// How a managed server's instances bind: unix (the default) or port.
-    #[arg(long, value_name = "MODE")]
-    bind: Option<muru_config::ServerBind>,
-
-    /// How many instances of a managed server's command run (default 1).
-    #[arg(long, value_name = "N")]
-    instances: Option<u32>,
-
-    /// The path probed until a managed server's instance answers 2xx or
-    /// 3xx; any answer makes it ready without one.
-    #[arg(long, value_name = "PATH")]
-    readiness: Option<String>,
-
-    /// How long a managed server's instances get to be ready (default 60s).
-    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
-    readiness_timeout: Option<Duration>,
-
-    /// The signal that stops a managed server's instance gracefully
-    /// (TERM, INT, QUIT, HUP, USR1, USR2 or WINCH); required by the
-    /// generic profile, the other profiles know their server's.
-    #[arg(long, value_name = "NAME")]
-    stop_signal: Option<String>,
-
-    /// A directory a path in an X-Muru-Sendfile response header must lie
-    /// in for the edge to serve the file; repeatable (default the table's).
-    #[arg(long = "sendfile-root", value_name = "DIR")]
-    sendfile_roots: Vec<String>,
-
-    /// A second response header honoured as X-Muru-Sendfile is, such as
-    /// X-Sendfile.
-    #[arg(long, value_name = "NAME")]
-    sendfile_header: Option<String>,
-
-    /// A directory of the application's own files the edge serves under
-    /// a path prefix, as PREFIX=DIR with DIR relative to the source, over
-    /// the source's [[tool.muru.static]] entries by prefix. Repeatable.
-    #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = crate::parse_static_setting)]
-    static_dirs: Vec<(String, String)>,
+    /// Report what the deploy would do, with where each of the release's
+    /// settings would come from, and change nothing.
+    #[arg(long)]
+    dry_run: bool,
 
     #[command(flatten)]
     socket: SocketArgs,
 
     #[command(flatten)]
     output: JsonArgs,
-
-    /// The command of a managed server, after `--`, with `{bind}` where
-    /// it takes its address; without `{bind}` the profile adds the
-    /// server's own flags.
-    #[arg(last = true, value_name = "COMMAND")]
-    command: Vec<String>,
 }
 
 /// Parse NAME=VALUE for --env.
@@ -2949,8 +2962,132 @@ fn absolute_interpreter(python: &Path, base: Option<&Path>) -> String {
     base.join(python).display().to_string()
 }
 
-/// Deploy a release.
-pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
+impl ReleaseArgs {
+    /// What cannot be asked for together.
+    pub(crate) fn check(&self) -> anyhow::Result<()> {
+        if self.server.is_none() && !self.command.is_empty() {
+            anyhow::bail!("a command after -- needs --server PROFILE");
+        }
+
+        Ok(())
+    }
+
+    /// These settings as the deploy request that carries them, for the
+    /// application and its source, with the interpreter as the caller
+    /// has it written. What says how the deploy is carried out is left
+    /// for the caller to set.
+    pub(crate) fn request(self, app: &str, source: &str, python: String) -> pb::DeployRequest {
+        pb::DeployRequest {
+            app: app.to_owned(),
+            source: source.to_owned(),
+            kind: self.server.map(|_| "http".to_owned()).unwrap_or_default(),
+            profile: self
+                .server
+                .map(|profile| profile.as_str().to_owned())
+                .unwrap_or_default(),
+            command: self.command.clone(),
+            bind: self
+                .bind
+                .map(|bind| bind.as_str().to_owned())
+                .unwrap_or_default(),
+            instances: self.instances,
+            readiness_path: self.readiness.unwrap_or_default(),
+            readiness_timeout_ms: self
+                .readiness_timeout
+                .map(|timeout| timeout.as_millis() as u64),
+            stop_signal: self.stop_signal.unwrap_or_default(),
+            entrypoint: self.entrypoint.unwrap_or_default(),
+            interface: self
+                .interface
+                .map(|value| value.as_str().to_owned())
+                .unwrap_or_default(),
+            python,
+            build_when: self.build.unwrap_or_default(),
+            build_extras: self.build_extra,
+            build_groups: self.build_group,
+            bytecode: self.bytecode.unwrap_or_default(),
+            processes: self.processes,
+            threads: self.threads,
+            sync_threads: self.sync_threads,
+            concurrency: self.concurrency,
+            preload: self
+                .preload
+                .map(|value| value.as_str().to_owned())
+                .unwrap_or_default(),
+            hooks: self.hooks.unwrap_or_default(),
+            factory: self.factory.then_some(true),
+            factory_phase: String::new(),
+            release: String::new(),
+            wait: true,
+            hold: false,
+            override_freeze: false,
+            fresh: false,
+            reflection: None,
+            grpc_web_origins: Vec::new(),
+            retain_ms: None,
+            retain_workers: None,
+            max_requests: self.max_requests,
+            max_lifetime_ms: self
+                .max_lifetime
+                .map(|lifetime| lifetime.as_millis() as u64),
+            soft_timeout_ms: timeout_ms(&self.timeouts, "soft"),
+            accel_redirect: None,
+            cgi_local_redirect: None,
+            sendfile_roots: self.sendfile_roots,
+            sendfile_header: self.sendfile_header,
+            static_dirs: self
+                .static_dirs
+                .iter()
+                .map(|(path, dir)| pb::StaticDir {
+                    path: path.clone(),
+                    dir: dir.clone(),
+                })
+                .collect(),
+            hard_timeout_ms: timeout_ms(&self.timeouts, "hard"),
+            hard_drain_grace_ms: timeout_ms(&self.timeouts, "hard_drain_grace"),
+            shutdown_timeout_ms: timeout_ms(&self.timeouts, "shutdown"),
+            websocket_drain_grace_ms: timeout_ms(&self.timeouts, "websocket_drain_grace"),
+            loop_stall_timeout_ms: timeout_ms(&self.timeouts, "loop_stall"),
+            gil_stall_timeout_ms: timeout_ms(&self.timeouts, "gil_stall"),
+            memory_measure: memory_setting(&self.memory, "measure").unwrap_or_default(),
+            memory_soft_limit: memory_setting(&self.memory, "soft_limit")
+                .and_then(|text| muru_config::parse_size(&text).ok()),
+            memory_soft_for_ms: memory_setting(&self.memory, "soft_for")
+                .and_then(|text| muru_config::parse_duration(&text).ok())
+                .map(|duration| duration.as_millis() as u64),
+            memory_reclaim_first: memory_setting(&self.memory, "reclaim_first")
+                .map(|text| text == "true"),
+            memory_hard_limit: memory_setting(&self.memory, "hard_limit")
+                .and_then(|text| muru_config::parse_size(&text).ok()),
+            memory_check_interval_ms: memory_setting(&self.memory, "check_interval")
+                .and_then(|text| muru_config::parse_duration(&text).ok())
+                .map(|duration| duration.as_millis() as u64),
+            env: self
+                .env
+                .iter()
+                .map(|(name, value)| pb::EnvEntry {
+                    name: name.clone(),
+                    value: value.clone(),
+                    ..Default::default()
+                })
+                .chain(
+                    self.secrets
+                        .iter()
+                        .map(|(name, store, key, as_file)| pb::EnvEntry {
+                            name: name.clone(),
+                            secret_store: store.clone(),
+                            secret_key: key.clone(),
+                            as_file: *as_file,
+                            ..Default::default()
+                        }),
+                )
+                .collect(),
+        }
+    }
+}
+
+/// Deploy a release, or with --dry-run report what deploying it would do.
+pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
     let source = args
         .source
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -2962,125 +3099,49 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         eprintln!("muru: {note}");
     }
 
-    if args.server.is_none() && !args.command.is_empty() {
-        anyhow::bail!("a command after -- needs --server PROFILE");
-    }
-
+    args.settings.check()?;
     let mut client = client::connect(&args.socket.socket()?).await?;
+    let python = args
+        .settings
+        .python
+        .as_deref()
+        .map(|path| absolute_interpreter(path, None))
+        .unwrap_or_default();
 
     let request = pb::DeployRequest {
-        app: args.app.clone(),
-        source: source.display().to_string(),
-        kind: args.server.map(|_| "http".to_owned()).unwrap_or_default(),
-        profile: args
-            .server
-            .map(|profile| profile.as_str().to_owned())
-            .unwrap_or_default(),
-        command: args.command.clone(),
-        bind: args
-            .bind
-            .map(|bind| bind.as_str().to_owned())
-            .unwrap_or_default(),
-        instances: args.instances,
-        readiness_path: args.readiness.unwrap_or_default(),
-        readiness_timeout_ms: args
-            .readiness_timeout
-            .map(|timeout| timeout.as_millis() as u64),
-        stop_signal: args.stop_signal.unwrap_or_default(),
-        entrypoint: args.entrypoint.unwrap_or_default(),
-        interface: args
-            .interface
-            .map(|value| value.as_str().to_owned())
-            .unwrap_or_default(),
-        python: args
-            .python
-            .map(|path| absolute_interpreter(&path, None))
-            .unwrap_or_default(),
-        build_when: args.build.unwrap_or_default(),
-        build_extras: args.build_extra,
-        build_groups: args.build_group,
-        bytecode: args.bytecode.unwrap_or_default(),
-        processes: args.processes,
-        threads: args.threads,
-        sync_threads: args.sync_threads,
-        concurrency: args.concurrency,
-        preload: args
-            .preload
-            .map(|value| value.as_str().to_owned())
-            .unwrap_or_default(),
-        hooks: args.hooks.unwrap_or_default(),
-        factory: args.factory.then_some(true),
-        factory_phase: String::new(),
         release: args.release.unwrap_or_default(),
         wait: !args.no_wait,
         hold: args.hold,
         override_freeze: args.override_freeze,
         fresh: args.fresh,
-        reflection: None,
-        grpc_web_origins: Vec::new(),
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
         retain_workers: args.retain_workers,
-        max_requests: args.max_requests,
-        max_lifetime_ms: args
-            .max_lifetime
-            .map(|lifetime| lifetime.as_millis() as u64),
-        soft_timeout_ms: timeout_ms(&args.timeouts, "soft"),
-        accel_redirect: None,
-        cgi_local_redirect: None,
-        sendfile_roots: args.sendfile_roots,
-        sendfile_header: args.sendfile_header,
-        static_dirs: args
-            .static_dirs
-            .iter()
-            .map(|(path, dir)| pb::StaticDir {
-                path: path.clone(),
-                dir: dir.clone(),
-            })
-            .collect(),
-        hard_timeout_ms: timeout_ms(&args.timeouts, "hard"),
-        hard_drain_grace_ms: timeout_ms(&args.timeouts, "hard_drain_grace"),
-        shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),
-        websocket_drain_grace_ms: timeout_ms(&args.timeouts, "websocket_drain_grace"),
-        loop_stall_timeout_ms: timeout_ms(&args.timeouts, "loop_stall"),
-        gil_stall_timeout_ms: timeout_ms(&args.timeouts, "gil_stall"),
-        memory_measure: memory_setting(&args.memory, "measure").unwrap_or_default(),
-        memory_soft_limit: memory_setting(&args.memory, "soft_limit")
-            .and_then(|text| muru_config::parse_size(&text).ok()),
-        memory_soft_for_ms: memory_setting(&args.memory, "soft_for")
-            .and_then(|text| muru_config::parse_duration(&text).ok())
-            .map(|duration| duration.as_millis() as u64),
-        memory_reclaim_first: memory_setting(&args.memory, "reclaim_first")
-            .map(|text| text == "true"),
-        memory_hard_limit: memory_setting(&args.memory, "hard_limit")
-            .and_then(|text| muru_config::parse_size(&text).ok()),
-        memory_check_interval_ms: memory_setting(&args.memory, "check_interval")
-            .and_then(|text| muru_config::parse_duration(&text).ok())
-            .map(|duration| duration.as_millis() as u64),
-        env: args
-            .env
-            .iter()
-            .map(|(name, value)| pb::EnvEntry {
-                name: name.clone(),
-                value: value.clone(),
-                ..Default::default()
-            })
-            .chain(
-                args.secrets
-                    .iter()
-                    .map(|(name, store, key, as_file)| pb::EnvEntry {
-                        name: name.clone(),
-                        secret_store: store.clone(),
-                        secret_key: key.clone(),
-                        as_file: *as_file,
-                        ..Default::default()
-                    }),
-            )
-            .collect(),
+        ..args
+            .settings
+            .request(&args.app, &source.display().to_string(), python)
     };
+
+    if args.dry_run {
+        let plan = client
+            .plan_deploy(request)
+            .await
+            .map_err(explain)?
+            .into_inner();
+
+        if args.output.json {
+            print_answer(&plan)?;
+        } else {
+            print_deploy_plan(&plan);
+        }
+
+        return Ok(i32::from(!plan.refusals.is_empty()));
+    }
+
     let release = client.deploy(request).await.map_err(explain)?.into_inner();
 
     if args.output.json {
-        return print_answer(&release);
+        print_answer(&release)?;
+        return Ok(0);
     }
 
     if args.no_wait {
@@ -3103,7 +3164,92 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             }
         );
     }
-    Ok(())
+
+    Ok(0)
+}
+
+/// A deploy's plan as people read it: the release, each setting with
+/// the layer it would come from, and what happens around it.
+fn print_deploy_plan(plan: &pb::DeployPlan) {
+    if !plan.refusals.is_empty() {
+        println!("muru: the deploy would be refused:");
+
+        for refusal in &plan.refusals {
+            println!("  {refusal}");
+        }
+
+        return;
+    }
+
+    println!(
+        "muru: plan (nothing changed): release {}@{}, {}",
+        plan.app, plan.release, plan.description
+    );
+
+    if plan.new_app {
+        println!("  the application {} would be created", plan.app);
+    }
+
+    if !plan.settings.is_empty() {
+        let lines: Vec<(String, &str)> = plan
+            .settings
+            .iter()
+            .map(|setting| {
+                (
+                    format!("{} = {}", setting.key, setting.value),
+                    setting.layer.as_str(),
+                )
+            })
+            .collect();
+        let width = lines
+            .iter()
+            .map(|(line, _)| line.len())
+            .filter(|length| *length <= 44)
+            .max()
+            .unwrap_or(0);
+
+        for (line, layer) in lines {
+            println!("  {line:<width$}  ({layer})");
+        }
+    }
+
+    if !plan.settings_from.is_empty() {
+        println!(
+            "  settings nothing else gives come from {}@{}; --fresh takes none",
+            plan.app, plan.settings_from
+        );
+    }
+
+    if plan.builds {
+        println!("  an environment would be built from the source's uv.lock");
+    }
+
+    match (plan.hold, plan.serving.is_empty()) {
+        (true, true) => println!(
+            "  the release would start held, and {} would serve nothing until a rollout",
+            plan.app
+        ),
+        (true, false) => println!(
+            "  the release would start held, and {}@{} would go on serving",
+            plan.app, plan.serving
+        ),
+        (false, true) => println!("  the release would serve once it is ready"),
+        (false, false) if plan.retain_ms == 0 => println!(
+            "  the release would take over from {}@{}, which would stop once it has drained",
+            plan.app, plan.serving
+        ),
+        (false, false) => println!(
+            "  the release would take over from {}@{}, which would stay warm for {} with {} to a group",
+            plan.app,
+            plan.serving,
+            muru_config::format_duration(Duration::from_millis(plan.retain_ms)),
+            match plan.retain_workers {
+                0 => "its host alone".to_owned(),
+                1 => "1 worker".to_owned(),
+                count => format!("{count} workers"),
+            }
+        ),
+    }
 }
 
 /// The rollout subcommands (section 9.3).
@@ -5350,6 +5496,26 @@ pub struct ApplyArgs {
     #[arg(long)]
     override_freeze: bool,
 
+    /// Start the releases the apply adds but leave traffic where it is,
+    /// for a preview with the Muru-Preview header or a rollout.
+    #[arg(long)]
+    hold: bool,
+
+    /// Return as soon as the releases the apply adds are recorded,
+    /// without waiting for them to serve.
+    #[arg(long)]
+    no_wait: bool,
+
+    /// How long a release the apply replaces stays warm for an instant
+    /// rollback (default 30m; 0 stops it as soon as it has drained).
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    retain: Option<Duration>,
+
+    /// The workers each group of a release the apply replaces keeps
+    /// while it stays warm (default 1; 0 keeps the host alone).
+    #[arg(long, value_name = "N")]
+    retain_workers: Option<u32>,
+
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -5370,6 +5536,10 @@ pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
             dry_run: args.dry_run,
             prune: args.prune,
             override_freeze: args.override_freeze,
+            hold: args.hold,
+            no_wait: args.no_wait,
+            retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
+            retain_workers: args.retain_workers,
         })
         .await
         .map_err(explain)?
@@ -5598,6 +5768,7 @@ fn resolve_paths(document: &mut muru_config::Document, base: &Path) {
     for app in document.app.values_mut() {
         for release in app.release.values_mut() {
             resolve(&mut release.source);
+            resolve(&mut release.cwd);
 
             if let Some(python) = &release.python {
                 release.python = Some(absolute_interpreter(Path::new(python), Some(base)));

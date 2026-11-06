@@ -8,9 +8,9 @@ use std::fmt::Write as _;
 use serde::Serialize;
 
 /// What a setting is called when nothing sets it.
-const DEFAULT: &str = "default";
+pub(crate) const DEFAULT: &str = "default";
 /// What a setting is called when a flag sets it.
-const COMMAND_LINE: &str = "command line";
+pub(crate) const COMMAND_LINE: &str = "command line";
 
 /// One setting: its key, its value and where the value came from.
 pub struct Row {
@@ -182,7 +182,7 @@ fn other_tables_note(tables: &[String], source: Option<&std::path::Path>) -> Vec
 /// `muructl run --print-config`: the flags over muru.local.toml over the
 /// project's run table over the defaults, and the application's settings
 /// from the flags over the project's table.
-pub fn for_run(args: &crate::RunArgs, resolved: &crate::Resolved) -> String {
+pub fn for_run(args: &crate::RunArgs, resolved: &crate::Resolved, interpreter: &str) -> String {
     let layers = &resolved.layers;
     let serving = &resolved.serving;
     let source = resolved.source.as_deref();
@@ -469,7 +469,11 @@ pub fn for_run(args: &crate::RunArgs, resolved: &crate::Resolved) -> String {
         notes.push("--single gives one process of one thread.".to_owned());
     }
 
-    let mut trailer = other_tables_note(&other_tables(&layers.table, &top), source);
+    let mut trailer = vec![format!("The interpreter is {interpreter}.")];
+    trailer.extend(other_tables_note(
+        &other_tables(&layers.table, &top),
+        source,
+    ));
 
     if has(&layers.table, "serve") {
         trailer.push("The serve table is muructl serve's, and is not read here.".to_owned());

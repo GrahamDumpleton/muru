@@ -7,6 +7,7 @@ the daemon records about the interpreter a release runs on."""
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -56,19 +57,28 @@ def project(directory: Path, requires: str | None = None, extra: str = "") -> Pa
 def run_once(
     directory: Path, *args: str, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """Run `muructl run --print-daemon-config`, which resolves the interpreter and
-    exits, with the active virtualenv hidden so the project decides."""
+    """Run `muructl run --print-config`, which finds the interpreter as the
+    run would, names it and exits, with the active virtualenv hidden so the
+    project decides."""
 
     environment = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
     environment.update(env or {})
 
     return subprocess.run(
-        [str(muructl()), "run", str(directory), "--print-daemon-config", *args],
+        [str(muructl()), "run", str(directory), "--print-config", *args],
         capture_output=True,
         text=True,
         timeout=60,
         env=environment,
     )
+
+
+def interpreter(printed: str) -> str:
+    """The interpreter `--print-config` says the run would use."""
+
+    named = re.search(r"^# The interpreter is Python .+ at (\S+) \(", printed, re.MULTILINE)
+    assert named, printed
+    return named.group(1)
 
 
 def test_a_version_request_on_the_command_line_is_resolved_with_uv(tmp_path: Path) -> None:
@@ -79,12 +89,11 @@ def test_a_version_request_on_the_command_line_is_resolved_with_uv(tmp_path: Pat
     completed = run_once(directory, "--python", VERSION)
 
     assert completed.returncode == 0, completed.stderr
-    assert "python = " in completed.stdout
 
-    # The interpreter written is the version asked for, as the probe saw it.
+    # The interpreter named is the version asked for, as the probe saw it.
 
-    written = next(line for line in completed.stdout.splitlines() if line.startswith("python = "))
-    python = written.split("=", 1)[1].strip().strip("'\"")
+    python = interpreter(completed.stdout)
+    assert f"({VERSION} from --python)" in completed.stdout
     probed = subprocess.run(
         [python, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"],
         capture_output=True,
@@ -103,7 +112,8 @@ def test_the_project_version_file_names_the_interpreter(tmp_path: Path) -> None:
     completed = run_once(directory)
 
     assert completed.returncode == 0, completed.stderr
-    assert "python = " in completed.stdout
+    assert interpreter(completed.stdout)
+    assert f"({VERSION} from .python-version)" in completed.stdout
 
 
 def test_requires_python_the_interpreter_does_not_meet_fails_before_anything_starts(

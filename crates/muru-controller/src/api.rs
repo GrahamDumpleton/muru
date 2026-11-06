@@ -329,37 +329,11 @@ impl Admin for Service {
         let request = request.into_inner();
         self.check_freeze(&request.app, "deploy", request.override_freeze)?;
 
-        // Section 3.3: a deploy takes what its flags and the source do
-        // not give from the release before it, unless it is fresh.
-
-        let previous = if request.fresh {
-            None
-        } else {
-            self.handle
-                .store
-                .app(&request.app)
-                .ok()
-                .and_then(|app| app.current.or(app.previous))
-                .and_then(|id| self.handle.store.release(&request.app, &id).ok())
-                .map(|release| release.spec)
-        };
-
-        // Resolution may run uv and the interpreter, so it is off the
-        // runtime's threads.
-
         let info = std::sync::Arc::clone(&self.handle.info);
-        let resolving = request.clone();
-        let spec = tokio::task::spawn_blocking(move || {
-            config::resolve_spec(
-                &resolving,
-                previous.as_ref(),
-                &config::Tables::default(),
-                &info.provisioning,
-            )
-        })
-        .await
-        .map_err(|error| Status::internal(error.to_string()))?
-        .map_err(Status::invalid_argument)?;
+        let spec = self
+            .resolve_deploy(&request, info.provisioning.clone())
+            .await?
+            .map_err(Status::invalid_argument)?;
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
@@ -399,6 +373,122 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(release_message(release, &self.handle)))
+    }
+
+    async fn plan_deploy(
+        &self,
+        request: Request<pb::DeployRequest>,
+    ) -> Result<Response<pb::DeployPlan>, Status> {
+        let request = request.into_inner();
+        let store = &self.handle.store;
+        let mut refusals = Vec::new();
+
+        if !crate::model::valid_name(&request.app) {
+            refusals.push(format!(
+                "{:?} is not a valid application name: lowercase letters, digits and hyphens, up to 63 characters",
+                request.app
+            ));
+        }
+
+        if let Some(by) = self.frozen().map_err(internal)?.get(&request.app)
+            && !request.override_freeze
+        {
+            refusals.push(format!(
+                "deploys of {} are frozen by overlay {}; give --override-freeze to deploy anyway",
+                request.app,
+                by.join(", ")
+            ));
+        }
+
+        let app = store.app(&request.app).ok();
+
+        let id = if request.release.is_empty() {
+            store.next_release_id(&request.app).map_err(internal)?
+        } else {
+            request.release.clone()
+        };
+
+        if !crate::model::valid_name(&id) {
+            refusals.push(format!("{id:?} is not a valid release id"));
+        } else if store.release(&request.app, &id).is_ok() {
+            refusals.push(format!("release {}@{id} already exists", request.app));
+        }
+
+        // A plan installs nothing: an interpreter the node lacks, which
+        // a deploy would have uv fetch, is found or the plan says so.
+
+        let mut provisioning = self.handle.info.provisioning.clone();
+        let downloads = provisioning.downloads_allowed();
+        provisioning.isolation.no_downloads = true;
+
+        let spec = match self.resolve_deploy(&request, provisioning).await? {
+            Ok(spec) => Some(spec),
+            Err(error) => {
+                refusals.push(if downloads && error.contains("uv python install") {
+                    format!("{error}; a deploy would try to install it, which a dry run does not")
+                } else {
+                    error
+                });
+                None
+            }
+        };
+
+        // Section 13.6: whether the release's memory fits the node's
+        // budget, with the retained releases making way.
+
+        if let Some(spec) = &spec {
+            let budget = self
+                .handle
+                .info
+                .defined
+                .read()
+                .expect("defined names poisoned")
+                .budget
+                .clone();
+
+            if let Err(why) = budget.release_fits(&request.app, spec, budget.retained) {
+                refusals.push(format!("not started: {}: {why}", request.app));
+            }
+        }
+
+        let previous = app
+            .as_ref()
+            .filter(|_| !request.fresh)
+            .and_then(|app| app.current.clone().or_else(|| app.previous.clone()));
+
+        Ok(Response::new(pb::DeployPlan {
+            app: request.app.clone(),
+            release: id,
+            new_app: app.is_none(),
+            description: spec.as_ref().map(config::describe).unwrap_or_default(),
+            settings: spec
+                .as_ref()
+                .filter(|spec| spec.http.is_none())
+                .map(|spec| {
+                    config::release_settings(spec)
+                        .into_iter()
+                        .map(|(key, value)| pb::DeploySetting {
+                            layer: spec.layers.0.get(key).cloned().unwrap_or_default(),
+                            key: key.to_owned(),
+                            value,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            builds: spec.as_ref().is_some_and(|spec| spec.build.builds),
+            serving: app.and_then(|app| app.current).unwrap_or_default(),
+            settings_from: previous
+                .filter(|_| spec.as_ref().is_some_and(|spec| spec.http.is_none()))
+                .unwrap_or_default(),
+            hold: request.hold,
+            retain_ms: request
+                .retain_ms
+                .unwrap_or(crate::daemon::RETENTION.as_millis() as u64),
+            retain_workers: request
+                .retain_workers
+                .unwrap_or(crate::daemon::RETAIN_WORKERS),
+            refusals,
+        }))
     }
 
     async fn list_releases(
@@ -1484,6 +1574,35 @@ impl Admin for Service {
 
         let mut report = report_message(&plan);
 
+        // Section 10.4: how the releases the apply adds are deployed,
+        // which the plan says of each one it holds, and of each release
+        // one of them takes over from.
+
+        let deploying = Deploying {
+            hold: request.hold,
+            wait: !request.no_wait,
+            retain: crate::daemon::Retention {
+                lasts: request
+                    .retain_ms
+                    .map_or(crate::daemon::RETENTION, Duration::from_millis),
+                workers: request
+                    .retain_workers
+                    .unwrap_or(crate::daemon::RETAIN_WORKERS),
+            },
+        };
+
+        if request.dry_run {
+            report.notes.extend(self.deploy_notes(&plan, &deploying));
+        }
+
+        if deploying.hold {
+            for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
+                if matches!(change.action, Action::Deploy { .. }) {
+                    message.detail = format!("held: {}", message.detail);
+                }
+            }
+        }
+
         if !request.dry_run && plan.errors.is_empty() {
             for (app, (id, by)) in &overridden {
                 self.handle.events.emit(
@@ -1505,7 +1624,7 @@ impl Admin for Service {
         let mut failures = 0;
 
         for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
-            message.outcome = self.carry_out(change).await;
+            message.outcome = self.carry_out(change, &deploying).await;
 
             if message.outcome.starts_with("failed") {
                 failures += 1;
@@ -1669,10 +1788,56 @@ fn compression_note(table: Option<&muru_config::Compression>) -> String {
     }
 }
 
+/// How an apply deploys the releases it adds (section 10.4).
+struct Deploying {
+    /// Start them and leave traffic where it is.
+    hold: bool,
+    /// Wait for each to serve or fail.
+    wait: bool,
+    /// How long a release one of them replaces stays warm, and with how
+    /// many workers.
+    retain: crate::daemon::Retention,
+}
+
 impl Service {
+    /// Resolve a deploy request into the release it describes. Section
+    /// 3.3: a deploy takes what its flags and the source do not give
+    /// from the release before it, unless it is fresh. Resolution may
+    /// run uv and the interpreter, so it is off the runtime's threads.
+    async fn resolve_deploy(
+        &self,
+        request: &pb::DeployRequest,
+        provisioning: crate::provision::Provisioning,
+    ) -> Result<Result<ReleaseSpec, String>, Status> {
+        let previous = if request.fresh {
+            None
+        } else {
+            self.handle
+                .store
+                .app(&request.app)
+                .ok()
+                .and_then(|app| app.current.or(app.previous))
+                .and_then(|id| self.handle.store.release(&request.app, &id).ok())
+                .map(|release| release.spec)
+        };
+
+        let resolving = request.clone();
+
+        tokio::task::spawn_blocking(move || {
+            config::resolve_spec(
+                &resolving,
+                previous.as_ref(),
+                &config::Tables::default(),
+                &provisioning,
+            )
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))
+    }
+
     /// Carry out one change of a plan and say how it went: an outcome
     /// starting with "failed" is counted as a failure.
-    async fn carry_out(&self, change: &Change) -> String {
+    async fn carry_out(&self, change: &Change, deploying: &Deploying) -> String {
         let store = &self.handle.store;
 
         let outcome = match &change.action {
@@ -1697,7 +1862,9 @@ impl Service {
                 .set_app_access_log(app, access_log)
                 .map(|()| "set".to_owned())
                 .map_err(|error| error.to_string()),
-            Action::Deploy { app, id, spec } => self.deploy_declared(app, id, spec).await,
+            Action::Deploy { app, id, spec } => {
+                self.deploy_declared(app, id, spec, deploying).await
+            }
             Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
             Action::RemoveApp { app } => store
                 .delete_app(app)
@@ -1784,13 +1951,55 @@ impl Service {
         outcome.unwrap_or_else(|error| format!("failed: {error}"))
     }
 
-    /// Deploy a declared release under its declared id and wait for the
-    /// outcome, as a deploy with --wait does.
+    /// What the plan's deploys would do beyond starting their releases,
+    /// for the report: nothing when a release is held, since traffic
+    /// stays where it is, and otherwise what becomes of the release
+    /// each application's last deploy takes over from.
+    fn deploy_notes(&self, plan: &Plan, deploying: &Deploying) -> Vec<String> {
+        if deploying.hold {
+            return Vec::new();
+        }
+
+        let mut last: BTreeMap<&str, &str> = BTreeMap::new();
+
+        for change in &plan.changes {
+            if let Action::Deploy { app, id, .. } = &change.action {
+                last.insert(app, id);
+            }
+        }
+
+        last.into_iter()
+            .filter_map(|(app, id)| {
+                let serving = self.handle.store.app(app).ok()?.current?;
+
+                Some(if deploying.retain.lasts.is_zero() {
+                    format!(
+                        "{app}@{serving} stops once it has drained, when {app}@{id} takes its place"
+                    )
+                } else {
+                    format!(
+                        "{app}@{serving} stays warm for {} with {} to a group, when {app}@{id} takes its place",
+                        muru_config::format_duration(deploying.retain.lasts),
+                        match deploying.retain.workers {
+                            0 => "its host alone".to_owned(),
+                            1 => "1 worker".to_owned(),
+                            count => format!("{count} workers"),
+                        }
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Deploy a declared release and say how it went: recorded when the
+    /// apply does not wait, else its state, with whether it serves or is
+    /// held.
     async fn deploy_declared(
         &self,
         app: &str,
         id: &str,
         spec: &ReleaseSpec,
+        deploying: &Deploying,
     ) -> Result<String, String> {
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
@@ -1800,15 +2009,20 @@ impl Service {
                 app: app.to_owned(),
                 spec: Box::new(spec.clone()),
                 id: Some(id.to_owned()),
-                retain: crate::daemon::Retention::default(),
-                hold: false,
+                retain: deploying.retain,
+                hold: deploying.hold,
                 created: created_tx,
                 done: done_tx,
             })
             .await
             .map_err(|_| STOPPING.to_owned())?;
 
-        created_rx.await.map_err(|_| STOPPING.to_owned())??;
+        let created = created_rx.await.map_err(|_| STOPPING.to_owned())??;
+
+        if !deploying.wait {
+            return Ok(format!("recorded ({})", created.state));
+        }
+
         let release = done_rx.await.map_err(|_| STOPPING.to_owned())??;
 
         // A release that failed says why, so the one answer an apply
@@ -1830,7 +2044,13 @@ impl Service {
         Ok(format!(
             "{}{}",
             release.state,
-            if serving { " and serving" } else { "" }
+            if serving {
+                " and serving"
+            } else if deploying.hold {
+                " and held: not serving"
+            } else {
+                ""
+            }
         ))
     }
 

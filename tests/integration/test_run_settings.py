@@ -133,14 +133,14 @@ def test_the_run_table_sets_how_the_project_is_served(tmp_path: Path) -> None:
     finally:
         server.stop()
 
-    # --print-daemon-config leaves the table out and writes what it resolved.
+    # --print-config writes the table as the run would use it.
 
     completed = subprocess.run(
         [
             str(muructl()),
             "run",
             str(directory),
-            "--print-daemon-config",
+            "--print-config",
             "--python",
             sys.executable,
         ],
@@ -149,12 +149,10 @@ def test_the_run_table_sets_how_the_project_is_served(tmp_path: Path) -> None:
         check=True,
         timeout=30,
     )
-    document = tomllib.loads(completed.stdout)
-    assert document["listener"] == [
-        {"address": f"127.0.0.1:{port}"},
-        {"address": f"127.0.0.1:{https_port}", "tls": True},
-    ]
-    assert "[run]" not in completed.stdout and "[tool.muru.run]" not in completed.stdout
+    table = tomllib.loads(completed.stdout)["run"]
+    assert (table["port"], table["https_port"], table["https"]) == (port, https_port, True)
+    assert f"# The interpreter is Python {sys.version_info[0]}." in completed.stdout
+    assert f" at {sys.executable} (from --python)." in completed.stdout
 
 
 def test_the_local_file_lays_over_the_table_and_a_flag_over_both(tmp_path: Path) -> None:

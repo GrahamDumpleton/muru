@@ -301,7 +301,9 @@ release; drain takes a release out of traffic and stops it.
 - rollout canary shifts traffic to a release step by step, each step judged \
 by gates against the release that serves.
 - apply makes a declarative file (muru.daemon.toml) the desired state; deploy adds \
-one release.
+one release. apply with hold starts the releases it adds without moving \
+traffic. The muructl render command writes such a file for a release from \
+a source directory and deploy's settings, without the daemon.
 - An overlay is a named, temporary change to routes or settings.
 - commands lists what an application declares it can run with a release \
 (migrations, data fixes, checks); run_command runs one by name, with its \
@@ -839,7 +841,7 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "deploy",
-            description: "Create a release of an application from a source directory and, once ready, move traffic to it; hold starts it without moving traffic. Waits for the release unless wait is false.",
+            description: "Create a release of an application from a source directory and, once ready, move traffic to it; hold starts it without moving traffic. Waits for the release unless wait is false. dry_run reports what the deploy would do, with where each setting would come from, without deploying.",
             changes: true,
             properties: json!({
                 "app": {"type": "string"},
@@ -848,6 +850,7 @@ fn specs() -> Vec<Spec> {
                 "python": {"type": "string", "description": "An interpreter path or a version such as 3.13"},
                 "hold": {"type": "boolean"},
                 "wait": {"type": "boolean", "description": "Wait until the release is ready or failed (default true)"},
+                "dry_run": {"type": "boolean"},
             }),
             required: &["app"],
             command: |arguments| {
@@ -863,6 +866,10 @@ fn specs() -> Vec<Spec> {
 
                 if arguments.get("wait").and_then(Value::as_bool) == Some(false) {
                     command.push("--no-wait".to_owned());
+                }
+
+                if flag(arguments, "dry_run") {
+                    command.push("--dry-run".to_owned());
                 }
 
                 Ok(command)
@@ -1056,11 +1063,13 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "apply",
-            description: "Make a declarative TOML file, or a directory of them, the desired state; dry_run reports what would change without changing it.",
+            description: "Make a declarative TOML file, or a directory of them, the desired state; dry_run reports what would change without changing it. hold starts the releases the apply adds without moving traffic. Waits for those releases unless wait is false.",
             changes: true,
             properties: json!({
                 "file": {"type": "string"},
                 "dry_run": {"type": "boolean"},
+                "hold": {"type": "boolean"},
+                "wait": {"type": "boolean", "description": "Wait until the releases the apply adds are ready or failed (default true)"},
             }),
             required: &["file"],
             command: |arguments| {
@@ -1072,6 +1081,14 @@ fn specs() -> Vec<Spec> {
 
                 if flag(arguments, "dry_run") {
                     command.push("--dry-run".to_owned());
+                }
+
+                if flag(arguments, "hold") {
+                    command.push("--hold".to_owned());
+                }
+
+                if arguments.get("wait").and_then(Value::as_bool) == Some(false) {
+                    command.push("--no-wait".to_owned());
                 }
 
                 Ok(command)

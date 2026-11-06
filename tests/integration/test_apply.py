@@ -152,6 +152,64 @@ def test_dry_run_plans_without_changing_anything(daemon: Daemon, tmp_path: Path)
     ]
 
 
+def test_how_the_releases_an_apply_adds_are_deployed(daemon: Daemon, tmp_path: Path) -> None:
+    # --hold starts every release the apply adds, in every application,
+    # and leaves traffic where it is; the plan and the report say so of
+    # each. A first release held leaves its application serving nothing.
+
+    config = tmp_path / "all.toml"
+    config.write_text(release("shop", "r1") + release("api", "r1"))
+    planned = apply(daemon, config, "--hold", "--dry-run")
+    held = [line for line in planned.stdout.splitlines() if "held: " in line]
+    assert [line.split()[:2] for line in held] == [["deploy", "api@r1"], ["deploy", "shop@r1"]]
+
+    applied = apply(daemon, config, "--hold")
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    outcomes = [line.split(None, 2) for line in applied.stdout.splitlines() if "deploy " in line]
+    assert outcomes == [
+        ["deploy", "api@r1", "ready and held: not serving"],
+        ["deploy", "shop@r1", "ready and held: not serving"],
+    ]
+    assert sorted(daemon.releases(), key=lambda row: row["release"]) == [
+        {"release": "api@r1", "state": "ready", "serving": ""},
+        {"release": "shop@r1", "state": "ready", "serving": ""},
+    ]
+    daemon.muructl("rollout", "bluegreen", "shop@r1")
+    assert daemon.releases("shop") == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
+
+    # --retain says how long the release an apply replaces stays warm,
+    # which the plan says, and 0 stops it once it has drained.
+
+    config.write_text(release("shop", "r1") + release("shop", "r2", threads=1))
+    planned = apply(daemon, config, "--dry-run")
+    assert (
+        "muru: shop@r1 stays warm for 1800s with 1 worker to a group, when shop@r2 takes its place"
+        in planned.stdout
+    )
+    planned = apply(daemon, config, "--dry-run", "--retain", "0")
+    assert "muru: shop@r1 stops once it has drained, when shop@r2 takes its place" in planned.stdout
+    applied = apply(daemon, config, "--retain", "0")
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    deadline = time.monotonic() + 20
+
+    while time.monotonic() < deadline and daemon.releases("shop")[1]["state"] != "stopped":
+        time.sleep(0.1)
+
+    assert daemon.releases("shop") == [
+        {"release": "shop@r2", "state": "ready", "serving": "yes"},
+        {"release": "shop@r1", "state": "stopped", "serving": ""},
+    ]
+
+    # --no-wait returns once the release is recorded.
+
+    config.write_text(release("shop", "r2", threads=1) + release("shop", "r3", threads=2))
+    early = apply(daemon, config, "--no-wait")
+    assert early.returncode == 0, early.stdout + early.stderr
+    assert early.stdout.splitlines()[1].split()[:3] == ["deploy", "shop@r3", "recorded"]
+    daemon.muructl("release", "wait", "shop@r3")
+    assert daemon.releases("shop")[0]["release"] == "shop@r3"
+
+
 def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path: Path) -> None:
     config = tmp_path / "shop.toml"
     config.write_text(release("shop", "r1") + release("shop", "r2"))
