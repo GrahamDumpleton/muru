@@ -49,7 +49,7 @@ Standard ASGI 3.0 keys (type, asgi, http_version, method, scheme, path, raw_path
 
 | Variable | Meaning |
 | --- | --- |
-| MURU_APP, MURU_RELEASE | application and release, also for a command run with the release (section 9.12) |
+| MURU_APP, MURU_RELEASE | application and release, also for a command run with the release (section 9.12); a command muructl runs itself for a project has no MURU_RELEASE |
 | MURU_GROUP, MURU_WORKER_ID | worker group and worker id, set after fork |
 | MURU_RELEASE_DIR, MURU_RUN_DIR | release source (also the working directory) and run directory |
 | MURU_INTERFACE, MURU_PROCESSES, MURU_THREADS | default mount interface and process model |

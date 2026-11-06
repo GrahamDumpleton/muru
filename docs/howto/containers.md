@@ -426,6 +426,26 @@ served when given none. Only someone who may exec into the container can
 use them. Commands that
 manage releases, hosts or the daemon say they need the daemon.
 
+The project's declared [commands](commands.md#the-projects-own-commands)
+run the same way, through the `muructl serve` in the container, with
+their output in the container's log:
+
+```
+docker exec shop muructl command list
+docker exec shop muructl command run backup
+docker exec shop muructl exec -- python manage.py showmigrations
+```
+
+A command also runs in a container of its own, where nothing is serving,
+which is how a migration is run before the new image serves. `muructl`
+runs it itself, with the image's interpreter and the project's
+environment variables, and exits with its status:
+
+```
+docker run --rm --env-file shop.env registry.example.com/shop:1.0.0 \
+    muructl command run migrate
+```
+
 ## Stopping
 
 muructl is the container's process 1 and runs as an init of its own, as

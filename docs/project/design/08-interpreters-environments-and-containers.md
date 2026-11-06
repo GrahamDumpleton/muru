@@ -96,7 +96,7 @@ compile_bytecode = true  # uv sync --compile-bytecode, feeds bytecode = 'source'
 
 - Under watch or touch reload a change to `pyproject.toml` or `uv.lock` creates the next release with a build; other changes build again from the unchanged lock, the cheap case. Reusing the directory would make a release mutable.
 
-- `muructl exec APP[@RELEASE] -- COMMAND` runs with the release's environment on PATH and the runtime library on PYTHONPATH, so `python manage.py migrate` sees what the server sees (section 9.12).
+- `muructl exec APP[@RELEASE] -- COMMAND` runs with the release's environment on PATH and the runtime library on PYTHONPATH, so `python manage.py migrate` sees what the server sees (section 9.12). With no application named it does the same for the project in the current directory, in development and in a container.
 
 **Without uv.** There is no second builder. `pyproject.toml`, `uv.lock` and uv are what building and the reload behaviour above need, and a machine without uv is told so once, with `muructl tools install uv` (a pinned, checksum-verified single binary) or the distribution's package as the fix. Everything else works there: a path given with `--python`, an active virtualenv or the project's `.venv` is used as it is and probed, `python3` on PATH is the last resort, a system Python with distribution packages works through `--python /usr/bin/python3`, and the runtime library still arrives on PYTHONPATH, fetched and unpacked by muructl without pip or uv (section 8.3). A node where fetching uv is forbidden deploys a prebuilt directory, or builds in CI with `muructl build --deployment` and ships the result. A builder on `python -m venv` and pip from an exported lock was designed and left out until there is demand for it (ADR 0036).
 

@@ -93,8 +93,8 @@ enough for production on Docker, Compose, Podman and Kubernetes.
    Issue: [#128](https://github.com/muruhq/muru/issues/128).
 
 Later additions to the goal: live reload of mounted configuration and
-certificates, debugging in a locked-down pod, `muructl exec` for
-migrations and one-off commands, and a generated Kubernetes manifest.
+certificates, debugging in a locked-down pod, and a generated
+Kubernetes manifest.
 
 ### Production readiness and 1.0
 
