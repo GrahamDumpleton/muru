@@ -3219,9 +3219,17 @@ pub fn resolve_spec(
     // Section 6.14: the default mount's handoff, checked against the
     // interface it hands from when that is declared.
 
-    let handoff = table
-        .handoff
-        .or_else(|| previous.and_then(|previous| previous.handoff));
+    let handoff = match request.handoff.as_str() {
+        "" => table
+            .handoff
+            .or_else(|| previous.and_then(|previous| previous.handoff)),
+        given => Some(
+            given
+                .parse()
+                .map_err(|error: muru_config::ParseError| error.to_string())?,
+        ),
+    };
+
     muru_config::check_handoff(handoff, Some(interface))?;
 
     Ok(ReleaseSpec {
@@ -3533,8 +3541,14 @@ fn resolve_build(
         when,
         extras,
         groups,
-        source_builds: settings.source_builds.unwrap_or(false),
-        compile_bytecode: settings.compile_bytecode.unwrap_or(true),
+        source_builds: request
+            .build_source_builds
+            .or(settings.source_builds)
+            .unwrap_or(false),
+        compile_bytecode: request
+            .build_compile_bytecode
+            .or(settings.compile_bytecode)
+            .unwrap_or(true),
         builds,
     })
 }
@@ -4889,6 +4903,15 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
             .bytecode
             .map(|bytecode| bytecode.as_str().to_owned())
             .unwrap_or_default(),
+        handoff: table
+            .handoff
+            .map(|handoff| handoff.as_str().to_owned())
+            .unwrap_or_default(),
+        build_source_builds: table.build.as_ref().and_then(|build| build.source_builds),
+        build_compile_bytecode: table
+            .build
+            .as_ref()
+            .and_then(|build| build.compile_bytecode),
         processes: table.processes.map(|value| value as u32),
         threads: table.threads.map(|value| value as u32),
         sync_threads: table.sync_threads.map(|value| value as u32),
@@ -5514,6 +5537,40 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         describe_maintenance(recorded.maintenance.as_ref()),
     );
 
+    // Section 8.2: the build and bytecode settings, each key on its own,
+    // as the spec's equality compares them.
+
+    compare(
+        "build.when",
+        declared.build.when.as_str().to_owned(),
+        recorded.build.when.as_str().to_owned(),
+    );
+    compare(
+        "build.extras",
+        declared.build.extras.join(", "),
+        recorded.build.extras.join(", "),
+    );
+    compare(
+        "build.groups",
+        declared.build.groups.join(", "),
+        recorded.build.groups.join(", "),
+    );
+    compare(
+        "build.source_builds",
+        declared.build.source_builds.to_string(),
+        recorded.build.source_builds.to_string(),
+    );
+    compare(
+        "build.compile_bytecode",
+        declared.build.compile_bytecode.to_string(),
+        recorded.build.compile_bytecode.to_string(),
+    );
+    compare(
+        "bytecode",
+        declared.bytecode.mode.as_str().to_owned(),
+        recorded.bytecode.mode.as_str().to_owned(),
+    );
+
     found
 }
 
@@ -6009,6 +6066,93 @@ mod tests {
                 ("deploy", "shop@r2".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn a_release_tables_handoff_and_build_keys_come_before_the_sources() {
+        let source =
+            std::env::temp_dir().join(format!("muru-config-handoff-build-{}", std::process::id()));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("pyproject.toml"),
+            "[tool.muru]\nentrypoint = 'shop.wsgi:application'\nhandoff = 'asgi'\n\
+             [tool.muru.build]\nsource_builds = true\ncompile_bytecode = false\n",
+        )
+        .unwrap();
+        let release = |keys: &str| {
+            format!(
+                "[app.shop.release.r1]\nsource = '{}'\npython = '/usr/bin/python3'\n{keys}",
+                source.display()
+            )
+        };
+        let resolve = |text: &str| {
+            let document = Document::parse(text).unwrap();
+            let table = &document.app["shop"].release["r1"];
+            resolve_declared(
+                "shop",
+                table,
+                &source.display().to_string(),
+                &crate::provision::Provisioning::off(),
+            )
+            .unwrap()
+        };
+
+        // The table's keys are the release's, whatever the source says.
+
+        let declared = release(
+            "handoff = 'wsgi'\n[app.shop.release.r1.build]\nsource_builds = false\ncompile_bytecode = true\n",
+        );
+        let spec = resolve(&declared);
+        assert_eq!(spec.handoff, Some(muru_config::Handoff::Wsgi));
+        assert!(!spec.build.source_builds);
+        assert!(spec.build.compile_bytecode);
+
+        // A table that leaves them out takes the source's.
+
+        let spec = resolve(&release(""));
+        assert_eq!(spec.handoff, Some(muru_config::Handoff::Asgi));
+        assert!(spec.build.source_builds);
+        assert!(!spec.build.compile_bytecode);
+
+        // Recorded from the table, the same table is unchanged, and one
+        // that says otherwise is refused, naming each key that differs.
+
+        let store = Store::in_memory().unwrap();
+        store.ensure_app("shop").unwrap();
+        store
+            .create_release("shop", "r1", &resolve(&declared))
+            .unwrap();
+        let planned = |text: &str| {
+            plan(
+                &store,
+                &Document::parse(text).unwrap(),
+                false,
+                &Defined::default(),
+                &crate::provision::Provisioning::off(),
+            )
+        };
+
+        let same = planned(&declared);
+        assert!(same.errors.is_empty(), "{:?}", same.errors);
+        assert!(same.changes.is_empty(), "{:?}", same.changes);
+        assert_eq!(same.unchanged, 1);
+
+        let changed = planned(&release(""));
+        assert_eq!(changed.errors.len(), 1, "{:?}", changed.errors);
+
+        for difference in [
+            "handoff asgi, recorded wsgi",
+            "build.source_builds true, recorded false",
+            "build.compile_bytecode false, recorded true",
+        ] {
+            assert!(
+                changed.errors[0].contains(difference),
+                "{}",
+                changed.errors[0]
+            );
+        }
+
+        std::fs::remove_dir_all(&source).unwrap();
     }
 
     #[test]

@@ -2975,7 +2975,10 @@ impl ReleaseArgs {
     /// These settings as the deploy request that carries them, for the
     /// application and its source, with the interpreter as the caller
     /// has it written. What says how the deploy is carried out is left
-    /// for the caller to set.
+    /// for the caller to set. No flag sets the handoff or the build's
+    /// source_builds and compile_bytecode: a deploy takes them from the
+    /// source's settings, and only a release's table in an applied file
+    /// gives them.
     pub(crate) fn request(self, app: &str, source: &str, python: String) -> pb::DeployRequest {
         pb::DeployRequest {
             app: app.to_owned(),
@@ -3006,6 +3009,9 @@ impl ReleaseArgs {
             build_extras: self.build_extra,
             build_groups: self.build_group,
             bytecode: self.bytecode.unwrap_or_default(),
+            handoff: String::new(),
+            build_source_builds: None,
+            build_compile_bytecode: None,
             processes: self.processes,
             threads: self.threads,
             sync_threads: self.sync_threads,
