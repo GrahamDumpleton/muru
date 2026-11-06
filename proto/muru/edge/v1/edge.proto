@@ -61,6 +61,7 @@ message Snapshot {
   Limits limits = 17;                   // section 4.6: the limits in force; the edge keeps its current ones when absent
   AccessLog access_log = 18;            // section 11.2: the records the access log writes; the edge keeps its current choice when absent
   repeated AccessLogOverride access_log_overrides = 19; // section 11.2: changes in force for a period, the newest last; only with access_log
+  repeated ListenerLimits listener_limits = 20; // section 4.18: listeners' own limits, over the snapshot's; read only with limits
 }
 
 // Section 11.2: which access records are written, where the edge was
@@ -129,6 +130,22 @@ message RequestLimits {
   uint64 request_deadline_ms = 3;
   uint64 body_idle_timeout_ms = 4;
   uint64 response_idle_timeout_ms = 5;
+}
+
+// Sections 4.6 and 4.18: a listener's own limits on its connections and
+// on reading a request's head, each in place of the node's for the
+// connections it accepts. A field that is absent says nothing.
+message ListenerLimits {
+  string listener = 1;                  // the listener's address, as IP:PORT
+  optional uint64 max_header_bytes = 2;
+  optional uint32 max_headers = 3;
+  optional uint64 header_read_timeout_ms = 4;
+  optional uint64 max_connections = 5;
+  optional uint64 max_connections_per_client = 6;
+  optional uint64 keep_alive_timeout_ms = 7;
+  optional uint64 keep_alive_timeout_proxy_ms = 8;
+  optional uint64 max_requests_per_connection = 9;
+  optional uint32 http2_max_concurrent_streams = 10;
 }
 
 // Section 6.13: who may speak HTTP/2 in cleartext on a listener without

@@ -1212,6 +1212,10 @@
           "type": "array",
           "x-default": "every client"
         },
+        "limits": {
+          "$ref": "#/$defs/ListenerLimits",
+          "description": "The listener's own limits on its connections and on reading a request's head, each replacing the `[limits]` value for the connections it accepts."
+        },
         "tls": {
           "default": false,
           "description": "Whether TLS is terminated on it, with the certificates of the virtual hosts it serves, chosen by SNI.",
@@ -1221,6 +1225,65 @@
       "required": [
         "address"
       ],
+      "type": "object"
+    },
+    "ListenerLimits": {
+      "additionalProperties": false,
+      "description": "A listener's `limits` table: the keys of `[limits]` that bound a connection and the reading of a request's head, each replacing the node's for the connections the listener accepts.",
+      "properties": {
+        "header_read_timeout": {
+          "description": "Time allowed for a complete request head.",
+          "type": "string",
+          "x-default": "`header_read_timeout` in `[limits]`"
+        },
+        "http2": {
+          "$ref": "#/$defs/Http2Limits",
+          "description": "HTTP/2 settings."
+        },
+        "keep_alive_timeout": {
+          "description": "Idle time before a keep-alive connection is closed.",
+          "type": "string",
+          "x-default": "`keep_alive_timeout` in `[limits]`"
+        },
+        "keep_alive_timeout_proxy": {
+          "description": "The same for connections from trusted proxies.",
+          "type": "string",
+          "x-default": "`keep_alive_timeout_proxy` in `[limits]`"
+        },
+        "max_connections": {
+          "description": "Open connections on the listener.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "`max_connections` in `[limits]`"
+        },
+        "max_connections_per_client": {
+          "description": "Open connections per client address; 0 disables it.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "`max_connections_per_client` in `[limits]`"
+        },
+        "max_header_bytes": {
+          "description": "Largest request head, for example 64KB.",
+          "type": "string",
+          "x-default": "`max_header_bytes` in `[limits]`"
+        },
+        "max_headers": {
+          "description": "Most headers in a request.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "`max_headers` in `[limits]`"
+        },
+        "max_requests_per_connection": {
+          "description": "Requests served on one connection before it is closed; 0 for no limit.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "`max_requests_per_connection` in `[limits]`"
+        }
+      },
       "type": "object"
     },
     "LogLevel": {

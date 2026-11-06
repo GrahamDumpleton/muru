@@ -79,7 +79,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | response.flush, coalesce_min_bytes, coalesce_max_delay, first_block | release, route | coalesce, 16KiB, 10ms, immediate | 5.4 |
 | max_body_size | `[limits]`, host, route | 10MB | 4.6 |
 | buffer_body, chunked_body, buffer_response | route and wider | off, buffer, on | 4.6 |
-| max_header_bytes, max_headers, header_read_timeout | `[limits]`, listener | 64KiB, 100, 30s | 4.6 |
+| max_header_bytes, max_headers, header_read_timeout | `[limits]`, a listener's `limits` | 64KiB, 100, 30s | 4.6 |
 | upload, max_file_size, max_files, hash, precheck, spool_quota | route (spool_quota also in the daemon's [limits], for every application together) | off, unlimited, 100 (at most 500), [sha256], false, 10GB per application (none for the node) | 4.11 |
 | static (directory or release_path), index, fallback, listing, case (strict by default), cache, follow_symlinks, stat_cache | route | none | 4.9 |
 | sendfile_roots, sendfile_header | release, mount, upstream | none, none | 4.9 |
@@ -101,7 +101,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | readiness, liveness (path, timeout, expect, required, interval, failures), checks | mount, release | none (built-in signals only) | 9.11 |
 | compression (enabled, encodings, min_size, types, level) | global, host, route | enabled, br zstd gzip, 1KB, text and JSON types, default | 4.17 |
 | decompress_requests | route | false | 4.17 |
-| max_connections, max_connections_per_client, high_water, min_idle_timeout, overload_reserve, keep_alive_timeout, keep_alive_timeout_proxy, max_requests_per_connection, `http2.*`, `websocket.*` | listener, mount | see 4.18 | 4.18 |
+| max_connections, max_connections_per_client, keep_alive_timeout, keep_alive_timeout_proxy, max_requests_per_connection, `http2.*` | `[limits]`, a listener's `limits` | see 4.18 | 4.18 |
+| high_water, min_idle_timeout, overload_reserve, `websocket.*` | listener, mount | see 4.18 | 4.18 |
 | auth (app or upstream, path, timeout, copy_headers, cache) | route | none | 4.16 |
 | upstream (route target), fallback.upstream, traffic.split upstream:NAME | route | none | 4.13 |
 | addresses, protocol, tls (ca, server_name, verify), health (path, interval, timeout, unhealthy_after, healthy_after, eject_after, eject_for), trust_muru_headers, connect_timeout | upstream | required, http1, none, none (ejection after 3 failures for 30s), false, 5s | 4.13 |

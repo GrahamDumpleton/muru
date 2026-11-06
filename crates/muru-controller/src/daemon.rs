@@ -923,6 +923,8 @@ struct Daemon {
     debug_exec: bool,
     /// The listeners' h2c policies, for every snapshot (section 6.13).
     h2c: Vec<pb::H2cPolicy>,
+    /// The listeners' own limits, for every snapshot (section 4.18).
+    listener_limits: Vec<pb::ListenerLimits>,
     /// The `[limits]` table (section 4.6), for every snapshot.
     limits: muru_edge::Limits,
     /// Which records the access log writes, from the `[logs]` table
@@ -1284,6 +1286,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         service,
         debug_exec: settings.debug_exec,
         h2c: settings.h2c.clone(),
+        listener_limits: settings.listener_limits.clone(),
         limits: settings.limits.clone(),
         access_log: settings.access_log.clone(),
         access_overrides: Vec::new(),
@@ -2503,6 +2506,10 @@ impl Daemon {
             ),
             ("[limits]", settings.limits != self.limits),
             ("[[listener]] h2c", settings.h2c != self.h2c),
+            (
+                "[[listener]] limits",
+                settings.listener_limits != self.listener_limits,
+            ),
             ("[logs] access_log", settings.access_log != self.access_log),
         ] {
             if changed {
@@ -2521,6 +2528,7 @@ impl Daemon {
         *self.info.limits.write().expect("limits poisoned") = self.limits.clone();
         self.access_log = settings.access_log;
         self.h2c = settings.h2c;
+        self.listener_limits = settings.listener_limits;
         self.client_rules = settings.client_rules;
         self.clients = clients;
 
@@ -5420,6 +5428,7 @@ impl Daemon {
             rate_limits: self.clients.limits_message.clone(),
             default_traffic,
             h2c: self.h2c.clone(),
+            listener_limits: self.listener_limits.clone(),
             limits: Some(self.limits.to_message()),
             access_log: Some(self.access_log.to_message()),
             access_log_overrides: self

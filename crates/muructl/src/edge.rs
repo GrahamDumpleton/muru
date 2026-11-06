@@ -384,7 +384,21 @@ impl EdgeControl for Control {
         // connections accepted from now on.
 
         if let Some(limits) = &snapshot.limits {
-            self.limits.apply(muru_edge::Limits::from_message(limits));
+            // Section 4.18: a listener's own are laid over them, by its
+            // address.
+
+            let listeners = snapshot
+                .listener_limits
+                .iter()
+                .filter_map(|own| {
+                    Some((
+                        own.listener.parse().ok()?,
+                        muru_edge::ListenerLimits::from_message(own),
+                    ))
+                })
+                .collect();
+            self.limits
+                .apply(muru_edge::Limits::from_message(limits), &listeners);
         }
 
         // Section 11.2: so do the access log's filters, for the records

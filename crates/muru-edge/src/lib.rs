@@ -356,6 +356,111 @@ impl RequestLimits {
     }
 }
 
+/// A listener's own limits on its connections and on reading a request's
+/// head (sections 4.6 and 4.18), each in place of the node's for the
+/// connections the listener accepts, and none where it says nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListenerLimits {
+    /// Bytes of request head accepted.
+    pub max_header_bytes: Option<usize>,
+    /// Request headers accepted.
+    pub max_headers: Option<usize>,
+    /// Time allowed for a complete request head.
+    pub header_read_timeout: Option<Duration>,
+    /// Open connections on the listener.
+    pub max_connections: Option<usize>,
+    /// Open connections per client address; 0 disables it.
+    pub max_connections_per_client: Option<usize>,
+    /// Idle time before a keep-alive connection is closed.
+    pub keep_alive_timeout: Option<Duration>,
+    /// The same, for connections from trusted proxies.
+    pub keep_alive_timeout_proxy: Option<Duration>,
+    /// Requests served on one connection before it is closed; 0 leaves
+    /// it open.
+    pub max_requests_per_connection: Option<u64>,
+    /// Concurrent streams per HTTP/2 connection.
+    pub http2_max_concurrent_streams: Option<u32>,
+}
+
+impl ListenerLimits {
+    /// The limits a snapshot carries for a listener.
+    pub fn from_message(message: &muru_proto::edge::v1::ListenerLimits) -> Self {
+        let size =
+            |value: Option<u64>| value.map(|value| usize::try_from(value).unwrap_or(usize::MAX));
+
+        Self {
+            max_header_bytes: size(message.max_header_bytes),
+            max_headers: message.max_headers.map(|count| count as usize),
+            header_read_timeout: message.header_read_timeout_ms.map(Duration::from_millis),
+            max_connections: size(message.max_connections),
+            max_connections_per_client: size(message.max_connections_per_client),
+            keep_alive_timeout: message.keep_alive_timeout_ms.map(Duration::from_millis),
+            keep_alive_timeout_proxy: message
+                .keep_alive_timeout_proxy_ms
+                .map(Duration::from_millis),
+            max_requests_per_connection: message.max_requests_per_connection,
+            http2_max_concurrent_streams: message.http2_max_concurrent_streams,
+        }
+    }
+
+    /// The limits as a snapshot carries them for the listener at
+    /// `address`.
+    pub fn to_message(&self, address: &str) -> muru_proto::edge::v1::ListenerLimits {
+        let millis = |duration: Option<Duration>| {
+            duration.map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        };
+
+        muru_proto::edge::v1::ListenerLimits {
+            listener: address.to_owned(),
+            max_header_bytes: self.max_header_bytes.map(|bytes| bytes as u64),
+            max_headers: self
+                .max_headers
+                .map(|count| u32::try_from(count).unwrap_or(u32::MAX)),
+            header_read_timeout_ms: millis(self.header_read_timeout),
+            max_connections: self.max_connections.map(|count| count as u64),
+            max_connections_per_client: self.max_connections_per_client.map(|count| count as u64),
+            keep_alive_timeout_ms: millis(self.keep_alive_timeout),
+            keep_alive_timeout_proxy_ms: millis(self.keep_alive_timeout_proxy),
+            max_requests_per_connection: self.max_requests_per_connection,
+            http2_max_concurrent_streams: self.http2_max_concurrent_streams,
+        }
+    }
+
+    /// Whether the listener says nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The node's limits with the listener's laid over them.
+    #[must_use]
+    pub fn over(&self, node: &Limits) -> Limits {
+        let mut limits = node.clone();
+
+        macro_rules! lay {
+            ($($field:ident),*) => {
+                $(
+                    if let Some(value) = self.$field {
+                        limits.$field = value;
+                    }
+                )*
+            };
+        }
+
+        lay!(
+            max_header_bytes,
+            max_headers,
+            header_read_timeout,
+            max_connections,
+            max_connections_per_client,
+            keep_alive_timeout,
+            keep_alive_timeout_proxy,
+            max_requests_per_connection,
+            http2_max_concurrent_streams
+        );
+        limits
+    }
+}
+
 /// The limits in force with what is derived from them, swapped together
 /// when a snapshot changes them (section 4.6); a connection takes those
 /// current when it is accepted and keeps them.
@@ -452,8 +557,14 @@ struct Shared {
     development: bool,
     occasions: occasions::Setting,
     access_log: Arc<access::AccessLog>,
-    /// The limits in force, which a snapshot may replace.
-    tuning: RwLock<Arc<Tuning>>,
+    /// The node's limits in force, which a snapshot may replace.
+    limits: RwLock<Arc<Limits>>,
+    /// Each listener's limits in force, in listener order: the node's
+    /// with the listener's own laid over them (section 4.18).
+    tuning: Vec<RwLock<Arc<Tuning>>>,
+    /// The listeners' addresses, in listener order, by which a snapshot
+    /// names them.
+    addresses: Vec<SocketAddr>,
     /// Where plain HTTP requests are redirected instead of being served.
     redirect_to: Option<SocketAddr>,
     /// The port of the first TLS listener, for hosts that insist on HTTPS.
@@ -499,9 +610,10 @@ enum Phase {
 }
 
 impl Shared {
-    /// The limits in force now, for a connection being accepted.
-    fn tuning(&self) -> Arc<Tuning> {
-        Arc::clone(&self.tuning.read().expect("tuning poisoned"))
+    /// The limits in force now on a listener, for a connection it is
+    /// accepting.
+    fn tuning(&self, listener: usize) -> Arc<Tuning> {
+        Arc::clone(&self.tuning[listener].read().expect("tuning poisoned"))
     }
 }
 
@@ -513,24 +625,37 @@ pub struct LimitsControl {
 }
 
 impl LimitsControl {
-    /// The limits in force now.
+    /// The node's limits in force now.
     pub fn current(&self) -> Arc<Limits> {
-        Arc::clone(&self.shared.tuning().limits)
+        Arc::clone(&self.shared.limits.read().expect("limits poisoned"))
     }
 
     /// Put new limits in force: connections accepted from now on take
     /// them, the listeners' connection limits and the spool's quota
     /// change at once, and connections already open keep what they had.
-    pub fn apply(&self, limits: Limits) {
-        for admission in &self.shared.admission {
-            admission.set_limits(limits.max_connections, limits.max_connections_per_client);
+    ///
+    /// A listener named in `listeners` has its own laid over the node's
+    /// (section 4.18); the others have the node's.
+    pub fn apply(
+        &self,
+        limits: Limits,
+        listeners: &std::collections::HashMap<SocketAddr, ListenerLimits>,
+    ) {
+        let shared = &self.shared;
+
+        for (index, address) in shared.addresses.iter().enumerate() {
+            let own = listeners
+                .get(address)
+                .map_or_else(|| limits.clone(), |own| own.over(&limits));
+            shared.admission[index].set_limits(own.max_connections, own.max_connections_per_client);
+            *shared.tuning[index].write().expect("tuning poisoned") = Arc::new(Tuning::new(own));
         }
 
-        if let Some(spool) = &self.shared.spool {
+        if let Some(spool) = &shared.spool {
             spool.set_quota((limits.spool_quota > 0).then_some(limits.spool_quota));
         }
 
-        *self.shared.tuning.write().expect("tuning poisoned") = Arc::new(Tuning::new(limits));
+        *shared.limits.write().expect("limits poisoned") = Arc::new(limits);
     }
 }
 
@@ -700,6 +825,12 @@ impl Edge {
             })
             .collect();
 
+        let tuning = bound
+            .iter()
+            .map(|_| RwLock::new(Arc::new(Tuning::new(config.limits.clone()))))
+            .collect();
+        let addresses = bound.iter().map(|(_, address, _)| *address).collect();
+
         Ok(Self {
             listeners: bound,
             local,
@@ -709,7 +840,9 @@ impl Edge {
                 development: config.development,
                 occasions: config.occasions,
                 access_log,
-                tuning: RwLock::new(Arc::new(Tuning::new(config.limits))),
+                tuning,
+                addresses,
+                limits: RwLock::new(Arc::new(config.limits)),
                 redirect_to,
                 https_port,
                 draining: tokio::sync::watch::channel(Phase::Serving).0,
@@ -956,7 +1089,7 @@ async fn accept(
         // current now are the connection's for its life.
 
         let token = Arc::clone(&shared.connections);
-        let tuning = shared.tuning();
+        let tuning = shared.tuning(index);
 
         match acceptor.clone() {
             None => {

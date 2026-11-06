@@ -1926,6 +1926,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         address: http.to_string(),
         tls: false,
         h2c: None,
+        limits: None,
     }];
 
     if resolved.serving.tls() {
@@ -1933,6 +1934,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
             address: https.to_string(),
             tls: true,
             h2c: None,
+            limits: None,
         });
     }
 

@@ -1607,6 +1607,56 @@ pub struct Listener {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "every client"))]
     pub h2c: Option<Vec<String>>,
+    /// The listener's own limits on its connections and on reading a
+    /// request's head (sections 4.6 and 4.18), each replacing the
+    /// `[limits]` value for the connections it accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ListenerLimits>,
+}
+
+/// A listener's `limits` table (sections 4.6 and 4.18): the keys of
+/// `[limits]` that bound a connection and the reading of a request's
+/// head, each replacing the node's for the connections the listener
+/// accepts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerLimits {
+    /// Largest request head, for example 64KB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_header_bytes` in `[limits]`"))]
+    pub max_header_bytes: Option<String>,
+    /// Most headers in a request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_headers` in `[limits]`"))]
+    pub max_headers: Option<usize>,
+    /// Time allowed for a complete request head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`header_read_timeout` in `[limits]`"))]
+    pub header_read_timeout: Option<String>,
+    /// Open connections on the listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_connections` in `[limits]`"))]
+    pub max_connections: Option<usize>,
+    /// Open connections per client address; 0 disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_connections_per_client` in `[limits]`"))]
+    pub max_connections_per_client: Option<usize>,
+    /// Idle time before a keep-alive connection is closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`keep_alive_timeout` in `[limits]`"))]
+    pub keep_alive_timeout: Option<String>,
+    /// The same for connections from trusted proxies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`keep_alive_timeout_proxy` in `[limits]`"))]
+    pub keep_alive_timeout_proxy: Option<String>,
+    /// Requests served on one connection before it is closed; 0 for no
+    /// limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_requests_per_connection` in `[limits]`"))]
+    pub max_requests_per_connection: Option<u64>,
+    /// HTTP/2 settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http2: Option<Http2Limits>,
 }
 
 /// How forwarding headers are left after they have been applied.
@@ -5926,6 +5976,10 @@ traffic = { classes = { ai-crawler = 'r1' } }"
                 address: "127.0.0.1:8080".to_owned(),
                 tls: false,
                 h2c: Some(vec!["loopback".to_owned()]),
+                limits: Some(ListenerLimits {
+                    max_connections: Some(500),
+                    ..ListenerLimits::default()
+                }),
             }],
             limits: Some(Limits {
                 max_body_size: Some("100MB".to_owned()),
@@ -6045,6 +6099,8 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(text.contains("[route.traffic]"), "{text}");
         assert!(text.contains("r2 = 10"), "{text}");
         assert!(text.contains("[host.shop]"), "{text}");
+        assert!(text.contains("[listener.limits]"), "{text}");
+        assert!(text.contains("max_connections = 500"), "{text}");
         assert!(text.contains("canonical_redirect = true"), "{text}");
         assert!(text.contains("[host.shop.timeouts]"), "{text}");
         assert!(text.contains("request_deadline = \"30s\""), "{text}");

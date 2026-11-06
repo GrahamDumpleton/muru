@@ -585,6 +585,8 @@ The `[limits]` table: sizes and durations as the configuration writes them.
 
 The `[limits.http2]` table.
 
+The same keys apply at `[listener.limits.http2]`.
+
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_concurrent_streams` | integer | `128` | Concurrent streams per connection. |
@@ -598,7 +600,25 @@ A listener, one of the `[[listener]]` entries, in the daemon's own file.
 | --- | --- | --- | --- |
 | `address` | string | required | The address, as IP:PORT. |
 | `h2c` | array of strings | every client | On a listener without TLS, the clients that may speak HTTP/2 in cleartext (h2c), as addresses, ranges, loopback or private; every client when omitted, none when empty. The others are served HTTP/1.1. |
+| `limits` | table, {ref}`[listener.limits] <config-daemon-listener-limits>` |  | The listener's own limits on its connections and on reading a request's head, each replacing the `[limits]` value for the connections it accepts. |
 | `tls` | boolean | `false` | Whether TLS is terminated on it, with the certificates of the virtual hosts it serves, chosen by SNI. |
+
+(config-daemon-listener-limits)=
+## `[listener.limits]`
+
+A listener's `limits` table: the keys of `[limits]` that bound a connection and the reading of a request's head, each replacing the node's for the connections the listener accepts.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `header_read_timeout` | string | `header_read_timeout` in `[limits]` | Time allowed for a complete request head. |
+| `http2` | table, {ref}`[limits.http2] <config-daemon-limits-http2>` |  | HTTP/2 settings. |
+| `keep_alive_timeout` | string | `keep_alive_timeout` in `[limits]` | Idle time before a keep-alive connection is closed. |
+| `keep_alive_timeout_proxy` | string | `keep_alive_timeout_proxy` in `[limits]` | The same for connections from trusted proxies. |
+| `max_connections` | integer | `max_connections` in `[limits]` | Open connections on the listener. |
+| `max_connections_per_client` | integer | `max_connections_per_client` in `[limits]` | Open connections per client address; 0 disables it. |
+| `max_header_bytes` | string | `max_header_bytes` in `[limits]` | Largest request head, for example 64KB. |
+| `max_headers` | integer | `max_headers` in `[limits]` | Most headers in a request. |
+| `max_requests_per_connection` | integer | `max_requests_per_connection` in `[limits]` | Requests served on one connection before it is closed; 0 for no limit. |
 
 (config-daemon-logs)=
 ## `[logs]`

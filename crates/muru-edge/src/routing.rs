@@ -2361,6 +2361,7 @@ mod tests {
             limits: None,
             access_log: None,
             access_log_overrides: Vec::new(),
+            listener_limits: Vec::new(),
             worker_sockets: Vec::new(),
             default_app: String::new(),
             default_release: String::new(),
