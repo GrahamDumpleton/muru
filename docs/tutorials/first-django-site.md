@@ -159,7 +159,10 @@ it, without reaching a worker. The login page came from the release.
 ## Migrations
 
 The daemon does not run `manage.py migrate`. Run it yourself, with the
-production settings, before deploying a release that needs it. While a
+production settings, before deploying a release that needs it:
+`muructl exec -- python manage.py migrate` runs it for the project in
+the current directory, and [database migrations](../howto/migrations.md)
+covers running it with a release. While a
 deploy switches from one release to the next, both serve for a moment
 against the same database, so a migration should leave the schema usable
 by the release before it as well: add a column in one release, start

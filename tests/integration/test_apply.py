@@ -47,6 +47,42 @@ def apply(daemon: Daemon, path: Path, *arguments: str) -> subprocess.CompletedPr
     return daemon.muructl("apply", "-f", str(path), *arguments, check=False)
 
 
+def test_a_daemon_format_file_beside_the_code_is_named_muru_daemon_toml(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    # The coding agents guide's example: a file for muructl apply kept
+    # with the project, its source the directory it is in. What its
+    # table leaves out comes from the project's own settings.
+
+    project = tmp_path / "shop"
+    project.mkdir()
+    (project / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (project / "pyproject.toml").write_text(
+        "[tool.muru]\nentrypoint = 'app:application'\nthreads = 3\n"
+    )
+    declared = f"[app.shop.release.r1]\nsource = '.'\npython = '{sys.executable}'\nprocesses = 1\n"
+    (project / "muru.daemon.toml").write_text(declared)
+
+    applied = apply(daemon, project / "muru.daemon.toml")
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    daemon.wait_for_routing("shop")
+    shown = daemon.muructl("release", "show", "shop@r1").stdout
+    assert "app:application" in shown and "1 process of 3 threads" in shown, shown
+
+    # Saved as muru.toml it is the project's settings file, which holds
+    # other keys, and the refusal says what the file was taken for.
+
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (other / "muru.toml").write_text(declared.replace("shop", "other"))
+    refused = apply(daemon, other / "muru.toml")
+    output = refused.stdout + refused.stderr
+    assert refused.returncode != 0
+    assert "`app` is a key of the daemon's format, and this file is read as the project's" in output
+    assert "named muru.daemon.toml" in output, output
+
+
 def test_an_interpreter_relative_to_the_file_is_resolved_there(
     daemon: Daemon, tmp_path: Path
 ) -> None:
@@ -114,6 +150,64 @@ def test_dry_run_plans_without_changing_anything(daemon: Daemon, tmp_path: Path)
         {"release": "shop@r2", "state": "ready", "serving": "yes"},
         {"release": "shop@r1", "state": "retained", "serving": ""},
     ]
+
+
+def test_how_the_releases_an_apply_adds_are_deployed(daemon: Daemon, tmp_path: Path) -> None:
+    # --hold starts every release the apply adds, in every application,
+    # and leaves traffic where it is; the plan and the report say so of
+    # each. A first release held leaves its application serving nothing.
+
+    config = tmp_path / "all.toml"
+    config.write_text(release("shop", "r1") + release("api", "r1"))
+    planned = apply(daemon, config, "--hold", "--dry-run")
+    held = [line for line in planned.stdout.splitlines() if "held: " in line]
+    assert [line.split()[:2] for line in held] == [["deploy", "api@r1"], ["deploy", "shop@r1"]]
+
+    applied = apply(daemon, config, "--hold")
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    outcomes = [line.split(None, 2) for line in applied.stdout.splitlines() if "deploy " in line]
+    assert outcomes == [
+        ["deploy", "api@r1", "ready and held: not serving"],
+        ["deploy", "shop@r1", "ready and held: not serving"],
+    ]
+    assert sorted(daemon.releases(), key=lambda row: row["release"]) == [
+        {"release": "api@r1", "state": "ready", "serving": ""},
+        {"release": "shop@r1", "state": "ready", "serving": ""},
+    ]
+    daemon.muructl("rollout", "bluegreen", "shop@r1")
+    assert daemon.releases("shop") == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
+
+    # --retain says how long the release an apply replaces stays warm,
+    # which the plan says, and 0 stops it once it has drained.
+
+    config.write_text(release("shop", "r1") + release("shop", "r2", threads=1))
+    planned = apply(daemon, config, "--dry-run")
+    assert (
+        "muru: shop@r1 stays warm for 1800s with 1 worker to a group, when shop@r2 takes its place"
+        in planned.stdout
+    )
+    planned = apply(daemon, config, "--dry-run", "--retain", "0")
+    assert "muru: shop@r1 stops once it has drained, when shop@r2 takes its place" in planned.stdout
+    applied = apply(daemon, config, "--retain", "0")
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    deadline = time.monotonic() + 20
+
+    while time.monotonic() < deadline and daemon.releases("shop")[1]["state"] != "stopped":
+        time.sleep(0.1)
+
+    assert daemon.releases("shop") == [
+        {"release": "shop@r2", "state": "ready", "serving": "yes"},
+        {"release": "shop@r1", "state": "stopped", "serving": ""},
+    ]
+
+    # --no-wait returns once the release is recorded.
+
+    config.write_text(release("shop", "r2", threads=1) + release("shop", "r3", threads=2))
+    early = apply(daemon, config, "--no-wait")
+    assert early.returncode == 0, early.stdout + early.stderr
+    assert early.stdout.splitlines()[1].split()[:3] == ["deploy", "shop@r3", "recorded"]
+    daemon.muructl("release", "wait", "shop@r3")
+    assert daemon.releases("shop")[0]["release"] == "shop@r3"
 
 
 def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path: Path) -> None:

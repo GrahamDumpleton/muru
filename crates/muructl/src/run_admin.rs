@@ -123,9 +123,54 @@ pub struct RunState {
     pub logs: Logs,
     /// The host's control connection.
     pub host: SharedHostLink,
+    /// What the application is served with, for its commands.
+    pub served: Arc<Served>,
+}
+
+/// What the run serves the application with, which a command of the
+/// project runs with too (section 9.12): the interpreter and the runtime
+/// library's directory, which a rebuilt environment replaces, and the
+/// project's environment variables.
+pub struct Served {
+    /// The interpreter, and the runtime library's directory when the
+    /// environment's own `muru` is not used.
+    pub interpreter: Mutex<(PathBuf, Option<PathBuf>)>,
+    /// The project's environment variables.
+    pub env: Vec<(String, String)>,
+    /// The project settings file muructl serve was given, read in place
+    /// of the one beside the code.
+    pub file: Option<PathBuf>,
+}
+
+impl Served {
+    /// A rebuilt environment's interpreter and runtime library.
+    pub fn replace(&self, python: PathBuf, pythonpath: Option<PathBuf>) {
+        *self.interpreter.lock().expect("interpreter poisoned") = (python, pythonpath);
+    }
 }
 
 impl RunState {
+    /// What a command of the project runs with, as the release that
+    /// serves does.
+    fn command_context(&self, release: String) -> crate::project_commands::Context {
+        let (python, pythonpath) = self
+            .served
+            .interpreter
+            .lock()
+            .expect("interpreter poisoned")
+            .clone();
+
+        crate::project_commands::Context {
+            app: self.app.clone(),
+            release,
+            project: self.project.clone(),
+            python,
+            pythonpath,
+            env: self.served.env.clone(),
+            file: self.served.file.clone(),
+        }
+    }
+
     /// The release that serves, as the log names it.
     pub fn release_id(&self) -> String {
         format!("r{}", self.release.load(Ordering::Relaxed))
@@ -670,6 +715,59 @@ impl Admin for Service {
         Ok(Response::new(self.lines(&state.app, &release, first, live)))
     }
 
+    /// Section 9.12: a command of the project, declared or one-off, run
+    /// with what the application is served with. Its output joins the
+    /// run's own, and an exclusive command runs one at a time here.
+    async fn run_command(
+        &self,
+        request: Request<pb::RunCommandRequest>,
+    ) -> Result<Response<CommandStream>, Status> {
+        let request = request.into_inner();
+        let state = &self.state;
+        let release = state
+            .target(&request.app, &request.release)
+            .map_err(Status::not_found)?;
+        let command = muru_controller::commands::CommandRequest::from_message(request)
+            .map_err(Status::invalid_argument)?;
+
+        let output = crate::project_commands::run(
+            &state.command_context(release),
+            command,
+            Arc::new(crate::project_commands::Printed {
+                logs: state.logs.clone(),
+            }),
+        )
+        .map_err(Status::failed_precondition)?;
+        let stream =
+            tokio_stream::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(output), Ok);
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    /// The commands the project declares, as its file has them now. A
+    /// run keeps no record of a command's last run.
+    async fn list_commands(
+        &self,
+        request: Request<pb::ListCommandsRequest>,
+    ) -> Result<Response<pb::ListCommandsResponse>, Status> {
+        let request = request.into_inner();
+        let state = &self.state;
+        let release = state
+            .target(&request.app, &request.release)
+            .map_err(Status::not_found)?;
+        let commands =
+            crate::project_commands::declared(&state.project, state.served.file.as_deref())
+                .map_err(Status::failed_precondition)?;
+
+        Ok(Response::new(pb::ListCommandsResponse {
+            app: state.app.clone(),
+            release,
+            commands: commands
+                .iter()
+                .map(|command| muru_controller::commands::info(command, None))
+                .collect(),
+        }))
+    }
+
     async fn reopen_logs(
         &self,
         _: Request<pb::ReopenLogsRequest>,
@@ -892,8 +990,7 @@ impl Admin for Service {
         list_apps(pb::ListAppsRequest) -> pb::ListAppsResponse, "muructl app";
         get_app(pb::GetAppRequest) -> pb::App, "muructl app";
         deploy(pb::DeployRequest) -> pb::Release, "muructl deploy";
-        run_command(pb::RunCommandRequest) -> CommandStream, "muructl exec and muructl command run";
-        list_commands(pb::ListCommandsRequest) -> pb::ListCommandsResponse, "muructl command";
+        plan_deploy(pb::DeployRequest) -> pb::DeployPlan, "muructl deploy";
         list_releases(pb::ListReleasesRequest) -> pb::ListReleasesResponse, "muructl release";
         get_release(pb::GetReleaseRequest) -> pb::Release, "muructl release";
         wait_release(pb::WaitReleaseRequest) -> pb::Release, "muructl release wait";

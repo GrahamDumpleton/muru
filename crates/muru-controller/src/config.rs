@@ -522,40 +522,7 @@ fn plan_app(
             continue;
         };
 
-        // Section 4.6: the limits the release sets on the requests it
-        // serves, which no deploy flag carries.
-
-        let served = match muru_config::check_served_limits(
-            table.max_body_size.as_deref(),
-            table.timeouts.as_ref(),
-        ) {
-            Ok(served) => served,
-            Err(error) => {
-                plan.errors.push(format!("{name}@{id}: {error}"));
-                continue;
-            }
-        };
-
-        let tables = Tables {
-            limits: (!served.is_empty()).then_some(served),
-            groups: (!table.groups.is_empty()).then_some(&table.groups),
-            mounts: (!table.mounts.is_empty()).then_some(&table.mounts),
-            static_dirs: (!table.static_dirs.is_empty()).then_some(&table.static_dirs[..]),
-            logging: table.logging.as_ref(),
-            scaling: table.scaling.as_ref(),
-            error_pages: (!table.error_pages.is_empty()).then_some(&table.error_pages),
-            error_override: table.error_override.as_ref(),
-            maintenance: table.maintenance.as_ref(),
-            commands: (!table.commands.is_empty()).then_some(&table.commands),
-            declared: true,
-        };
-
-        let spec = match resolve_spec(
-            &request_from(name, table, source),
-            None,
-            &tables,
-            provisioning,
-        ) {
+        let spec = match resolve_declared(name, table, source, provisioning) {
             Ok(spec) => spec,
             Err(error) => {
                 plan.errors.push(format!("{name}@{id}: {error}"));
@@ -2646,6 +2613,52 @@ fn layer(given: bool, table: bool, previous: bool, declared: bool) -> &'static s
     }
 }
 
+/// Section 13.1: a release's worker processes when nothing sets them.
+pub const DEFAULT_PROCESSES: u32 = 1;
+/// Its application threads in each worker.
+pub const DEFAULT_THREADS: u32 = 4;
+/// Its threads for synchronous code called from an ASGI application.
+pub const DEFAULT_SYNC_THREADS: u32 = 8;
+/// The requests an ASGI worker's event loop takes at once.
+pub const DEFAULT_CONCURRENCY: u32 = 1000;
+
+/// Resolve a declared release as an apply does: from its table and the
+/// source's own settings, never from an earlier release, so that a file
+/// means the same thing wherever it is applied.
+pub fn resolve_declared(
+    app: &str,
+    table: &ReleaseTable,
+    source: &str,
+    provisioning: &crate::provision::Provisioning,
+) -> Result<ReleaseSpec, String> {
+    // Section 4.6: the limits the release sets on the requests it
+    // serves, which no deploy flag carries.
+
+    let served =
+        muru_config::check_served_limits(table.max_body_size.as_deref(), table.timeouts.as_ref())?;
+
+    let tables = Tables {
+        limits: (!served.is_empty()).then_some(served),
+        groups: (!table.groups.is_empty()).then_some(&table.groups),
+        mounts: (!table.mounts.is_empty()).then_some(&table.mounts),
+        static_dirs: (!table.static_dirs.is_empty()).then_some(&table.static_dirs[..]),
+        logging: table.logging.as_ref(),
+        scaling: table.scaling.as_ref(),
+        error_pages: (!table.error_pages.is_empty()).then_some(&table.error_pages),
+        error_override: table.error_override.as_ref(),
+        maintenance: table.maintenance.as_ref(),
+        commands: (!table.commands.is_empty()).then_some(&table.commands),
+        declared: true,
+    };
+
+    resolve_spec(
+        &request_from(app, table, source),
+        None,
+        &tables,
+        provisioning,
+    )
+}
+
 /// Resolve a deploy request into a release spec: the request's settings,
 /// then the source's [tool.muru] table, then the previous release when
 /// one is given (a deploy that is not fresh) and it ran native workers,
@@ -2791,22 +2804,22 @@ pub fn resolve_spec(
         .processes
         .or(table.processes.map(|value| value as u32))
         .or(previous.map(|previous| previous.processes))
-        .unwrap_or(1);
+        .unwrap_or(DEFAULT_PROCESSES);
     let threads = request
         .threads
         .or(table.threads.map(|value| value as u32))
         .or(previous.map(|previous| previous.threads))
-        .unwrap_or(4);
+        .unwrap_or(DEFAULT_THREADS);
     let sync_threads = request
         .sync_threads
         .or(table.sync_threads.map(|value| value as u32))
         .or(previous.map(|previous| previous.sync_threads))
-        .unwrap_or(8);
+        .unwrap_or(DEFAULT_SYNC_THREADS);
     let concurrency = request
         .concurrency
         .or(table.concurrency.map(|value| value as u32))
         .or(previous.map(|previous| previous.concurrency))
-        .unwrap_or(1000);
+        .unwrap_or(DEFAULT_CONCURRENCY);
     let groups = groups.unwrap_or(&table.groups);
     let mounts = mounts.unwrap_or(&table.mounts);
     check_groups_and_mounts(groups, mounts)?;
@@ -3279,7 +3292,7 @@ pub fn resolve_spec(
 /// inputs with names Python accepts as keywords, patterns that compile,
 /// no default where one is required or secret, and every placeholder an
 /// input, a secret one only in `env`, where no command line shows it.
-fn resolve_commands(
+pub fn resolve_commands(
     tables: &BTreeMap<String, muru_config::CommandTable>,
 ) -> Result<Vec<crate::model::CommandSpec>, String> {
     let mut commands = Vec::with_capacity(tables.len());
@@ -3499,10 +3512,22 @@ fn resolve_build(
         ));
     }
 
-    let mut extras = settings.extras.clone();
-    extras.extend(request.build_extras.iter().cloned());
-    let mut groups = settings.groups.clone();
-    groups.extend(request.build_groups.iter().cloned());
+    // The request's extras and groups go beside the table's, each once,
+    // so that a declared release which repeats the table's adds nothing.
+
+    let beside = |settings: &[String], request: &[String]| {
+        let mut all = settings.to_vec();
+
+        for name in request {
+            if !all.contains(name) {
+                all.push(name.clone());
+            }
+        }
+
+        all
+    };
+    let extras = beside(&settings.extras, &request.build_extras);
+    let groups = beside(&settings.groups, &request.build_groups);
 
     Ok(crate::model::BuildSpec {
         when,
@@ -3576,7 +3601,9 @@ fn resolve_interpreter(
 }
 
 /// Section 3.3: where each of a release's settings comes from, by the
-/// keys `release_settings` shows.
+/// keys `release_settings` shows. The build mode and where bytecode goes
+/// (section 8.2) come from the request or the source alone, never an
+/// earlier release.
 fn resolve_layers(
     request: &pb::DeployRequest,
     table: &muru_config::ToolMuru,
@@ -3610,6 +3637,27 @@ fn resolve_layers(
             ),
         ),
         ("python", python),
+        (
+            "build.when",
+            layer(
+                !request.build_when.is_empty(),
+                table
+                    .build
+                    .as_ref()
+                    .is_some_and(|build| build.when.is_some()),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "bytecode",
+            layer(
+                !request.bytecode.is_empty(),
+                table.bytecode.is_some(),
+                false,
+                declared,
+            ),
+        ),
         (
             "interface",
             layer(
@@ -3828,7 +3876,7 @@ fn resolve_layers(
 
 /// Section 3.3: a release's settings as `config show --effective`
 /// shows them beside their layers, by key.
-fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
+pub fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
     let optional = |value: Option<u64>, format: fn(u64) -> String| {
         value.map_or_else(|| "off".to_owned(), format)
     };
@@ -4289,7 +4337,7 @@ fn resolve_error_tables(
 
 /// A deploy request's keys as the release table they amount to, for the
 /// kind check of section 9.9: which keys are set is what matters.
-fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, String> {
+pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, String> {
     let readiness = (!request.readiness_path.is_empty() || request.readiness_timeout_ms.is_some())
         .then(|| muru_config::Readiness {
             path: (!request.readiness_path.is_empty()).then(|| request.readiness_path.clone()),
@@ -4388,7 +4436,7 @@ fn parse_optional<T: std::str::FromStr<Err = muru_config::ParseError>>(
 }
 
 /// Milliseconds as a duration a table writes.
-fn format_ms(ms: u64) -> String {
+pub(crate) fn format_ms(ms: u64) -> String {
     muru_config::format_duration(Duration::from_millis(ms))
 }
 
@@ -5224,7 +5272,7 @@ fn describe_http(http: Option<&HttpServerSpec>) -> String {
 
 /// What a release runs, for the report: entrypoint, processes by threads
 /// and the source.
-fn describe(spec: &ReleaseSpec) -> String {
+pub fn describe(spec: &ReleaseSpec) -> String {
     if let Some(http) = &spec.http {
         return format!("{} in {}", http.describe(), spec.source.display());
     }

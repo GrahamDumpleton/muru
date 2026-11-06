@@ -326,7 +326,7 @@ with `--fix`; the formatters keep what it inserts.
 | `just test-docker` | Container scenarios (needs a container runtime) |
 | `just test-linux` | Linux suites inside the development container |
 | `just bench` | Performance scenarios against other servers (see bench/README.md; Linux for real numbers) |
-| `just docs` | Build the documentation with warnings as errors |
+| `just docs` | Build the documentation from nothing, as CI does, with warnings as errors |
 | `just docs-latex` | Check the LaTeX source for the PDF builds cleanly (the PDF itself is built on Read the Docs) |
 | `just changelog-draft` | Preview the changelog the fragments would produce |
 | `just changelog` | Build the changelog from the fragments, in the release pull request |

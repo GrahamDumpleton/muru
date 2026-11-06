@@ -412,6 +412,27 @@ def test_serve_runs_as_an_arbitrary_user_on_a_read_only_root(
     assert instance.exec("python3", "-c", "import os; print(os.getuid())").stdout.strip() == (
         "1000770000"
     )
+
+    # Section 9.12: a command of the project runs through the serve, and
+    # in a container of its own, where nothing serves, by muructl itself.
+
+    release = "import muru, os; print('release', os.environ.get('MURU_RELEASE', 'none'))"
+    through = instance.exec("muructl", "exec", "--", "python", "-c", release, check=False)
+    assert through.returncode == 0, through.stdout + through.stderr
+    assert through.stdout.strip() == "release r1"
+    assert "[command exec] release r1" in instance.logs()
+
+    alone = ["muructl", "exec", "--", "python", "-c", release]
+    completed = subprocess.run(
+        ["docker", "run", "--rm", "--user", "1000770000:0", "--read-only", IMAGE, *alone],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.strip() == "release none"
+
     elapsed, code = instance.stop()
     assert code == 0, instance.logs()
     assert elapsed < 9, elapsed

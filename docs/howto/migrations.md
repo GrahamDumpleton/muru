@@ -78,6 +78,34 @@ muructl command run shop migrate
 CI job that deploys can stop at a failed migration before it moves any
 traffic.
 
+## Without the daemon
+
+The same declared command runs for [the project in the current
+directory](commands.md#the-projects-own-commands) when no application is
+named:
+
+```
+muructl command run migrate
+```
+
+- **In development**, it runs with the project's own interpreter and
+  environment, through `muructl run` when that is up and on its own
+  otherwise, so the migration is run the way it will be in production.
+- **In a container platform**, run it from the new image before the
+  image serves: a Kubernetes Job as the [Kubernetes
+  guide](kubernetes.md#migrations) shows, an init container, a Helm
+  pre-upgrade hook, or `docker run --rm IMAGE muructl command run
+  migrate` before `docker compose up`. It needs no running container of
+  the application.
+- **In a serving container**, `docker exec` or `kubectl exec` runs it
+  through the `muructl serve` there, which suits a command that goes
+  with the code already serving, such as the contract step.
+
+`exclusive = true` holds for one daemon or one serving process. A
+migration started by several Jobs at once is kept to one run by the
+platform, with a Job of `parallelism: 1`, or by the migration tool's own
+lock.
+
 ## Rolling back
 
 A rollback moves traffic to the previous release but leaves the schema

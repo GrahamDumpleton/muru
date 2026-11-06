@@ -4493,7 +4493,7 @@ impl Daemon {
             env,
             cwd: spec.source.clone(),
             identity,
-            log: self.host_log(app, id),
+            log: Some(self.host_log(app, id)),
             timeout: None,
             declared: None,
             exclusive: false,

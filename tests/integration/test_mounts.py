@@ -108,11 +108,11 @@ def test_the_start_up_output_names_each_mount(development: support.Server) -> No
     assert "muru: mount reports serves /reports from mounted:reports_app" in log
 
 
-def test_print_config_writes_the_mounts() -> None:
+def test_render_writes_the_mounts() -> None:
     muructl = support.muructl_path()
     assert muructl is not None
     completed = subprocess.run(
-        [str(muructl), "run", str(MOUNTED), "--print-config", "--python", sys.executable],
+        [str(muructl), "render", "mounted", str(MOUNTED)],
         capture_output=True,
         text=True,
         check=True,

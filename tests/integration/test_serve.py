@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -271,20 +272,114 @@ def test_a_named_proxy_has_the_header_types_of_the_built_in_trust(tmp_path: Path
 
 
 def test_print_config_names_where_each_setting_came_from(tmp_path: Path) -> None:
-    config = tmp_path / "serve.toml"
-    config.write_text('access_log = "errors"\nthreads = 3\n')
+    # A project settings file named in place of the one beside the code,
+    # as a deployment mounts one, with serve's settings under [serve].
+
+    config = tmp_path / "settings.toml"
+    config.write_text(
+        "entrypoint = 'plain_wsgi:application'\nsync_threads = 2\n"
+        "\n[serve]\naccess_log = 'errors'\nthreads = 3\n\n[run]\nport = 9\n"
+    )
     serve = start(
         tmp_path,
         "--print-config",
         env={"MURU_SERVE_CONFIG": str(config), "MURU_SERVE_THREADS": "5"},
+        app=None,
         wait=False,
     )
     assert serve.process.wait(timeout=30) == 0
     time.sleep(0.2)
     output = serve.output()
-    assert f'access_log = "errors"    # {config}' in output, output
-    assert 'threads = "5"    # environment' in output, output
-    assert 'processes = "1"    # command line' in output, output
+
+    def source(key: str) -> str:
+        lines = [line for line in output.splitlines() if line.startswith(f"{key} = ")]
+        assert len(lines) == 1, output
+        return lines[0].split("# ", 1)[1]
+
+    assert output.startswith(
+        "# The settings this muructl serve would use, and where each came from.\n"
+        f"# The project's settings are read from {config}.\n"
+    ), output
+    assert source("entrypoint") == str(config)
+    assert source("sync_threads") == str(config)
+    assert source("threads") == "MURU_SERVE_THREADS"
+    assert source("processes") == "command line"
+    assert source("access_log") == f"[serve] in {config}"
+    assert source("admin_listen") == "command line"
+    assert source("slow") == "default"
+    assert "# The run table is muructl run's, and is not read here." in output
+
+    # It reads as the project's file does, so it can be saved as one.
+
+    document = tomllib.loads(output)
+    assert document["threads"] == 5 and document["sync_threads"] == 2
+    assert document["serve"]["access_log"] == "errors"
+    assert document["serve"]["compression"] is True
+
+
+def test_a_named_settings_file_is_used_in_place_of_the_projects(tmp_path: Path) -> None:
+    # Section 13.9: --config names a project settings file, and the one
+    # beside the code is not read at all. Paths in it are the project's.
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    project = tmp_path / "shop"
+    project.mkdir()
+    (project / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (project / "public").mkdir()
+    (project / "public" / "hello.txt").write_text("from the project\n")
+    (project / "pyproject.toml").write_text(
+        "[tool.muru]\nentrypoint = 'missing:application'\n"
+        "[tool.muru.commands.only-in-project]\nrun = ['true']\n"
+    )
+    mounted = tmp_path / "mounted"
+    mounted.mkdir()
+    settings = mounted / "settings.toml"
+    settings.write_text(
+        "entrypoint = 'app:application'\nenv = { GREETING = 'mounted' }\n"
+        "\n[[static]]\npath = '/public'\ndir = 'public'\n"
+        "\n[commands.greet]\nrun = ['python', '-c', 'import os; print(os.environ[\"GREETING\"])']\n"
+        "\n[serve]\naccess_log = 'off'\n"
+    )
+    serve = start(tmp_path, "--chdir", str(project), "--config", str(settings), app=None)
+
+    def run(*arguments: str, **env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(muructl), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=tmp_path,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, **env},
+        )
+
+    try:
+        assert serve.get("/info")[0] == 200
+        assert serve.get("/public/hello.txt") == (200, "from the project\n")
+
+        # The serve's commands are those of the file it was given.
+
+        listed = run("command", "list", MURU_RUN_DIR=str(serve.run_dir))
+        assert "greet" in listed.stdout and "only-in-project" not in listed.stdout, listed
+        ran = run("command", "run", "greet", MURU_RUN_DIR=str(serve.run_dir))
+        assert (ran.returncode, ran.stdout) == (0, "mounted\n"), ran.stderr
+    finally:
+        assert serve.stop() == 0
+
+    # With nothing serving, as in a Job, a command reads the same file
+    # from the variable the Deployment sets, or from the flag.
+
+    empty = support.short_dir("muru-none-")
+    where = ["--chdir", str(project), "--python", sys.executable]
+    own = run(
+        "command", "run", "greet", *where, MURU_RUN_DIR=str(empty), MURU_SERVE_CONFIG=str(settings)
+    )
+    assert (own.returncode, own.stdout) == (0, "mounted\n"), own.stderr
+    flagged = run("command", "list", "--config", str(settings), *where, MURU_RUN_DIR=str(empty))
+    assert "greet" in flagged.stdout and "only-in-project" not in flagged.stdout, flagged
+    beside = run("command", "list", *where, MURU_RUN_DIR=str(empty))
+    assert "only-in-project" in beside.stdout, beside.stdout + beside.stderr
 
 
 def test_json_lines_carry_their_kind_time_and_pod(tmp_path: Path) -> None:
@@ -388,6 +483,64 @@ def test_probe_answers_over_the_run_directory(tmp_path: Path) -> None:
         timeout=30,
     )
     assert gone.returncode == 1
+
+
+def test_a_command_of_the_project_runs_through_the_serve(tmp_path: Path) -> None:
+    # Section 9.12: muructl in the container, as kubectl exec runs it,
+    # runs the project's commands through the serve it finds in the run
+    # directory, with what the application is served with.
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    project = tmp_path / "shop"
+    project.mkdir()
+    (project / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (project / "pyproject.toml").write_text(
+        """[tool.muru]
+entrypoint = 'app:application'
+env = { GREETING = 'hello' }
+
+[tool.muru.commands.greet]
+run = ['python', '-c', 'import os, sys; print(os.environ["GREETING"], sys.argv[1])', '{name}']
+inputs.name = { default = 'pod' }
+"""
+    )
+    serve = start(tmp_path, "--chdir", str(project), "--log-format", "json", app=None)
+
+    def run(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(muructl), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=tmp_path,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "MURU_RUN_DIR": str(serve.run_dir)},
+        )
+
+    try:
+        listed = run("command", "list")
+        assert listed.returncode == 0, listed.stderr
+        assert listed.stdout.startswith("app@r1\n") and "greet" in listed.stdout, listed.stdout
+
+        ran = run("command", "run", "greet")
+        assert ran.returncode == 0, ran.stderr
+        assert ran.stdout == "hello pod\n"
+
+        # Its output and events are records of the serve's one stream.
+
+        serve.wait_for("command.finished: greet")
+        records = [json.loads(line) for line in serve.stdout]
+        assert any(record["message"] == "[command greet] hello pod" for record in records)
+        assert any(
+            record["kind"] == "muru" and record["message"].startswith("command.started: greet")
+            for record in records
+        )
+
+        one_off = run("exec", "--", "python", "-c", "import sys; sys.exit(7)")
+        assert one_off.returncode == 7, one_off.stderr
+    finally:
+        assert serve.stop() == 0
 
 
 def test_an_unwritable_run_directory_says_what_fixes_it(tmp_path: Path) -> None:

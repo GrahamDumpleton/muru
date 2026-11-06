@@ -22,6 +22,9 @@ service Admin {
   // default strategy (blue/green): start it, move traffic when it is
   // ready, drain the previous release.
   rpc Deploy(DeployRequest) returns (Release);
+  // What that deploy would do (muructl deploy --dry-run): the release as
+  // it would be resolved and what would refuse it. Nothing changes.
+  rpc PlanDeploy(DeployRequest) returns (DeployPlan);
 
   // Releases.
   rpc ListReleases(ListReleasesRequest) returns (ListReleasesResponse);
@@ -314,6 +317,30 @@ message DeployRequest {
   repeated string build_extras = 53;        // extras the built environment includes, beside the table's
   repeated string build_groups = 54;        // dependency groups the built environment includes, beside the table's
   string bytecode = 55;                     // section 8.2: redirect, source or off; the table's, else redirect, when empty
+}
+
+// What a deploy would do. With refusals nothing would be deployed.
+message DeployPlan {
+  string app = 1;
+  string release = 2;               // the id the release would take
+  bool new_app = 3;                 // the application would be created
+  string description = 4;           // what the release runs, as an apply's plan describes it
+  repeated DeploySetting settings = 5;
+  bool builds = 6;                  // the daemon would build an environment from uv.lock
+  string serving = 7;               // the release that serves now, or empty
+  string settings_from = 8;         // the release whose settings fill what nothing else gives, or empty
+  bool hold = 9;                    // the release would start and traffic would stay where it is
+  uint64 retain_ms = 10;            // how long the release it replaces would stay warm
+  uint32 retain_workers = 11;       // and the workers each of its groups would keep
+  repeated string refusals = 12;    // what would refuse the deploy
+}
+
+// One of a planned release's settings and the layer it would come from
+// (section 3.3).
+message DeploySetting {
+  string key = 1;
+  string value = 2;
+  string layer = 3;                 // deploy flags, [tool.muru], the previous release or default
 }
 
 // Section 4.9: a directory of the release's own files, as --static gives it.
@@ -717,6 +744,10 @@ message ApplyConfigRequest {
   bool dry_run = 2;                 // report the plan and change nothing
   bool prune = 3;                   // also remove what the document does not contain
   bool override_freeze = 4;         // deploy releases of applications an overlay freezes (section 9.6)
+  bool hold = 5;                    // start the releases the apply adds and leave traffic where it is
+  bool no_wait = 6;                 // return once those releases are recorded, without waiting for them to serve
+  optional uint64 retain_ms = 7;    // how long a release the apply replaces stays warm; 30 minutes when absent
+  optional uint32 retain_workers = 8; // the workers each of its groups keeps meanwhile; 1 when absent
 }
 
 message DiffConfigRequest {

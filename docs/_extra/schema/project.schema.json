@@ -996,7 +996,7 @@
     },
     "ServeSettings": {
       "additionalProperties": false,
-      "description": "The `[tool.muru.serve]` table (`[serve]` in muru.toml), and the file `MURU_SERVE_CONFIG` names: how `muructl serve` runs the application in a container. A key is a flag of the command in snake case, taking the flag's value; a list key takes the values the flag would be repeated with.",
+      "description": "The `[tool.muru.serve]` table (`[serve]` in muru.toml, and in the file `muructl serve --config` names in its place): how `muructl serve` runs the application in a container. A key is a flag of the command in snake case, taking the flag's value; a list key takes the values the flag would be repeated with.",
       "properties": {
         "access_log": {
           "default": "on",

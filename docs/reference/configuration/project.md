@@ -2,7 +2,7 @@
 
 # The project's [tool.muru] table
 
-The keys an application ships with: the `[tool.muru]` table of its `pyproject.toml`, or the same keys at the top level of a `muru.toml` beside it. Every key is optional. A command line flag, or a release declared to the daemon, takes precedence over the key.
+The keys an application ships with: the `[tool.muru]` table of its `pyproject.toml`, or the same keys at the top level of a `muru.toml` beside it. A project with both uses its `muru.toml`: the `[tool.muru]` table is then not read, and the two are never merged. `muructl serve --config FILE` reads FILE, in the form of a `muru.toml`, in place of either. Every key is optional. A command line flag, or a release declared to the daemon, takes precedence over the key.
 
 The JSON Schema of the same keys, for an editor that checks TOML against one, is `https://docs.muruhq.dev/en/latest/schema/project.schema.json`.
 
@@ -302,7 +302,7 @@ The same keys apply at `[tool.muru.groups.NAME.scaling]`.
 (config-project-tool-muru-serve)=
 ## `[tool.muru.serve]`
 
-The `[tool.muru.serve]` table (`[serve]` in muru.toml), and the file `MURU_SERVE_CONFIG` names: how `muructl serve` runs the application in a container. A key is a flag of the command in snake case, taking the flag's value; a list key takes the values the flag would be repeated with.
+The `[tool.muru.serve]` table (`[serve]` in muru.toml, and in the file `muructl serve --config` names in its place): how `muructl serve` runs the application in a container. A key is a flag of the command in snake case, taking the flag's value; a list key takes the values the flag would be repeated with.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |

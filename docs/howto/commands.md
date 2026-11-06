@@ -11,6 +11,10 @@ anyone operating it runs them with `muructl command run`: a person, a
 deploy script, or a coding agent through the [MCP tools](coding-agents.md).
 `muructl exec` runs anything else, once.
 
+With no application named, the same commands run for [the project in the
+current directory](#the-projects-own-commands), with no daemon: in
+development, in a container, or in a Kubernetes Job.
+
 ## Declaring commands
 
 Commands are declared in the project's `[tool.muru]` table, in
@@ -213,9 +217,78 @@ builds from `uv.lock` must have started once, which builds it. A
 [managed server](managed-servers.md)'s release has no interpreter of its
 own and runs none.
 
-A development run with `muructl run` has no releases to run commands
-with; run them in the project's own environment instead, as
-`uv run python manage.py migrate`.
+A development run with `muructl run`, and `muructl serve`, have no
+releases to name. Their commands are [the project's
+own](#the-projects-own-commands).
+
+## The project's own commands
+
+Leave the application out, and a command is one of the project in the
+current directory:
+
+```
+muructl command list
+muructl command run migrate
+muructl command run add-user --input username=amy --input-stdin password
+muructl exec -- python manage.py showmigrations orders
+```
+
+The commands are the ones the project's file declares now. Each runs in
+the project directory with the interpreter, the runtime library and the
+`[tool.muru.env]` variables the application is served with, over the
+environment `muructl` itself has. Inputs, callables, `timeout`, output,
+the exit status and stopping work as they do for a release's command.
+
+Where the command runs depends on what is running:
+
+- **Through `muructl run` or `muructl serve`.** When a development run
+  of the project is up, or `muructl serve` is running in the container,
+  the command runs through it. Its output joins that process's output,
+  prefixed `[command NAME]`, so the terminal, the container's log and
+  `muructl logs` show it, and its start and end are printed as
+  `command.started`, `command.finished` and `command.failed` lines.
+  `MURU_RELEASE` names the release that serves, `r1` and so on.
+- **By `muructl` itself.** When nothing serves the project, `muructl`
+  starts the command and waits for it. Nothing else needs to be running,
+  which is what a Kubernetes Job, an init container, a Helm hook or a
+  step of a CI job needs. Its output goes to standard output and
+  standard error alone, and `MURU_RELEASE` is not set.
+
+`--chdir DIR` names the project from another directory, as it does for
+`muructl run`. A command `muructl` runs itself finds the rest as
+`muructl serve` and `muructl run` do:
+
+| What | Where it is looked for, in order |
+| --- | --- |
+| The project | `--chdir`, `MURU_SERVE_CHDIR`, the current directory |
+| The project's settings | The file `--config` or `MURU_SERVE_CONFIG` names, as [`muructl serve` takes it](containers.md#a-settings-file-from-outside-the-image); else the `muru.toml` or `pyproject.toml` in the project |
+| The interpreter | `--python`, `MURU_SERVE_PYTHON`, `python` in the settings' serve table, `python` in the settings, the active virtual environment, the project's `.venv`, `/app/.venv`, `python3` on `PATH` |
+| The runtime library | The interpreter's environment when it holds this version of `muru`; else the directory `--runtime-dir`, `MURU_SERVE_RUNTIME_DIR` or the serve table's `runtime_dir` names; else `/opt/muru` when it holds one; else where `muructl run` keeps it |
+
+A Job and a Deployment made from one image, with the same environment
+variables, so find the same settings, interpreter and library. No environment is
+built for a command: build it first, with `muructl build` or by running
+the application once.
+
+What differs by where a command runs:
+
+| | A named application, under the daemon | Through `muructl run` or `muructl serve` | By `muructl` itself |
+| --- | --- | --- | --- |
+| The code | The release's source | The project directory | The project directory |
+| `exclusive = true` | One run at a time for the application | One run at a time for that process | Not checked: one run at a time is up to what starts it, such as a Job with `parallelism: 1`, a Helm hook or the migration tool's own lock |
+| `--secret-input` | Read from the daemon's secret stores | Refused; give the value with `--input-stdin` | Refused; give the value with `--input-stdin` |
+| Output and events | The release's log and the events | That process's output | Standard output and standard error |
+| The last run in `muructl command list` | Kept | Not kept | Not kept |
+
+A project whose `[tool.muru.env]` takes a value from a secret store is
+served by the daemon alone, and its commands are run there too. The
+secrets a container is given are in its environment or mounted as files,
+and a command sees them as the application does.
+
+With an application named the command always goes to the daemon, which
+runs it with that release's own code and not with what is in the current
+directory. `--chdir`, `--config`, `--python` and `--runtime-dir` are
+refused there.
 
 ## Migrations
 

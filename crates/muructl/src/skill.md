@@ -38,12 +38,16 @@ with a non-zero exit status when it fails.
 | Roll back | `rollback` | `rollback APP` | Returns to the previous release, which is kept warm for a while after a deploy |
 | Drain | `drain` | `drain APP@RELEASE` | Leaves the release; its workers stop once their requests finish |
 | Canary | `rollout` with `canary` | `rollout canary APP@RELEASE --steps 10,50` | Shifts in steps; each step's gates (error rate, latency, worker faults) promote or roll back on their own |
-| Apply | `apply` | `apply --file muru.toml` | Whatever the file declares: a new release in it deploys as `deploy` does |
+| Apply | `apply` | `apply --file muru.daemon.toml` | Whatever the file declares: a new release in it deploys as `deploy` does |
+| Apply held | `apply` with `hold` | `apply --file muru.daemon.toml --hold` | Stays where it is; every release the apply adds runs beside what serves |
+| Plan a deploy | `deploy` with `dry_run` | `deploy APP SOURCE --dry-run` | None; reports the release a deploy would make, each setting with where it would come from, and what would refuse it |
 | Run a command | `run_command` | `command run APP NAME --input K=V` | None; runs a command the release declares (a migration, a data fix, a check) with the release's interpreter and settings |
 
 `deploy` adds one release; `apply` makes a declarative file the whole
-desired state. Use `apply` when the project has a `muru.toml`, `deploy`
-for a quick release of the working tree.
+desired state. Use `apply` when the project has a `muru.daemon.toml`, `deploy`
+for a quick release of the working tree. `muructl render APP SOURCE
+--release ID` writes a `muru.daemon.toml` for one release from a source
+directory and `deploy`'s settings, without the daemon.
 
 ## The development loop
 
@@ -51,7 +55,7 @@ for a quick release of the working tree.
    the MCP server was started with `--up`, which has done it.
 
 2. Deploy the working tree: `deploy` with `app` and `source` set to the
-   project directory, or `apply` with the project's `muru.toml`. Wait for
+   project directory, or `apply` with the project's `muru.daemon.toml`. Wait for
    the result: it is the release, with its `state` (`ready` or `failed`)
    and a `message` saying why it failed.
 

@@ -190,15 +190,13 @@ muru: error: no runtime library for /app/.venv/bin/python (cp313): build the ima
 
 ## Settings
 
-Every setting is a flag. The same setting can come from four other
+Every setting is a flag. The same setting can come from three other
 places, each taking precedence over the one before:
 
 1. the project's `[tool.muru]` table, as for a deployment;
 2. its `[tool.muru.serve]` table (`[serve]` at the top level of a
    `muru.toml`), whose keys are the flags in snake case;
-3. a file named by `--config` or `MURU_SERVE_CONFIG`, holding the same
-   keys at its top level;
-4. an environment variable per flag, `MURU_SERVE_` and the flag's name in
+3. an environment variable per flag, `MURU_SERVE_` and the flag's name in
    upper snake case: `MURU_SERVE_LISTEN` for `--listen`,
    `MURU_SERVE_PROCESSES` for `--processes`.
 
@@ -219,13 +217,65 @@ docker run -e MURU_SERVE_PROCESSES=8 registry.example.com/shop
 ```
 
 `muructl serve --print-config` prints the settings it would use, each
-with where it came from, and exits.
+with where it came from, and exits. The output has the shape of the
+project's file, the application's settings and then a `[serve]` table:
+
+```text
+$ MURU_SERVE_PROCESSES=8 muructl serve --print-config
+# The settings this muructl serve would use, and where each came from.
+# The project's settings are read from /app/pyproject.toml.
+
+entrypoint = "shop.wsgi:application"    # [tool.muru] in /app/pyproject.toml
+processes = 8                           # MURU_SERVE_PROCESSES
+threads = 4                             # default
+...
+
+[serve]
+listen = "0.0.0.0:8080"                 # default
+access_log_exclude = ["/static/*"]      # [tool.muru.serve] in /app/pyproject.toml
+...
+```
+
+The `[run]` table is `muructl run`'s and is not read here, so a setting
+both commands have, such as `access_log` or `slow`, is set again under
+`[serve]`.
+
+### A settings file from outside the image
+
+`--config FILE`, or `MURU_SERVE_CONFIG`, names a project settings file
+that is read in place of the `pyproject.toml` or `muru.toml` beside the
+code, which is then not read at all. A deployment mounts one to change
+the settings without building an image:
+
+```toml
+# /etc/shop/muru.toml, mounted from a ConfigMap
+entrypoint = "shop.wsgi:application"
+
+[commands.migrate]
+run = ["python", "manage.py", "migrate", "--noinput"]
+
+[serve]
+processes = 4
+trusted_proxy = ["10.0.0.0/8"]
+```
+
+```
+muructl serve --config /etc/shop/muru.toml
+```
+
+The file has the form of a `muru.toml`, with serve's settings under
+`[serve]`; a file named `pyproject.toml` is read for its `[tool.muru]`
+table. It holds everything the project's own file would, the entrypoint
+and the declared commands included, since the two are not merged.
+Relative paths in it, such as a static directory, are taken from the
+project directory. An environment variable or a flag still changes one
+setting over it.
 
 | Flag | Default | Effect |
 | --- | --- | --- |
 | `ENTRYPOINT` or `PATH` | the working directory | a `module:callable`, or the project directory |
 | `--chdir DIR` | | the directory to find the project in |
-| `--config FILE` | | a settings file |
+| `--config FILE` | | a project settings file read in place of the one beside the code |
 | `--listen ADDRESS` | `0.0.0.0:8080` | where the application is served |
 | `--admin-listen ADDRESS` | `0.0.0.0:9090` | where the probes and metrics are served, or `off` |
 | `--admin-status` | off | serve `/status` on the admin port too |
@@ -425,6 +475,26 @@ The commands that name an application or a release take the one being
 served when given none. Only someone who may exec into the container can
 use them. Commands that
 manage releases, hosts or the daemon say they need the daemon.
+
+The project's declared [commands](commands.md#the-projects-own-commands)
+run the same way, through the `muructl serve` in the container, with
+their output in the container's log:
+
+```
+docker exec shop muructl command list
+docker exec shop muructl command run backup
+docker exec shop muructl exec -- python manage.py showmigrations
+```
+
+A command also runs in a container of its own, where nothing is serving,
+which is how a migration is run before the new image serves. `muructl`
+runs it itself, with the image's interpreter and the project's
+environment variables, and exits with its status:
+
+```
+docker run --rm --env-file shop.env registry.example.com/shop:1.0.0 \
+    muructl command run migrate
+```
 
 ## Stopping
 

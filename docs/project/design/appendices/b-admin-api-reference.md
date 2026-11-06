@@ -38,12 +38,13 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 
 | RPC | Gateway | Purpose |
 | --- | --- | --- |
-| ApplyConfig | POST /v1/config:apply | apply files, with dry_run and prune |
+| ApplyConfig | POST /v1/config:apply | apply files, with dry_run and prune, and hold, no_wait and retention for the releases added |
 | ExportConfig | GET /v1/config:export | export desired state |
 | DiffConfig | POST /v1/config:diff | compare submitted configuration |
 | GetConfigSchema | GET /v1/config:schema | JSON Schema |
 | GetEffectiveConfig | GET /v1/apps/{app}/releases/{release}:effective | merged settings with sources |
 | Deploy | POST /v1/apps/{app}:deploy | create a release and apply the default strategy |
+| PlanDeploy | POST /v1/apps/{app}:planDeploy | what that deploy would do, and what would refuse it, changing nothing |
 | Rollback | POST /v1/apps/{app}:rollback | restore the previous traffic policy |
 | ReloadApp | POST /v1/apps/{app}:reload | new release from the same source |
 | CheckRelease | POST /v1/apps/{app}:check | validate in a throwaway host |

@@ -1945,7 +1945,7 @@
     },
     "Release": {
       "additionalProperties": false,
-      "description": "A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes. `muructl run --print-config` writes one so a laptop setup can become a declared release, and `muructl apply` reads them.",
+      "description": "A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes, which `muructl apply` reads. What a table leaves out comes from the `[tool.muru]` table of its source.",
       "properties": {
         "accel_redirect": {
           "default": false,

@@ -33,6 +33,28 @@ pub struct Options {
     pub system: bool,
 }
 
+/// The variable that names the daemon's configuration file.
+pub const CONFIG_VARIABLE: &str = "MURU_DAEMON_CONFIG";
+
+/// The name that variable had, which is refused so a daemon never passes
+/// its configuration over without a word.
+const RENAMED_CONFIG_VARIABLE: &str = "MURU_CONFIG";
+
+/// Refuse the daemon's configuration variable under its earlier name,
+/// unless the new one is set too.
+pub fn check_renamed() -> Result<(), String> {
+    let set = |name: &str| env::var_os(name).is_some_and(|value| !value.is_empty());
+
+    if set(RENAMED_CONFIG_VARIABLE) && !set(CONFIG_VARIABLE) {
+        return Err(format!(
+            "{RENAMED_CONFIG_VARIABLE} is set, and the daemon's configuration file is now named \
+             by {CONFIG_VARIABLE}; set that instead"
+        ));
+    }
+
+    Ok(())
+}
+
 /// One resolved location and the rule that chose it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
@@ -124,7 +146,7 @@ impl Locations {
         );
         let config = pick(
             options.config.as_ref(),
-            "MURU_CONFIG",
+            CONFIG_VARIABLE,
             "CONFIGURATION_DIRECTORY",
             || default_config(mode, home.as_deref()),
         );

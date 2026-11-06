@@ -16,7 +16,7 @@ use regex::Regex;
 use schemars::JsonSchema;
 use serde_json::{Map, Value};
 
-use crate::{BuildWhen, Document, RunSettings, ServeSettings, ToolMuru};
+use crate::{BuildWhen, Document, RunSettings, ToolMuru};
 
 /// The keyword a field's default is described by when it has no single
 /// value: `#[schemars(extend("x-default" = "..."))]`.
@@ -34,13 +34,11 @@ pub enum File {
     Project,
     /// muru.local.toml, a developer's own settings for `muructl run`.
     Local,
-    /// The file `muructl serve --config` reads.
-    Serve,
 }
 
 impl File {
     /// Every file, in the order the reference lists them.
-    pub const ALL: [File; 4] = [File::Daemon, File::Project, File::Local, File::Serve];
+    pub const ALL: [File; 3] = [File::Daemon, File::Project, File::Local];
 
     /// The name of the file's schema and page: `daemon` gives
     /// daemon.schema.json and daemon.md.
@@ -49,7 +47,6 @@ impl File {
             File::Daemon => "daemon",
             File::Project => "project",
             File::Local => "local",
-            File::Serve => "serve",
         }
     }
 
@@ -58,7 +55,6 @@ impl File {
             File::Daemon => "The daemon's configuration and applied files",
             File::Project => "The project's [tool.muru] table",
             File::Local => "muru.local.toml",
-            File::Serve => "The muructl serve configuration file",
         }
     }
 
@@ -66,7 +62,7 @@ impl File {
     fn root(self) -> &'static str {
         match self {
             File::Project => "tool.muru",
-            File::Daemon | File::Local | File::Serve => "",
+            File::Daemon | File::Local => "",
         }
     }
 
@@ -75,7 +71,9 @@ impl File {
             File::Daemon => {
                 "The keys of the daemon's configuration file, `muru.toml` in its \
                  configuration directory, and of the files `muructl apply` reads, which \
-                 share one format. Listeners, limits, the proxy, compression, secret \
+                 share one format. A file in this format kept beside a project's code is \
+                 named `muru.daemon.toml`, since `muru.toml` there is the project's \
+                 settings, which have other keys. Listeners, limits, the proxy, compression, secret \
                  stores, logs, shutdown, metrics, events, the dashboard, the overlay \
                  webhook, client classes and rate limits belong to the daemon's own file; \
                  an applied file that sets them is refused. Applications, their releases, \
@@ -84,7 +82,10 @@ impl File {
             File::Project => {
                 "The keys an application ships with: the `[tool.muru]` table of its \
                  `pyproject.toml`, or the same keys at the top level of a `muru.toml` \
-                 beside it. Every key is optional. A command line flag, or a release \
+                 beside it. A project with both uses its `muru.toml`: the `[tool.muru]` \
+                 table is then not read, and the two are never merged. `muructl serve \
+                 --config FILE` reads FILE, in the form of a `muru.toml`, in place of \
+                 either. Every key is optional. A command line flag, or a release \
                  declared to the daemon, takes precedence over the key."
             }
             File::Local => {
@@ -92,12 +93,6 @@ impl File {
                  the project, which is not committed. Its `[run]` table holds the keys of \
                  `[tool.muru.run]` and takes precedence over them; lists add to the \
                  project's."
-            }
-            File::Serve => {
-                "The file `muructl serve --config` or `MURU_SERVE_CONFIG` names: the keys \
-                 of the project's `[tool.muru.serve]` table at its top level, taking \
-                 precedence over that table. A command line flag or a `MURU_` variable \
-                 takes precedence over the file."
             }
         }
     }
@@ -133,7 +128,6 @@ pub fn json_schema(file: File) -> Value {
         File::Daemon => generator.into_root_schema_for::<Document>(),
         File::Project => generator.into_root_schema_for::<ToolMuru>(),
         File::Local => generator.into_root_schema_for::<LocalFile>(),
-        File::Serve => generator.into_root_schema_for::<ServeSettings>(),
     };
 
     let mut value = schema.to_value();
@@ -157,6 +151,15 @@ pub fn json_schema(file: File) -> Value {
     }
 
     value
+}
+
+/// The keys the file takes at its top level.
+pub fn top_level_keys(file: File) -> BTreeSet<String> {
+    json_schema(file)
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|properties| properties.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Citations of the design specification left in the file's descriptions

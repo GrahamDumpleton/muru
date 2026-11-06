@@ -58,8 +58,33 @@ which has its production counterpart in the host limits.
 The table applies whenever the project is found: as the argument, with
 `--chdir`, or in the current directory, with an entrypoint on the command
 line too. The daemon ignores it, so `muructl deploy` of the project
-neither reads nor rejects it, and `--print-config` leaves it out while
-writing the listeners and TLS it resolved.
+neither reads nor rejects it, and so does `muructl serve`, which has its
+own `[serve]` table.
+
+`muructl run --print-config` prints the settings the run would use and
+exits: the application's settings, then the `[run]` table, each with
+where it came from, in the shape of the project's file. It ends with the
+interpreter the run would use, and an interpreter the run could not use
+is refused here as the run would refuse it.
+
+```text
+$ muructl run --print-config --threads 2
+# The settings this muructl run would use, and where each came from.
+# The project's settings are read from ./pyproject.toml.
+
+entrypoint = "shop.wsgi:application"    # [tool.muru] in ./pyproject.toml
+processes = 1                           # default
+threads = 2                             # command line
+...
+
+[run]
+port = 8123              # [tool.muru.run] in ./pyproject.toml
+access_log = "errors"    # [run] in ./muru.local.toml
+reload = true            # default
+...
+
+# The interpreter is Python 3.13.1 (cp313) at ./.venv/bin/python (the project's .venv).
+```
 
 ## Your own machine: muru.local.toml
 

@@ -25,7 +25,7 @@ ones it names.
 | `overlay_preview` | reads | `muructl overlay preview` | `name` |
 | `skill_status` | reads | `muructl mcp skill status` | none |
 | `docs` | reads | The user guide embedded in `muructl`: the list of pages, or one page's Markdown | `page` |
-| `deploy` | changes | `muructl deploy` | `app`, `source`, `entrypoint`, `python`, `hold`, `wait` (default true) |
+| `deploy` | changes | `muructl deploy` | `app`, `source`, `entrypoint`, `python`, `hold`, `wait` (default true), `dry_run` |
 | `promote` | changes | `muructl rollout bluegreen` | `release` |
 | `rollback` | changes | `muructl rollback` | `app` |
 | `drain` | changes | `muructl drain` | `release` |
@@ -35,7 +35,7 @@ ones it names.
 | `restart` | changes | `muructl restart` | `target`, `worker`, `all`, `force` |
 | `overlay` | changes | `muructl overlay activate`, `end` or `promote` | `action`, `name`, `for` |
 | `maintenance` | changes | `muructl maintenance on` or `off` | `app` or `host`, `on` |
-| `apply` | changes | `muructl apply` | `file`, `dry_run` |
+| `apply` | changes | `muructl apply` | `file`, `dry_run`, `hold`, `wait` (default true) |
 | `log_level` | changes | `muructl logging level` | `target`, `levels`, `for`, `reset` |
 | `access_log` | changes | `muructl logging access` | `mode`, `app`, `paths`, `for`, `reset` |
 | `reopen_logs` | changes | `muructl logs reopen` | `workers` |

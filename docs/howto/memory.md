@@ -29,8 +29,7 @@ hard_limit = "1200MB"
 check_interval = "5s"
 ```
 
-The same table goes in a declared release for `muructl apply`, and
-`muructl run --print-config` writes it. Sizes are `800MB`, `1.5GB` or a
+The same table goes in a declared release for `muructl apply`. Sizes are `800MB`, `1.5GB` or a
 number of bytes, with KB, MB and GB as powers of 1024.
 
 The node-wide memory budget is in [scaling](scaling.md), and a [worker
