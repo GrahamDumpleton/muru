@@ -292,3 +292,116 @@ app = "echo"
     refused = apply(daemon, config)
     assert refused.returncode != 0
     assert 'host raw: compression: "max" is not a level' in refused.stdout + refused.stderr
+
+
+def test_a_host_and_a_route_change_request_and_response_headers(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    config = tmp_path / "hosts.toml"
+    config.write_text(
+        ECHO
+        + """[host.shop]
+names = ["shop.test"]
+request_headers = { remove = ["X-Debug"], set = { X-Site = "shop", X-Tier = "host" } }
+
+[host.shop.response_headers]
+remove = ["Server"]
+set = { X-Frame-Options = "DENY" }
+add = { Link = ["</a.css>; rel=preload", "</b.js>; rel=preload"] }
+
+[host.bare]
+names = ["bare.test"]
+response_headers = { set = { X-Content-Type-Options = "nosniff" } }
+
+[[route]]
+host = "shop"
+app = "echo"
+
+[[route]]
+name = "shop-info"
+host = "shop"
+path = "/info"
+app = "echo"
+request_headers = { set = { X-Tier = "route" } }
+response_headers = { remove = ["Link"], set = { X-Frame-Options = "SAMEORIGIN" } }
+
+[[route]]
+host = "bare"
+path = "/only"
+app = "echo"
+
+[overlay.locked]
+routes.shop-info = { response_headers = { set = { X-Locked = "yes" } } }
+"""
+    )
+    applied = apply(daemon, config)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    daemon.wait_for_routing("echo")
+
+    def headers_of(response: support.Response) -> dict[str, list[str]]:
+        found: dict[str, list[str]] = {}
+
+        for name, value in response.headers:
+            found.setdefault(name.lower(), []).append(value)
+
+        return found
+
+    sent = {"X-Debug": "1", "X-Tier": "client", "X-Kept": "yes"}
+
+    # The host's rules reach every route's requests and responses: the
+    # application's response loses Server and gains the headers set and
+    # added.
+
+    headers = headers_of(daemon.request("/text", host="shop.test", headers=sent))
+    assert "server" not in headers
+    assert headers["x-frame-options"] == ["DENY"]
+    assert headers["link"] == ["</a.css>; rel=preload", "</b.js>; rel=preload"]
+
+    # The route's rules are applied after its host's, to the request the
+    # application sees and to the response.
+
+    response = daemon.request("/info", host="shop.test", headers=sent)
+    environ = json.loads(response.body)["environ"]
+    assert "HTTP_X_DEBUG" not in environ
+    assert environ["HTTP_X_SITE"] == "shop"
+    assert environ["HTTP_X_TIER"] == "route"
+    assert environ["HTTP_X_KEPT"] == "yes"
+    headers = headers_of(response)
+    assert headers["x-frame-options"] == ["SAMEORIGIN"]
+    assert "link" not in headers and "server" not in headers
+
+    # A response the edge answers itself carries them too, a path no
+    # route takes having its host's alone.
+
+    missing = daemon.request("/missing", host="bare.test")
+    assert missing.status == 404
+    assert headers_of(missing)["x-content-type-options"] == ["nosniff"]
+
+    listed = daemon.muructl("host", "list").stdout
+    assert "[request headers: removes X-Debug; sets X-Site, X-Tier]" in listed, listed
+    assert "[response headers: removes Server; sets X-Frame-Options; adds Link]" in listed
+
+    # An overlay puts its table in place of the route's.
+
+    daemon.muructl("overlay", "activate", "locked")
+    wait_for(
+        lambda: headers_of(daemon.request("/info", host="shop.test")).get("x-locked") == ["yes"]
+    )
+    headers = headers_of(daemon.request("/info", host="shop.test"))
+    assert headers["x-frame-options"] == ["DENY"], "the host's, the route's table being replaced"
+    assert len(headers["link"]) == 2
+
+    # Headers the edge handles cannot be named, and a value is checked.
+
+    for table, expected in [
+        ('request_headers = { set = { Host = "x" } }', "request_headers.set: Host cannot be set"),
+        ('response_headers = { remove = ["Content-Length"] }', "Content-Length cannot be set"),
+        ('request_headers = { remove = ["X-Muru-Mode"] }', "X-Muru-Mode cannot be set"),
+        ('response_headers = { set = { "X A" = "1" } }', '"X A" is not a header name'),
+        ("response_headers = { add = { Link = [] } }", "response_headers.add.Link gives no value"),
+    ]:
+        broken = tmp_path / "broken.toml"
+        broken.write_text(f'[host.broken]\nnames = ["broken.test"]\n{table}\n')
+        refused = apply(daemon, broken)
+        assert refused.returncode != 0, table
+        assert expected in refused.stdout + refused.stderr, refused.stdout + refused.stderr

@@ -929,6 +929,22 @@
         }
       ]
     },
+    "HeaderValues": {
+      "anyOf": [
+        {
+          "description": "One value.",
+          "type": "string"
+        },
+        {
+          "description": "A value for each time the header is sent.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "One value of a header, or several for a header sent more than once."
+    },
     "Host": {
       "additionalProperties": false,
       "description": "A virtual host, the `[host.NAME]` table.",
@@ -1004,6 +1020,14 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "request_headers": {
+          "$ref": "#/$defs/RequestHeaders",
+          "description": "Headers removed from, and set on, the host's requests before anything is asked to serve them. A route's own are applied after them."
+        },
+        "response_headers": {
+          "$ref": "#/$defs/ResponseHeaders",
+          "description": "Headers removed from, set on and added to every response to the host's requests. A route's own are applied after them."
         },
         "slow": {
           "description": "How slow a request is to be written under `access_log = \"errors\"`.",
@@ -2076,6 +2100,27 @@
         }
       ]
     },
+    "RequestHeaders": {
+      "additionalProperties": false,
+      "description": "What a virtual host or a route does to the headers of a request before anything is asked to serve it: the `request_headers` table. The names are removed first, then the headers set.",
+      "properties": {
+        "remove": {
+          "description": "Headers removed from the request, by name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "set": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Headers set on the request, by name, each replacing any the client sent.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
     "RequestTimeouts": {
       "additionalProperties": false,
       "description": "The timeouts of one request, the `timeouts` table of a virtual host or a route. Each key replaces the same key of the level beneath, down to the daemon's `[limits]`.",
@@ -2099,6 +2144,34 @@
           "description": "Time a worker may pause mid-response.",
           "type": "string",
           "x-default": "`response_idle_timeout` in `[limits]`"
+        }
+      },
+      "type": "object"
+    },
+    "ResponseHeaders": {
+      "additionalProperties": false,
+      "description": "What a virtual host or a route does to the headers of a response: the `response_headers` table. The names are removed first, then the headers set, then those added.",
+      "properties": {
+        "add": {
+          "additionalProperties": {
+            "$ref": "#/$defs/HeaderValues"
+          },
+          "description": "Headers added to the response beside any it has, by name: a value, or a list of values for a header sent more than once.",
+          "type": "object"
+        },
+        "remove": {
+          "description": "Headers removed from the response, by name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "set": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Headers set on the response, by name, each replacing any the response has.",
+          "type": "object"
         }
       },
       "type": "object"
@@ -2233,6 +2306,14 @@
           "description": "Whether a directory asked for without a trailing slash is redirected to the slash form.",
           "type": "boolean"
         },
+        "request_headers": {
+          "$ref": "#/$defs/RequestHeaders",
+          "description": "Headers removed from, and set on, the route's requests before anything is asked to serve them, after the host's."
+        },
+        "response_headers": {
+          "$ref": "#/$defs/ResponseHeaders",
+          "description": "Headers removed from, set on and added to every response to the route's requests, after the host's."
+        },
         "spool_quota": {
           "default": "10GB",
           "description": "What the application's stored uploads may hold at once when a request on the route arrives.",
@@ -2304,6 +2385,14 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "request_headers": {
+          "$ref": "#/$defs/RequestHeaders",
+          "description": "The headers removed from and set on the route's requests, in place of the route's `request_headers`."
+        },
+        "response_headers": {
+          "$ref": "#/$defs/ResponseHeaders",
+          "description": "The headers removed from, set on and added to the route's responses, in place of the route's `response_headers`."
         },
         "target": {
           "$ref": "#/$defs/RouteTarget",

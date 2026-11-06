@@ -252,6 +252,21 @@ message CompressionChoice {
   string level = 5;                     // fast, default or best; the level beneath's when empty
 }
 
+// Section 4.7: what a virtual host or a route does to the headers of a
+// request, or of a response: the names are removed, then the headers
+// set, each replacing any there, then those added beside any there.
+message HeaderRules {
+  repeated string remove = 1;
+  repeated HeaderField set = 2;
+  repeated HeaderField add = 3;         // responses only
+}
+
+// A header by name and value.
+message HeaderField {
+  string name = 1;
+  string value = 2;
+}
+
 message Proxy {
   repeated string trusted = 1;          // addresses, CIDR ranges, loopback, private, unix
   repeated string headers = 2;          // header types applied from trusted peers
@@ -277,6 +292,8 @@ message Host {
   bool canonical_redirect = 14;         // requests for the host's other names are redirected to the canonical name
   AccessLogChoice access_log = 15;      // section 11.2: the host's own access log choice; none when absent
   CompressionChoice compression = 16;   // section 4.17: the host's own compression settings; none when absent
+  HeaderRules request_headers = 17;     // section 4.7: applied to the host's requests before anything serves them
+  HeaderRules response_headers = 18;    // applied to every response to the host's requests
 }
 
 // A route (section 4.5): a path prefix of a host to an application, or
@@ -310,6 +327,8 @@ message Route {
   repeated string client_classes = 26;  // section 4.14: the classes the route takes; every request when empty
   RequestLimits limits = 27;            // section 4.6: the limits of the route's requests, over the host's; none when absent
   CompressionChoice compression = 28;   // section 4.17: the route's own compression settings, over the host's; none when absent
+  HeaderRules request_headers = 29;     // section 4.7: applied to the route's requests after the host's
+  HeaderRules response_headers = 30;    // applied to every response to the route's requests after the host's
 }
 
 // Section 4.11: how a route's uploads are received before dispatch.

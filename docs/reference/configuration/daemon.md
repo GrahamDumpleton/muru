@@ -501,10 +501,37 @@ A virtual host, the `[host.NAME]` table.
 | `max_body_size` | string | `max_body_size` in `[limits]` | The largest request body for the host's routes, for example 1MB, replacing the daemon's `[limits]` value. A route's own replaces it. |
 | `names` | array of strings |  | The names it answers to: exact names, or `*.example.com` for one label. Compared case-insensitively, without a port or trailing dot. |
 | `rate_limits` | array of strings |  | The `[rate_limit.NAME]` tables applied to every request for the host, before a route's. |
+| `request_headers` | table, {ref}`[host.NAME.request_headers] <config-daemon-host-name-request-headers>` |  | Headers removed from, and set on, the host's requests before anything is asked to serve them. A route's own are applied after them. |
+| `response_headers` | table, {ref}`[host.NAME.response_headers] <config-daemon-host-name-response-headers>` |  | Headers removed from, set on and added to every response to the host's requests. A route's own are applied after them. |
 | `slow` | string | `slow` in `[logs]` | How slow a request is to be written under `access_log = "errors"`. |
 | `timeouts` | table, {ref}`[host.NAME.timeouts] <config-daemon-host-name-timeouts>` |  | The timeouts of a request for the host's routes, each replacing the daemon's `[limits]` value. A route's own replace them. |
 | `tls` | table, {ref}`[host.NAME.tls] <config-daemon-host-name-tls>` |  | Its certificate and key, for TLS listeners. |
 | `use_canonical_name` | boolean | `false` | Give the application the canonical name as SERVER_NAME rather than the name matched. |
+
+(config-daemon-host-name-request-headers)=
+## `[host.NAME.request_headers]`
+
+What a virtual host or a route does to the headers of a request before anything is asked to serve it: the `request_headers` table. The names are removed first, then the headers set.
+
+The same keys apply at `[route.request_headers]` and `[overlay.NAME.routes.NAME.request_headers]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `remove` | array of strings |  | Headers removed from the request, by name. |
+| `set` | table of strings |  | Headers set on the request, by name, each replacing any the client sent. |
+
+(config-daemon-host-name-response-headers)=
+## `[host.NAME.response_headers]`
+
+What a virtual host or a route does to the headers of a response: the `response_headers` table. The names are removed first, then the headers set, then those added.
+
+The same keys apply at `[route.response_headers]` and `[overlay.NAME.routes.NAME.response_headers]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `add` | table of strings or arrays of strings |  | Headers added to the response beside any it has, by name: a value, or a list of values for a header sent more than once. |
+| `remove` | array of strings |  | Headers removed from the response, by name. |
+| `set` | table of strings |  | Headers set on the response, by name, each replacing any the response has. |
 
 (config-daemon-host-name-timeouts)=
 ## `[host.NAME.timeouts]`
@@ -656,6 +683,8 @@ The same keys apply at `[overlay.NAME.routes.NAME.client_routes.NAME]`.
 | `error_pages` | table of tables, {ref}`[error_pages.STATUS] <config-daemon-error-pages-status>` |  | Error pages, by status or status:reason, each in place of the route's page for the same key. |
 | `mode` | string |  | The site mode. |
 | `rate_limits` | array of strings |  | The rate limits, in place of the route's. |
+| `request_headers` | table, {ref}`[host.NAME.request_headers] <config-daemon-host-name-request-headers>` |  | The headers removed from and set on the route's requests, in place of the route's `request_headers`. |
+| `response_headers` | table, {ref}`[host.NAME.response_headers] <config-daemon-host-name-response-headers>` |  | The headers removed from, set on and added to the route's responses, in place of the route's `response_headers`. |
 | `target` | table, {ref}`[overlay.NAME.routes.NAME.target] <config-daemon-overlay-name-routes-name-target>` |  | What serves the route instead. |
 | `traffic` | table, {ref}`[overlay.NAME.routes.NAME.traffic] <config-daemon-overlay-name-routes-name-traffic>` |  | The traffic policy: a pin sends every request to one release. |
 
@@ -795,6 +824,8 @@ A route, one of the `[[route]]` entries: a path prefix of a virtual host to an a
 | `precheck` | boolean | `false` | Ask the application with the request's headers alone first, and read the body only when it answers 2xx. |
 | `rate_limits` | array of strings |  | The `[rate_limit.NAME]` tables applied to the route's requests, after the host's. |
 | `redirect_slash` | boolean | `true` | Whether a directory asked for without a trailing slash is redirected to the slash form. |
+| `request_headers` | table, {ref}`[host.NAME.request_headers] <config-daemon-host-name-request-headers>` |  | Headers removed from, and set on, the route's requests before anything is asked to serve them, after the host's. |
+| `response_headers` | table, {ref}`[host.NAME.response_headers] <config-daemon-host-name-response-headers>` |  | Headers removed from, set on and added to every response to the route's requests, after the host's. |
 | `spool_quota` | string | `"10GB"` | What the application's stored uploads may hold at once when a request on the route arrives. |
 | `static` | string |  | The directory served by the edge, instead of an application. |
 | `timeouts` | table, {ref}`[host.NAME.timeouts] <config-daemon-host-name-timeouts>` |  | The timeouts of the route's requests, each replacing the host's, or else the daemon's `[limits]` value. |

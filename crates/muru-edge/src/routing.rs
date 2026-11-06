@@ -47,6 +47,10 @@ pub struct Host {
     /// The compression policy for the host's routes (section 4.17), when
     /// the host sets any of it: the node's with the host's laid over.
     pub compression: Option<Arc<crate::compression::Compression>>,
+    /// The host's rules for request headers (section 4.7).
+    pub request_headers: Option<Arc<crate::headers::Rules>>,
+    /// The host's rules for response headers.
+    pub response_headers: Option<Arc<crate::headers::Rules>>,
     /// The name requests for the host's other names are redirected to,
     /// when the host redirects them.
     pub canonical: Option<String>,
@@ -143,6 +147,11 @@ struct Route {
     /// when the route sets any of it: the host's with the route's laid
     /// over.
     compression: Option<Arc<crate::compression::Compression>>,
+    /// The route's rules for request headers (section 4.7), applied
+    /// after the host's.
+    request_headers: Option<Arc<crate::headers::Rules>>,
+    /// The route's rules for response headers, applied after the host's.
+    response_headers: Option<Arc<crate::headers::Rules>>,
     /// The rate limits the route's requests draw from after the host's
     /// (section 4.15).
     rate_limits: Vec<Arc<crate::ratelimit::Limit>>,
@@ -1130,8 +1139,23 @@ pub struct Routing {
     /// Section 6.13: the listeners that limit cleartext HTTP/2 to some
     /// clients.
     h2c: HashMap<SocketAddr, crate::proxy::Networks>,
-    /// Whether any host or route has compression settings of its own.
-    compression_varies: bool,
+    /// Whether any host or route has compression settings or header
+    /// rules of its own.
+    sites_vary: bool,
+}
+
+/// What the virtual host and the route a client's request names set for
+/// it besides where it goes.
+#[derive(Debug, Clone, Copy)]
+pub struct Site<'a> {
+    /// The compression policy (section 4.17): the route's own over its
+    /// host's over the node's.
+    pub compression: &'a crate::compression::Compression,
+    /// The rules for request headers (section 4.7): the host's, then
+    /// the route's.
+    pub request_headers: [Option<&'a crate::headers::Rules>; 2],
+    /// The rules for response headers: the host's, then the route's.
+    pub response_headers: [Option<&'a crate::headers::Rules>; 2],
 }
 
 /// Where a request goes.
@@ -1254,7 +1278,7 @@ impl Routing {
             default_policy: None,
             default_app: None,
             h2c: HashMap::new(),
-            compression_varies: false,
+            sites_vary: false,
         }
     }
 
@@ -1502,7 +1526,7 @@ impl Routing {
             default_policy,
             default_app: default_name,
             h2c,
-            compression_varies: false,
+            sites_vary: false,
         };
 
         for host in &snapshot.hosts {
@@ -1549,6 +1573,13 @@ impl Routing {
                     .map(Arc::new),
                 canonical: (host.canonical_redirect && !host.canonical.is_empty())
                     .then(|| normalise(&host.canonical)),
+                request_headers: crate::headers::rules_of(host.request_headers.as_ref()).map_err(
+                    |error| anyhow::anyhow!("host {}: request_headers: {error}", host.name),
+                )?,
+                response_headers: crate::headers::rules_of(host.response_headers.as_ref())
+                    .map_err(|error| {
+                        anyhow::anyhow!("host {}: response_headers: {error}", host.name)
+                    })?,
             });
             routing.routes.push(Vec::new());
         }
@@ -1610,8 +1641,26 @@ impl Routing {
                         anyhow::anyhow!("route {} {}: compression: {error}", route.host, route.path)
                     })?
                     .map(Arc::new);
+                let request_headers = crate::headers::rules_of(route.request_headers.as_ref())
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "route {} {}: request_headers: {error}",
+                            route.host,
+                            route.path
+                        )
+                    })?;
+                let response_headers = crate::headers::rules_of(route.response_headers.as_ref())
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "route {} {}: response_headers: {error}",
+                            route.host,
+                            route.path
+                        )
+                    })?;
                 routing.routes[index].push(Route {
                     compression,
+                    request_headers,
+                    response_headers,
                     path: route.path.clone(),
                     classes: route.client_classes.clone(),
                     app: route.app.clone(),
@@ -1642,12 +1691,15 @@ impl Routing {
             }
         }
 
-        routing.compression_varies = routing.hosts.iter().any(|host| host.compression.is_some())
-            || routing
-                .routes
-                .iter()
-                .flatten()
-                .any(|route| route.compression.is_some());
+        routing.sites_vary = routing.hosts.iter().any(|host| {
+            host.compression.is_some()
+                || host.request_headers.is_some()
+                || host.response_headers.is_some()
+        }) || routing.routes.iter().flatten().any(|route| {
+            route.compression.is_some()
+                || route.request_headers.is_some()
+                || route.response_headers.is_some()
+        });
 
         // Section 4.14: of routes with the same path, those for client
         // classes come before the one for every request.
@@ -1762,33 +1814,46 @@ impl Routing {
         &self.compression
     }
 
-    /// The compression policy for a client's request (section 4.17):
-    /// the route's own over its host's over the node's, by the host the
-    /// request named and its path.
-    pub fn compression_for(
-        &self,
-        name: Option<&str>,
-        path: &str,
-        class: &str,
-        listener: &str,
-    ) -> &crate::compression::Compression {
-        // Most nodes set compression once, so no host or route is looked
-        // for.
+    /// What the host and the route a client's request names set for it
+    /// (sections 4.7 and 4.17), by the host the request named and its
+    /// path: the node's alone where no host takes it, and the host's
+    /// where no route does.
+    pub fn site(&self, name: Option<&str>, path: &str, class: &str, listener: &str) -> Site<'_> {
+        let node = Site {
+            compression: &self.compression,
+            request_headers: [None, None],
+            response_headers: [None, None],
+        };
 
-        if !self.compression_varies {
-            return &self.compression;
+        // Most nodes set none of it, so no host or route is looked for.
+
+        if !self.sites_vary {
+            return node;
         }
 
         let Some(index) = self.host_for(name, listener) else {
-            return &self.compression;
+            return node;
         };
 
-        self.routes[index]
+        let host = &self.hosts[index];
+        let route = self.routes[index]
             .iter()
-            .find(|route| route.matches(path, class))
-            .and_then(|route| route.compression.as_deref())
-            .or(self.hosts[index].compression.as_deref())
-            .unwrap_or(&self.compression)
+            .find(|route| route.matches(path, class));
+
+        Site {
+            compression: route
+                .and_then(|route| route.compression.as_deref())
+                .or(host.compression.as_deref())
+                .unwrap_or(&self.compression),
+            request_headers: [
+                host.request_headers.as_deref(),
+                route.and_then(|route| route.request_headers.as_deref()),
+            ],
+            response_headers: [
+                host.response_headers.as_deref(),
+                route.and_then(|route| route.response_headers.as_deref()),
+            ],
+        }
     }
 
     /// The same tables with this compression policy, for a development

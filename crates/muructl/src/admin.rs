@@ -4427,6 +4427,16 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             names.push_str(&format!(" [compression {}]", host.compression));
         }
 
+        // Section 4.7: its rules for headers.
+
+        if !host.request_headers.is_empty() {
+            names.push_str(&format!(" [request headers: {}]", host.request_headers));
+        }
+
+        if !host.response_headers.is_empty() {
+            names.push_str(&format!(" [response headers: {}]", host.response_headers));
+        }
+
         println!(
             "{:<16} {:<8} {:<10} {names}",
             host.name,
@@ -4627,6 +4637,16 @@ pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
 
         if !route.compression.is_empty() {
             target.push_str(&format!(" [compression {}]", route.compression));
+        }
+
+        // Section 4.7: its rules for headers.
+
+        if !route.request_headers.is_empty() {
+            target.push_str(&format!(" [request headers: {}]", route.request_headers));
+        }
+
+        if !route.response_headers.is_empty() {
+            target.push_str(&format!(" [response headers: {}]", route.response_headers));
         }
 
         if !route.upload.is_empty() {

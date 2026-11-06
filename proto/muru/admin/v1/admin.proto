@@ -776,6 +776,8 @@ message Host {
   map<string, string> timeouts = 12;  // the host's own request timeouts, as configured
   string access_log = 13;             // the host's own access log choice (section 11.2): on, errors or off
   string compression = 14;            // "off" when the host turns compression off, "set" when it has other settings of its own (section 4.17)
+  string request_headers = 15;        // what the host removes from and sets on requests (section 4.7), as one phrase
+  string response_headers = 16;       // what the host removes from, sets on and adds to responses, as one phrase
 }
 
 message ListRoutesRequest {}
@@ -804,6 +806,8 @@ message Route {
   map<string, string> traffic_classes = 17; // a client class to the release, or upstream:NAME, that takes its requests
   map<string, string> timeouts = 18; // the route's own request timeouts, as configured (section 4.6)
   string compression = 19;          // "off" when the route turns compression off, "set" when it has other settings of its own (section 4.17)
+  string request_headers = 20;      // what the route removes from and sets on requests (section 4.7), as one phrase
+  string response_headers = 21;     // what the route removes from, sets on and adds to responses, as one phrase
 }
 
 message ListUpstreamsRequest {}

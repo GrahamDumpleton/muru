@@ -38,6 +38,7 @@ pub mod connections;
 pub mod endpoints;
 pub mod errors;
 pub mod grpc;
+pub mod headers;
 pub mod ja4;
 pub mod link;
 pub mod metrics;
@@ -1174,15 +1175,12 @@ async fn serve<I>(
                     .or_else(|| parts.uri.host().map(str::to_owned))
             });
 
-            // Section 4.17: the compression policy of the route the
-            // client's request names, over its host's and the node's.
+            // Sections 4.7 and 4.17: what the host and the route the
+            // client's request names set for it besides where it goes,
+            // the compression policy and the header rules.
 
-            let compression = routing.compression_for(
-                host.as_deref(),
-                parts.uri.path(),
-                &client_class,
-                &listener,
-            );
+            let site = routing.site(host.as_deref(), parts.uri.path(), &client_class, &listener);
+            let compression = site.compression;
             let mut body = Some(body);
             let mut buffered: Option<Bytes> = None;
             let mut origin: Option<routing::Origin> = None;
@@ -1326,6 +1324,20 @@ async fn serve<I>(
                         && let Some(problem) = methods.refuse(&parts.method)
                     {
                         break link::reject(&parts, &context, problem);
+                    }
+
+                    // Section 4.7: the host's and then the route's rules
+                    // for request headers, once, before an authentication
+                    // handler, a worker, an upstream or a redirect's
+                    // target sees the request.
+
+                    if matches!(
+                        decision,
+                        routing::Decision::Serve { .. } | routing::Decision::Static { .. }
+                    ) {
+                        for rules in site.request_headers.iter().flatten() {
+                            rules.apply(&mut parts.headers);
+                        }
                     }
                 }
 
@@ -1844,6 +1856,13 @@ async fn serve<I>(
                 } else {
                     response.headers_mut().insert(name.clone(), value.clone());
                 }
+            }
+
+            // Section 4.7: the host's and then the route's rules for
+            // response headers, whatever answered.
+
+            for rules in site.response_headers.iter().flatten() {
+                rules.apply(response.headers_mut());
             }
 
             // Section 4.17: compressed for the client when the policy and

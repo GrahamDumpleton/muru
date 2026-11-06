@@ -925,6 +925,17 @@ fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: 
             valid = false;
         }
 
+        // Section 4.7: the host's rules for request and response
+        // headers.
+
+        if let Err(error) = muru_config::check_header_tables(
+            host.request_headers.as_ref(),
+            host.response_headers.as_ref(),
+        ) {
+            plan.errors.push(format!("host {name}: {error}"));
+            valid = false;
+        }
+
         // Section 4.17: the host's own compression settings.
 
         if let Some(table) = &host.compression

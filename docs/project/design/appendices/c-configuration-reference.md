@@ -105,7 +105,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | auth (app or upstream, path, timeout, copy_headers, cache) | route | none | 4.16 |
 | upstream (route target), fallback.upstream, traffic.split upstream:NAME | route | none | 4.13 |
 | addresses, protocol, tls (ca, server_name, verify), health (path, interval, timeout, unhealthy_after, healthy_after, eject_after, eject_for), trust_muru_headers, connect_timeout | upstream | required, http1, none, none (ejection after 3 failures for 30s), false, 5s | 4.13 |
-| response_headers (add, remove), request_headers (add, remove) | host, route | none | 4.3 |
+| request_headers (remove, set), response_headers (remove, set, add) | host, route, overlay route | none | 4.7 |
 | user, group, umask, limits | application | daemon's user, none | 10.9 |
 | `[secrets.store.NAME]` (kind, command, timeout), env values with secret = { store, key } and optional as = 'file' | daemon, release | file store in the secrets directory | 10.8 |
 | bytecode | release, variant | redirect | 8.2 |

@@ -1746,6 +1746,208 @@ pub struct Host {
     /// route's own replace them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<Compression>,
+    /// Headers removed from, and set on, the host's requests before
+    /// anything is asked to serve them (section 4.7). A route's own are
+    /// applied after them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<RequestHeaders>,
+    /// Headers removed from, set on and added to every response to the
+    /// host's requests (section 4.7). A route's own are applied after
+    /// them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<ResponseHeaders>,
+}
+
+/// What a virtual host or a route does to the headers of a request
+/// before anything is asked to serve it (section 4.7): the
+/// `request_headers` table. The names are removed first, then the
+/// headers set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestHeaders {
+    /// Headers removed from the request, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<String>,
+    /// Headers set on the request, by name, each replacing any the
+    /// client sent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub set: BTreeMap<String, String>,
+}
+
+/// What a virtual host or a route does to the headers of a response
+/// (section 4.7): the `response_headers` table. The names are removed
+/// first, then the headers set, then those added.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseHeaders {
+    /// Headers removed from the response, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<String>,
+    /// Headers set on the response, by name, each replacing any the
+    /// response has.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub set: BTreeMap<String, String>,
+    /// Headers added to the response beside any it has, by name: a value,
+    /// or a list of values for a header sent more than once.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub add: BTreeMap<String, HeaderValues>,
+}
+
+/// One value of a header, or several for a header sent more than once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum HeaderValues {
+    /// One value.
+    One(String),
+    /// A value for each time the header is sent.
+    Many(Vec<String>),
+}
+
+impl HeaderValues {
+    /// The values, in order.
+    pub fn values(&self) -> &[String] {
+        match self {
+            Self::One(value) => std::slice::from_ref(value),
+            Self::Many(values) => values,
+        }
+    }
+}
+
+/// The headers a `request_headers` or `response_headers` table may not
+/// name: those that describe one connection, the ones the edge reads the
+/// message's framing and host from, and Muru's own.
+const PROTECTED_HEADERS: [&str; 11] = [
+    "connection",
+    "content-length",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Check a header name a table names: a token, and not one of the
+/// protected headers.
+fn check_header_name(key: &str, name: &str) -> Result<(), String> {
+    let token = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte));
+
+    if !token {
+        return Err(format!("{key}: {name:?} is not a header name"));
+    }
+
+    let lower = name.to_ascii_lowercase();
+
+    if PROTECTED_HEADERS.contains(&lower.as_str()) || lower.starts_with("x-muru-") {
+        return Err(format!(
+            "{key}: {name} cannot be set or removed; the edge handles it"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check a header value a table gives: printable ASCII, with no space at
+/// either end.
+fn check_header_value(key: &str, name: &str, value: &str) -> Result<(), String> {
+    let printable = value
+        .bytes()
+        .all(|byte| byte == b'\t' || (b' '..=b'~').contains(&byte));
+
+    if !printable || value.trim() != value {
+        return Err(format!(
+            "{key}.{name}: {value:?} is not a header value: printable ASCII with no space at either end"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check the names of one part of a header table, and that none is
+/// given twice in different case.
+fn check_header_names<'a>(
+    key: &str,
+    names: impl Iterator<Item = &'a String>,
+) -> Result<(), String> {
+    let mut seen: Vec<String> = Vec::new();
+
+    for name in names {
+        check_header_name(key, name)?;
+        let lower = name.to_ascii_lowercase();
+
+        if seen.contains(&lower) {
+            return Err(format!("{key}: {name} is named twice"));
+        }
+
+        seen.push(lower);
+    }
+
+    Ok(())
+}
+
+/// Check a `request_headers` table (section 4.7). A header set has no
+/// underscore in its name, since the edge passes none on.
+pub fn check_request_headers(table: &RequestHeaders) -> Result<(), String> {
+    check_header_names("request_headers.remove", table.remove.iter())?;
+    check_header_names("request_headers.set", table.set.keys())?;
+
+    for (name, value) in &table.set {
+        if name.contains('_') {
+            return Err(format!(
+                "request_headers.set: {name} has an underscore; the edge passes no such header on"
+            ));
+        }
+
+        check_header_value("request_headers.set", name, value)?;
+    }
+
+    Ok(())
+}
+
+/// Check a `response_headers` table (section 4.7).
+pub fn check_response_headers(table: &ResponseHeaders) -> Result<(), String> {
+    check_header_names("response_headers.remove", table.remove.iter())?;
+    check_header_names("response_headers.set", table.set.keys())?;
+    check_header_names("response_headers.add", table.add.keys())?;
+
+    for (name, value) in &table.set {
+        check_header_value("response_headers.set", name, value)?;
+    }
+
+    for (name, values) in &table.add {
+        if values.values().is_empty() {
+            return Err(format!("response_headers.add.{name} gives no value"));
+        }
+
+        for value in values.values() {
+            check_header_value("response_headers.add", name, value)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Check the header tables of a virtual host, a route or an overlay's
+/// change to a route.
+pub fn check_header_tables(
+    request: Option<&RequestHeaders>,
+    response: Option<&ResponseHeaders>,
+) -> Result<(), String> {
+    if let Some(table) = request {
+        check_request_headers(table)?;
+    }
+
+    if let Some(table) = response {
+        check_response_headers(table)?;
+    }
+
+    Ok(())
 }
 
 /// The timeouts of one request (section 4.6), the `timeouts` table of a
@@ -1966,6 +2168,14 @@ pub struct Route {
     /// replacing the host's, or else the daemon's `[compression]` value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<Compression>,
+    /// Headers removed from, and set on, the route's requests before
+    /// anything is asked to serve them (section 4.7), after the host's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<RequestHeaders>,
+    /// Headers removed from, set on and added to every response to the
+    /// route's requests (section 4.7), after the host's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<ResponseHeaders>,
     /// Section 4.11: `multipart` or `raw` makes the edge receive and store
     /// uploads before the application sees the request; off without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2051,6 +2261,10 @@ pub fn check_route_policies(route: &Route) -> Result<(), String> {
     }
 
     check_client_match(route.matches.as_ref())?;
+    check_header_tables(
+        route.request_headers.as_ref(),
+        route.response_headers.as_ref(),
+    )?;
 
     for class in route
         .traffic
@@ -2257,6 +2471,14 @@ pub struct RouteOverlay {
     /// place of the route's page for the same key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_pages: Option<BTreeMap<String, ErrorPage>>,
+    /// The headers removed from and set on the route's requests (section
+    /// 4.7), in place of the route's `request_headers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<RequestHeaders>,
+    /// The headers removed from, set on and added to the route's
+    /// responses, in place of the route's `response_headers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<ResponseHeaders>,
     /// Routes for client classes (section 4.14) at the route's host and
     /// path, by class: each a copy of the route with these changes, or the
     /// route for that class already there with them.
@@ -2574,6 +2796,11 @@ fn check_route_overlay(change: &RouteOverlay, outer: bool) -> Result<(), String>
 
         check_error_pages(pages, false)?;
     }
+
+    check_header_tables(
+        change.request_headers.as_ref(),
+        change.response_headers.as_ref(),
+    )?;
 
     if let Some(traffic) = &change.traffic
         && traffic.pin.is_some() == traffic.split.is_some()
@@ -5623,6 +5850,67 @@ traffic = { classes = { ai-crawler = 'r1' } }"
     }
 
     #[test]
+    fn header_tables_name_headers_the_edge_does_not_handle() {
+        let table = |text: &str| toml::from_str::<Route>(&format!("host = 'shop'\n{text}"));
+        let checked = |text: &str| {
+            let route = table(text).unwrap();
+            check_header_tables(
+                route.request_headers.as_ref(),
+                route.response_headers.as_ref(),
+            )
+        };
+
+        assert_eq!(
+            checked(
+                "request_headers = { remove = ['X-Debug'], set = { X-Site = 'shop' } }\n\
+                 response_headers = { remove = ['Server'], set = { X-Frame-Options = 'DENY' }, \
+                 add = { Link = ['</a>; rel=preload', '</b>; rel=preload'], Via = '1.1 edge' } }"
+            ),
+            Ok(())
+        );
+
+        for (text, expected) in [
+            (
+                "request_headers = { set = { host = 'x' } }",
+                "request_headers.set: host cannot be set or removed",
+            ),
+            (
+                "request_headers = { remove = ['Transfer-Encoding'] }",
+                "request_headers.remove: Transfer-Encoding cannot be set or removed",
+            ),
+            (
+                "response_headers = { add = { X-Muru-Compress = 'off' } }",
+                "response_headers.add: X-Muru-Compress cannot be set or removed",
+            ),
+            (
+                "response_headers = { set = { 'X A' = '1' } }",
+                "response_headers.set: \"X A\" is not a header name",
+            ),
+            (
+                "request_headers = { set = { X_Site = 'shop' } }",
+                "request_headers.set: X_Site has an underscore",
+            ),
+            (
+                "response_headers = { set = { X-A = ' padded' } }",
+                "response_headers.set.X-A: \" padded\" is not a header value",
+            ),
+            (
+                "response_headers = { set = { X-A = '1', x-a = '2' } }",
+                "response_headers.set: x-a is named twice",
+            ),
+            (
+                "response_headers = { add = { Link = [] } }",
+                "response_headers.add.Link gives no value",
+            ),
+        ] {
+            let error = checked(text).unwrap_err();
+            assert!(error.starts_with(expected), "{text}: {error}");
+        }
+
+        assert!(table("request_headers = { add = { X-A = '1' } }").is_err());
+    }
+
+    #[test]
     fn sizes_and_durations_are_written_in_the_largest_exact_unit() {
         assert_eq!(format_size(100 * 1024 * 1024), "100MB");
         assert_eq!(format_size(64 * 1024), "64KB");
@@ -5721,6 +6009,17 @@ traffic = { classes = { ai-crawler = 'r1' } }"
                 enabled: Some(false),
                 ..Compression::default()
             }),
+            request_headers: Some(RequestHeaders {
+                remove: vec!["X-Debug".to_owned()],
+                set: BTreeMap::new(),
+            }),
+            response_headers: Some(ResponseHeaders {
+                add: BTreeMap::from([(
+                    "Link".to_owned(),
+                    HeaderValues::Many(vec!["</a>; rel=preload".to_owned()]),
+                )]),
+                ..ResponseHeaders::default()
+            }),
             upload: Some("multipart".to_owned()),
             max_file_size: None,
             max_files: Some(5),
@@ -5751,6 +6050,9 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(text.contains("request_deadline = \"30s\""), "{text}");
         assert!(text.contains("[route.timeouts]"), "{text}");
         assert!(text.contains("[route.compression]"), "{text}");
+        assert!(text.contains("[route.request_headers]"), "{text}");
+        assert!(text.contains("remove = [\"X-Debug\"]"), "{text}");
+        assert!(text.contains("[route.response_headers.add]"), "{text}");
         assert!(text.contains("enabled = false"), "{text}");
         assert!(text.contains("queue_timeout = \"2s\""), "{text}");
         assert!(text.contains("[[route]]"), "{text}");

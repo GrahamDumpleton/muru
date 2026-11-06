@@ -1313,6 +1313,12 @@ impl Admin for Service {
                     timeouts: timeouts_map(host.timeouts.as_ref()),
                     access_log: host.access_log.unwrap_or_default(),
                     compression: compression_note(host.compression.as_ref()),
+                    request_headers: crate::overlays::describe_request_headers(
+                        host.request_headers.as_ref(),
+                    ),
+                    response_headers: crate::overlays::describe_response_headers(
+                        host.response_headers.as_ref(),
+                    ),
                 })
                 .collect(),
         }))
@@ -1395,6 +1401,12 @@ impl Admin for Service {
                     max_body_size: route.max_body_size.clone().unwrap_or_default(),
                     timeouts: timeouts_map(route.timeouts.as_ref()),
                     compression: compression_note(route.compression.as_ref()),
+                    request_headers: crate::overlays::describe_request_headers(
+                        route.request_headers.as_ref(),
+                    ),
+                    response_headers: crate::overlays::describe_response_headers(
+                        route.response_headers.as_ref(),
+                    ),
                     host: route.host,
                     path: route.path,
                     app: route.app,

@@ -2041,6 +2041,44 @@ pub(crate) fn compression_choice(
     Ok(choice)
 }
 
+/// A `request_headers` table (section 4.7) as the snapshot carries it.
+fn request_headers_message(table: &muru_config::RequestHeaders) -> pb::HeaderRules {
+    pb::HeaderRules {
+        remove: table.remove.clone(),
+        set: header_fields(&table.set),
+        add: Vec::new(),
+    }
+}
+
+/// A `response_headers` table (section 4.7) as the snapshot carries it,
+/// a header added more than once with a field for each value.
+fn response_headers_message(table: &muru_config::ResponseHeaders) -> pb::HeaderRules {
+    pb::HeaderRules {
+        remove: table.remove.clone(),
+        set: header_fields(&table.set),
+        add: table
+            .add
+            .iter()
+            .flat_map(|(name, values)| {
+                values.values().iter().map(|value| pb::HeaderField {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+            })
+            .collect(),
+    }
+}
+
+fn header_fields(headers: &BTreeMap<String, String>) -> Vec<pb::HeaderField> {
+    headers
+        .iter()
+        .map(|(name, value)| pb::HeaderField {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
 /// A host's certificate chain and key as PEM text, for the snapshot.
 fn read_pem_pair(certificate: &str, key: &str) -> anyhow::Result<(String, String)> {
     let chain =
@@ -5243,6 +5281,8 @@ impl Daemon {
                 name,
                 limits,
                 access_log,
+                request_headers: host.request_headers.as_ref().map(request_headers_message),
+                response_headers: host.response_headers.as_ref().map(response_headers_message),
                 compression: host
                     .compression
                     .as_ref()
@@ -5280,6 +5320,11 @@ impl Daemon {
             .into_iter()
             .map(|route| pb::Route {
                 upload: upload_message(&route),
+                request_headers: route.request_headers.as_ref().map(request_headers_message),
+                response_headers: route
+                    .response_headers
+                    .as_ref()
+                    .map(response_headers_message),
                 compression: route
                     .compression
                     .as_ref()

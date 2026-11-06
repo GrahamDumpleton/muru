@@ -59,6 +59,8 @@ Recipes for specific tasks, assuming you already know the basics. The
   by name, with a certificate each.
 - [Behind a load balancer or proxy](behind-a-proxy.md): which proxies to
   trust and which of their headers to believe.
+- [Request and response headers](headers.md): headers a host or a route
+  removes, sets and adds.
 - [Static files](static-files.md): directories the edge serves itself.
 - [File hints](file-hints.md): files an application hands to the edge to
   send.
@@ -136,6 +138,7 @@ overlays
 client-classes
 virtual-hosts
 behind-a-proxy
+headers
 static-files
 file-hints
 uploads

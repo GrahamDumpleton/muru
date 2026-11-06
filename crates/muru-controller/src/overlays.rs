@@ -291,6 +291,16 @@ fn change_route(route: &mut Route, change: &RouteOverlay) {
         route.rate_limits = limits.clone();
     }
 
+    // Section 4.7: each table replaces the route's whole.
+
+    if let Some(headers) = &change.request_headers {
+        route.request_headers = Some(headers.clone());
+    }
+
+    if let Some(headers) = &change.response_headers {
+        route.response_headers = Some(headers.clone());
+    }
+
     // Section 4.12: each page replaces the route's for its key.
 
     for (key, page) in change.error_pages.iter().flatten() {
@@ -444,6 +454,8 @@ pub fn conflicts(overlays: &BTreeMap<String, Overlay>) -> Vec<String> {
                 ("traffic", change.traffic.is_some()),
                 ("target", change.target.is_some()),
                 ("rate_limits", change.rate_limits.is_some()),
+                ("request_headers", change.request_headers.is_some()),
+                ("response_headers", change.response_headers.is_some()),
             ];
 
             for (field, set) in fields {
@@ -674,6 +686,16 @@ fn changes(
                 before.rate_limits.join(", "),
                 after.rate_limits.join(", "),
             ),
+            (
+                "request_headers",
+                describe_request_headers(before.request_headers.as_ref()),
+                describe_request_headers(after.request_headers.as_ref()),
+            ),
+            (
+                "response_headers",
+                describe_response_headers(before.response_headers.as_ref()),
+                describe_response_headers(after.response_headers.as_ref()),
+            ),
         ];
 
         let pages = change
@@ -879,6 +901,57 @@ fn describe_target(route: &Route) -> String {
         format!("upstream {}", route.upstream)
     } else {
         format!("app {}", route.app)
+    }
+}
+
+/// A `request_headers` table as one phrase: what it removes and sets.
+pub(crate) fn describe_request_headers(table: Option<&muru_config::RequestHeaders>) -> String {
+    let Some(table) = table else {
+        return String::new();
+    };
+
+    describe_headers(&table.remove, table.set.keys(), std::iter::empty())
+}
+
+/// A `response_headers` table as one phrase: what it removes, sets and
+/// adds.
+pub(crate) fn describe_response_headers(table: Option<&muru_config::ResponseHeaders>) -> String {
+    let Some(table) = table else {
+        return String::new();
+    };
+
+    describe_headers(&table.remove, table.set.keys(), table.add.keys())
+}
+
+fn describe_headers<'a>(
+    remove: &[String],
+    set: impl Iterator<Item = &'a String>,
+    add: impl Iterator<Item = &'a String>,
+) -> String {
+    let names = |names: Vec<&str>| names.join(", ");
+    let set: Vec<&str> = set.map(String::as_str).collect();
+    let add: Vec<&str> = add.map(String::as_str).collect();
+    let mut parts = Vec::new();
+
+    if !remove.is_empty() {
+        parts.push(format!(
+            "removes {}",
+            names(remove.iter().map(String::as_str).collect())
+        ));
+    }
+
+    if !set.is_empty() {
+        parts.push(format!("sets {}", names(set)));
+    }
+
+    if !add.is_empty() {
+        parts.push(format!("adds {}", names(add)));
+    }
+
+    if parts.is_empty() {
+        "nothing".to_owned()
+    } else {
+        parts.join("; ")
     }
 }
 
