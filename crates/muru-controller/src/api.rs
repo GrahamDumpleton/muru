@@ -731,7 +731,8 @@ impl Admin for Service {
                 store: self.handle.store.clone(),
             }),
         )
-        .map_err(Status::failed_precondition)?;
+        .map_err(Status::failed_precondition)?
+        .output;
         let stream =
             tokio_stream::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(output), Ok);
         Ok(Response::new(Box::pin(stream)))

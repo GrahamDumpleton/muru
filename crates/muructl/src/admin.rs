@@ -6510,8 +6510,9 @@ fn show_output(output: &pb::CommandOutput, json: bool) -> anyhow::Result<Option<
 /// Run a command of the project here in this process (section 9.12):
 /// nothing else is running to ask, as in a Kubernetes Job. The command
 /// gets what muructl serve and muructl run would serve the application
-/// with, and a signal that would end muructl stops it first, as a caller
-/// going away does under the daemon.
+/// with. SIGINT or SIGTERM stops it as a caller going away does under the
+/// daemon, and muructl exits once it has ended; a second signal kills it
+/// at once.
 async fn run_own(
     request: pb::RunCommandRequest,
     project: &crate::project_commands::ProjectArgs,
@@ -6527,7 +6528,10 @@ async fn run_own(
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
 
-    let mut output = muru_controller::commands::run(
+    let muru_controller::commands::Running {
+        mut output,
+        stopper,
+    } = muru_controller::commands::run(
         prepared,
         std::sync::Arc::new(muru_controller::commands::Unrecorded),
     )
@@ -6549,17 +6553,45 @@ async fn run_own(
         }
     };
 
-    // The stream closed is the caller gone: the command's session gets
-    // SIGTERM and, after the grace period, SIGKILL, and the stream ends
-    // once the command has.
+    // The command's session gets SIGTERM and, after the grace period,
+    // SIGKILL, as at its timeout; another signal kills it at once. Its
+    // output is read on to the last message, which comes once the command
+    // has ended and been reaped, so muructl exits only after it.
 
-    output.close();
+    let name = if signalled == libc::SIGINT {
+        "SIGINT"
+    } else {
+        "SIGTERM"
+    };
+    stopper.stop(format!("muructl got {name}"));
 
-    while let Some(message) = output.recv().await {
-        show_output(&message, json)?;
+    loop {
+        tokio::select! {
+            message = output.recv() => {
+                let Some(message) = message else {
+                    anyhow::bail!("the command's end was not reported");
+                };
+
+                // The end is said even when the command exits with 0 once
+                // stopped, which show_output passes over as a success.
+
+                if message.finished && !json {
+                    use std::io::Write as _;
+
+                    std::io::stdout().flush()?;
+                    eprintln!("muru: the command {}", message.message);
+                } else {
+                    show_output(&message, json)?;
+                }
+
+                if message.finished {
+                    return Ok(128 + signalled);
+                }
+            }
+            _ = interrupt.recv() => stopper.kill(),
+            _ = terminate.recv() => stopper.kill(),
+        }
     }
-
-    Ok(128 + signalled)
 }
 
 /// What `muructl logs` takes: a release's output, or the access log,

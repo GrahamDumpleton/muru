@@ -211,7 +211,7 @@ pub fn run(
     request: CommandRequest,
     record: Arc<dyn Record>,
 ) -> Result<tokio::sync::mpsc::Receiver<muru_proto::admin::v1::CommandOutput>, String> {
-    muru_controller::commands::run(prepare(context, request)?, record)
+    Ok(muru_controller::commands::run(prepare(context, request)?, record)?.output)
 }
 
 /// How a command finds the project when it runs on its own: the few

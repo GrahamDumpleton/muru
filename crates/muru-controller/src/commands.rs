@@ -557,14 +557,49 @@ struct Ending {
     ok: bool,
 }
 
-/// Start the command and stream what it writes. The receiver yields a
-/// message per line of output and a last one saying how it ended; when
-/// the receiver is dropped the command is stopped, as at its timeout. An
-/// exclusive command already running for the application is refused.
-pub fn run(
-    prepared: Prepared,
-    record: Arc<dyn Record>,
-) -> Result<mpsc::Receiver<pb::CommandOutput>, String> {
+/// A command `run` started: what it writes, and a way to stop it while
+/// that is still read.
+pub struct Running {
+    /// A message per line of output, and a last one saying how it ended.
+    /// When it is dropped the command is stopped, as at its timeout,
+    /// because its caller went away.
+    pub output: mpsc::Receiver<pb::CommandOutput>,
+    /// Stops the command for a caller that reads on to its end.
+    pub stopper: Stopper,
+}
+
+/// What a caller asks of a command whose output it still reads.
+enum Request {
+    /// Stop it as at its timeout, for this reason.
+    Stop(String),
+    /// Kill its session at once.
+    Kill,
+}
+
+/// Stops a command `run` started, while its caller goes on reading the
+/// output, so the last message still says how it ended. Dropping it
+/// leaves the command running.
+#[derive(Clone)]
+pub struct Stopper(mpsc::UnboundedSender<Request>);
+
+impl Stopper {
+    /// Stop the command as at its timeout: its session gets SIGTERM and,
+    /// after the grace period, SIGKILL. `why` is how its end says why it
+    /// was stopped, such as "muructl got SIGTERM".
+    pub fn stop(&self, why: impl Into<String>) {
+        let _ = self.0.send(Request::Stop(why.into()));
+    }
+
+    /// Kill the command's session at once, during the grace period of a
+    /// stop or in place of one.
+    pub fn kill(&self) {
+        let _ = self.0.send(Request::Kill);
+    }
+}
+
+/// Start the command and stream what it writes. An exclusive command
+/// already running for the application is refused.
+pub fn run(prepared: Prepared, record: Arc<dyn Record>) -> Result<Running, String> {
     let secrets = SecretFiles(prepared.secrets.clone());
 
     let claim = match (&prepared.declared, prepared.exclusive) {
@@ -587,15 +622,19 @@ pub fn run(
         _ => Claim(None),
     };
 
-    let (sender, receiver) = mpsc::channel(256);
+    let (sender, output) = mpsc::channel(256);
+    let (stopper, requests) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
-        supervise(prepared, record, sender).await;
+        supervise(prepared, record, sender, requests).await;
         drop(claim);
         drop(secrets);
     });
 
-    Ok(receiver)
+    Ok(Running {
+        output,
+        stopper: Stopper(stopper),
+    })
 }
 
 /// Run the command to its end, relaying its output and recording it.
@@ -603,6 +642,7 @@ async fn supervise(
     prepared: Prepared,
     record: Arc<dyn Record>,
     sender: mpsc::Sender<pb::CommandOutput>,
+    mut requests: mpsc::UnboundedReceiver<Request>,
 ) {
     let subject = prepared.subject();
     let started = Instant::now();
@@ -688,8 +728,9 @@ async fn supervise(
     };
     tokio::pin!(timed_out);
 
-    // Relay lines until both streams close, the command outlives its
-    // timeout or the caller goes away.
+    // Relay lines until both streams close. The command is stopped when
+    // it outlives its timeout, when the caller asks or when the caller
+    // goes away.
 
     let mut stopped: Option<String> = None;
     let mut caller_gone = false;
@@ -719,7 +760,7 @@ async fn supervise(
 
                     if stopped.is_none() {
                         stopped = Some("its caller went away".to_owned());
-                        stop(pid, &mut child).await;
+                        stop(pid, &mut child, &mut requests).await;
                     }
                 }
             }
@@ -729,16 +770,28 @@ async fn supervise(
                     "it ran past its timeout of {}",
                     muru_config::format_duration(timeout)
                 ));
-                stop(pid, &mut child).await;
+                stop(pid, &mut child, &mut requests).await;
             }
             () = sender.closed(), if !caller_gone => {
                 caller_gone = true;
 
                 if stopped.is_none() {
                     stopped = Some("its caller went away".to_owned());
-                    stop(pid, &mut child).await;
+                    stop(pid, &mut child, &mut requests).await;
                 }
             }
+            request = next_request(&mut requests) => match request {
+                Request::Stop(why) => {
+                    if stopped.is_none() {
+                        stopped = Some(why);
+                        stop(pid, &mut child, &mut requests).await;
+                    }
+                }
+                Request::Kill => {
+                    stopped.get_or_insert_with(|| "its caller had it killed".to_owned());
+                    kill(pid, &mut child);
+                }
+            },
         }
     }
 
@@ -781,8 +834,13 @@ async fn supervise(
     }
 }
 
-/// Stop the command's session: SIGTERM, a grace period, then SIGKILL.
-async fn stop(pid: u32, child: &mut tokio::process::Child) {
+/// Stop the command's session: SIGTERM, a grace period, then SIGKILL,
+/// sooner when the caller asks for the command to be killed.
+async fn stop(
+    pid: u32,
+    child: &mut tokio::process::Child,
+    requests: &mut mpsc::UnboundedReceiver<Request>,
+) {
     if pid == 0 {
         let _ = child.start_kill();
         return;
@@ -790,12 +848,37 @@ async fn stop(pid: u32, child: &mut tokio::process::Child) {
 
     crate::host::signal_group(pid, libc::SIGTERM);
 
-    if tokio::time::timeout(STOP_GRACE, child.wait())
-        .await
-        .is_err()
-    {
+    let ended = tokio::select! {
+        waited = tokio::time::timeout(STOP_GRACE, child.wait()) => waited.is_ok(),
+        () = kill_asked(requests) => false,
+    };
+
+    if !ended {
+        kill(pid, child);
+    }
+}
+
+/// Kill the command's session at once.
+fn kill(pid: u32, child: &mut tokio::process::Child) {
+    if pid == 0 {
+        let _ = child.start_kill();
+    } else {
         crate::host::signal_group(pid, libc::SIGKILL);
     }
+}
+
+/// What the caller asks next, which never comes once it has dropped its
+/// stopper.
+async fn next_request(requests: &mut mpsc::UnboundedReceiver<Request>) -> Request {
+    match requests.recv().await {
+        Some(request) => request,
+        None => std::future::pending().await,
+    }
+}
+
+/// Wait for the caller to ask for the command to be killed.
+async fn kill_asked(requests: &mut mpsc::UnboundedReceiver<Request>) {
+    while !matches!(next_request(requests).await, Request::Kill) {}
 }
 
 /// Send each line a stream carries, as text, until it closes.
@@ -1235,7 +1318,8 @@ mod tests {
             ),
             recorded(),
         )
-        .expect("started");
+        .expect("started")
+        .output;
         let messages = collect(receiver).await;
 
         let lines: Vec<(bool, &str)> = messages
@@ -1264,7 +1348,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let mut command = prepared(&["sleep", "30"], dir.path().join("r1.log"));
         command.timeout = Some(Duration::from_millis(200));
-        let messages = collect(run(command, recorded()).expect("started")).await;
+        let messages = collect(run(command, recorded()).expect("started").output).await;
 
         let last = messages.last().expect("a last message");
         assert!(last.finished);
@@ -1277,6 +1361,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_command_stopped_by_its_caller_ends_saying_why() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let mut running = run(
+            prepared(
+                &["sh", "-c", "echo started; exec sleep 30"],
+                dir.path().join("r1.log"),
+            ),
+            recorded(),
+        )
+        .expect("started");
+
+        // The stop comes once the command is running, and the output is
+        // read on to its end.
+
+        let first = running.output.recv().await.expect("a line");
+        assert_eq!(first.line, "started");
+        running.stopper.stop("muructl got SIGTERM");
+        let messages = collect(running.output).await;
+
+        let last = messages.last().expect("a last message");
+        assert!(last.finished);
+        assert_eq!(last.exit_code, 128 + libc::SIGTERM);
+        assert!(
+            last.message
+                .starts_with("stopped because muructl got SIGTERM; it was killed by signal 15"),
+            "{}",
+            last.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_that_ignores_sigterm_is_killed_when_its_caller_asks() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let mut running = run(
+            prepared(
+                &[
+                    "sh",
+                    "-c",
+                    "trap '' TERM; echo started; while :; do sleep 1; done",
+                ],
+                dir.path().join("r1.log"),
+            ),
+            recorded(),
+        )
+        .expect("started");
+
+        // Asked to stop, it would hold out for the grace period; the kill
+        // that follows ends it well inside that.
+
+        let first = running.output.recv().await.expect("a line");
+        assert_eq!(first.line, "started");
+        running.stopper.stop("muructl got SIGINT");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        running.stopper.kill();
+        let messages = tokio::time::timeout(STOP_GRACE / 2, collect(running.output))
+            .await
+            .expect("the command ended before the grace period did");
+
+        let last = messages.last().expect("a last message");
+        assert_eq!(last.exit_code, 128 + libc::SIGKILL);
+        assert!(
+            last.message
+                .starts_with("stopped because muructl got SIGINT; it was killed by signal 9"),
+            "{}",
+            last.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stopper_leaves_the_command_running() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let Running { output, stopper } = run(
+            prepared(
+                &["sh", "-c", "sleep 0.2; echo done"],
+                dir.path().join("r1.log"),
+            ),
+            recorded(),
+        )
+        .expect("started");
+        drop(stopper);
+        let messages = collect(output).await;
+
+        let last = messages.last().expect("a last message");
+        assert_eq!(last.exit_code, 0, "{}", last.message);
+        assert!(messages.iter().any(|message| message.line == "done"));
+    }
+
+    #[tokio::test]
     async fn a_program_that_is_not_found_ends_with_127() {
         let dir = tempfile::tempdir().expect("a directory");
         let messages = collect(
@@ -1284,7 +1456,8 @@ mod tests {
                 prepared(&["no-such-program-anywhere"], dir.path().join("r1.log")),
                 recorded(),
             )
-            .expect("started"),
+            .expect("started")
+            .output,
         )
         .await;
 
@@ -1332,7 +1505,7 @@ mod tests {
         command.log = None;
         command.label = "migrate".to_owned();
         command.declared = Some("migrate".to_owned());
-        let messages = collect(run(command, kept.clone()).expect("started")).await;
+        let messages = collect(run(command, kept.clone()).expect("started").output).await;
 
         assert_eq!(messages.last().expect("a last message").exit_code, 3);
         assert!(!dir.path().join("x").exists());

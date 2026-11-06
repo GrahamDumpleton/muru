@@ -48,6 +48,7 @@ timeout = '1s'
 """
 
 TASKS = """import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -71,6 +72,14 @@ if __name__ == "__main__":
         print("to standard error", file=sys.stderr)
         sys.exit(int(sys.argv[3]))
 
+    # A stop is noted before the signal does what it would have done.
+
+    def stopped(signum, frame):
+        Path("hold.stopped").write_text(signal.Signals(signum).name)
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    signal.signal(signal.SIGTERM, stopped)
     Path("hold.pid").write_text(str(os.getpid()))
     print("holding", flush=True)
     time.sleep(60)
@@ -225,12 +234,15 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
     assert one_off.returncode == 0, one_off.stderr
     assert one_off.stdout == f"{sys.executable} hello\n"
 
-    # Its timeout stops it, and so does a signal that ends muructl.
+    # Its timeout stops it, and so does a signal that ends muructl: the
+    # command gets SIGTERM, and muructl exits once it has ended.
 
     slow = muructl(runtime, project, "command", "run", "slow", *python)
     assert slow.returncode == 128 + signal.SIGTERM
     assert "ran past its timeout of 1s" in slow.stderr
+    assert (project / "hold.stopped").read_text() == "SIGTERM"
     (project / "hold.pid").unlink()
+    (project / "hold.stopped").unlink()
 
     held = subprocess.Popen(
         command(runtime, project, "command", "run", "hold", *python),
@@ -246,8 +258,11 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
         wait_until((project / "hold.pid").exists, "the command never started")
         pid = int((project / "hold.pid").read_text())
         held.send_signal(signal.SIGTERM)
-        assert held.wait(timeout=30) == 128 + signal.SIGTERM
+        _, stderr = held.communicate(timeout=30)
+        assert held.returncode == 128 + signal.SIGTERM
         assert gone(pid)
+        assert (project / "hold.stopped").read_text() == "SIGTERM"
+        assert "muru: the command stopped because muructl got SIGTERM" in stderr, stderr
     finally:
         held.kill()
 

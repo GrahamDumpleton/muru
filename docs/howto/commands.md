@@ -192,6 +192,21 @@ with anything it started. A command past its `timeout` is stopped the
 same way. Run a long command where the session will last, under `nohup`,
 `tmux` or a CI job, so a dropped connection does not stop it halfway.
 
+When `muructl` runs the command itself, because nothing serves the
+project, Ctrl-C or SIGTERM stops the command the same way. `muructl`
+waits for it to end, says why it was stopped, and exits with 128 plus the
+signal it got, 130 for Ctrl-C and 143 for SIGTERM:
+
+```console
+$ muructl command run migrate
+Running migrations:
+^C
+muru: the command stopped because muructl got SIGINT; it was killed by signal 15 after 4s
+```
+
+A second Ctrl-C or SIGTERM kills the command, and anything it started,
+at once.
+
 ## What is recorded
 
 The command's output is added to the release's log, each line prefixed
