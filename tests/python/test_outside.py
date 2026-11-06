@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from muru import _asgi, _native, _outside
+from muru import _asgi, _outside
 
 REPORT = textwrap.dedent(
     """\
@@ -286,13 +286,15 @@ def test_a_profile_names_threads_as_linux_does_asking_once_each(
     assert sorted(path.split("/")[-2] for path in reads) == ["40", "41"]
 
 
-def test_the_loop_thread_tells_the_runtime_its_name(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_loop_thread_tells_the_runtime_its_name(
+    monkeypatch: pytest.MonkeyPatch, native: Any
+) -> None:
     named: list[tuple[str, str]] = []
 
     def name_thread(name: str) -> None:
         named.append((name, threading.current_thread().name))
 
-    monkeypatch.setattr(_native, "name_thread", name_thread)
+    monkeypatch.setattr(native, "name_thread", name_thread)
     loop = _asgi.Loop(sync_threads=1)
     loop.start()
     loop.stop()
