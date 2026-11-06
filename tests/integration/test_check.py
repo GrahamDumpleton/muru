@@ -51,6 +51,26 @@ def test_a_sound_project_passes(tmp_path: Path) -> None:
     assert "muru: serving" not in completed.stdout, "nothing is served"
 
 
+def test_a_muru_toml_beside_pyproject_is_said_to_be_the_one_read(tmp_path: Path) -> None:
+    # The two are never merged: muru.toml is used and the [tool.muru]
+    # table is not read, which the check says.
+
+    source = tmp_path / "shop"
+    shutil.copytree(SHOP, source, ignore=shutil.ignore_patterns("__pycache__"))
+    alone = check(str(source))
+    assert "is not read" not in alone.stdout, alone.stdout
+
+    (source / "muru.toml").write_text("entrypoint = 'shop.wsgi:application'\n")
+    completed = check(str(source))
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert f"muru: check: [tool.muru] from {source / 'muru.toml'} is valid" in completed.stdout
+    assert (
+        f"muru: check: {source / 'muru.toml'} is used for the project's settings; the "
+        f"[tool.muru] table in {source / 'pyproject.toml'} is not read"
+    ) in completed.stdout, completed.stdout
+    assert "hooks module" not in completed.stdout, "the table's hooks are not read"
+
+
 def test_an_entrypoint_that_does_not_resolve_fails_with_the_error(tmp_path: Path) -> None:
     directory = tmp_path / "project"
     directory.mkdir()

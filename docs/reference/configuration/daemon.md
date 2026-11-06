@@ -2,7 +2,7 @@
 
 # The daemon's configuration and applied files
 
-The keys of the daemon's configuration file, `muru.toml` in its configuration directory, and of the files `muructl apply` reads, which share one format. Listeners, limits, the proxy, compression, secret stores, logs, shutdown, metrics, events, the dashboard, the overlay webhook, client classes and rate limits belong to the daemon's own file; an applied file that sets them is refused. Applications, their releases, hosts, routes, upstreams and overlays may be in either.
+The keys of the daemon's configuration file, `muru.toml` in its configuration directory, and of the files `muructl apply` reads, which share one format. A file in this format kept beside a project's code is named `muru.daemon.toml`, since `muru.toml` there is the project's settings, which have other keys. Listeners, limits, the proxy, compression, secret stores, logs, shutdown, metrics, events, the dashboard, the overlay webhook, client classes and rate limits belong to the daemon's own file; an applied file that sets them is refused. Applications, their releases, hosts, routes, upstreams and overlays may be in either.
 
 The JSON Schema of the same keys, for an editor that checks TOML against one, is `https://docs.muruhq.dev/en/latest/schema/daemon.schema.json`.
 
@@ -54,7 +54,7 @@ An application's table and its releases.
 (config-daemon-app-name-release-id)=
 ## `[app.NAME.release.ID]`
 
-A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes. `muructl run --print-config` writes one so a laptop setup can become a declared release, and `muructl apply` reads them.
+A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes, which `muructl apply` reads. What a table leaves out comes from the `[tool.muru]` table of its source.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |

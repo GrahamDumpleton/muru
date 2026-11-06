@@ -57,6 +57,10 @@ pub struct ServeArgs {
 
     #[command(flatten)]
     socket: SocketArgs,
+
+    /// The daemon's own files, for the daemon --up starts.
+    #[command(flatten)]
+    files: crate::admin::DaemonFileArgs,
 }
 
 /// Run an `mcp` subcommand.
@@ -110,6 +114,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         let started = tokio::process::Command::new(&server.muructl)
             .arg("up")
             .args(args.socket.location_arguments())
+            .args(args.files.as_arguments())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -295,7 +300,7 @@ hold starts the release without moving traffic.
 release; drain takes a release out of traffic and stops it.
 - rollout canary shifts traffic to a release step by step, each step judged \
 by gates against the release that serves.
-- apply makes a declarative file (muru.toml) the desired state; deploy adds \
+- apply makes a declarative file (muru.daemon.toml) the desired state; deploy adds \
 one release.
 - An overlay is a named, temporary change to routes or settings.
 - commands lists what an application declares it can run with a release \

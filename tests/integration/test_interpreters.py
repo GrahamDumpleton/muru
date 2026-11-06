@@ -56,14 +56,14 @@ def project(directory: Path, requires: str | None = None, extra: str = "") -> Pa
 def run_once(
     directory: Path, *args: str, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """Run `muructl run --print-config`, which resolves the interpreter and
+    """Run `muructl run --print-daemon-config`, which resolves the interpreter and
     exits, with the active virtualenv hidden so the project decides."""
 
     environment = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
     environment.update(env or {})
 
     return subprocess.run(
-        [str(muructl()), "run", str(directory), "--print-config", *args],
+        [str(muructl()), "run", str(directory), "--print-daemon-config", *args],
         capture_output=True,
         text=True,
         timeout=60,

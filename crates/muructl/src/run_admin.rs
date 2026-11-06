@@ -137,6 +137,9 @@ pub struct Served {
     pub interpreter: Mutex<(PathBuf, Option<PathBuf>)>,
     /// The project's environment variables.
     pub env: Vec<(String, String)>,
+    /// The project settings file muructl serve was given, read in place
+    /// of the one beside the code.
+    pub file: Option<PathBuf>,
 }
 
 impl Served {
@@ -164,6 +167,7 @@ impl RunState {
             python,
             pythonpath,
             env: self.served.env.clone(),
+            file: self.served.file.clone(),
         }
     }
 
@@ -750,8 +754,9 @@ impl Admin for Service {
         let release = state
             .target(&request.app, &request.release)
             .map_err(Status::not_found)?;
-        let commands = crate::project_commands::declared(&state.project)
-            .map_err(Status::failed_precondition)?;
+        let commands =
+            crate::project_commands::declared(&state.project, state.served.file.as_deref())
+                .map_err(Status::failed_precondition)?;
 
         Ok(Response::new(pb::ListCommandsResponse {
             app: state.app.clone(),

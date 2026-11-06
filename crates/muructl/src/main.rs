@@ -14,6 +14,7 @@ mod edge;
 mod init;
 mod log_format;
 mod mcp;
+mod print_config;
 mod project_commands;
 mod provision;
 mod pstats;
@@ -63,10 +64,11 @@ enum Command {
 
     /// Run one application in a container: configured from the image and the environment, probes and metrics on an admin port, logs on standard output.
     #[command(
-        after_help = "Every setting can also come from the project's [tool.muru.serve] table, a file \
-                      named by --config or MURU_SERVE_CONFIG, or an environment variable named \
-                      MURU_SERVE_ and the flag in upper snake case, such as MURU_SERVE_PROCESSES; \
-                      a flag wins over all of them, and --print-config shows where each came from."
+        after_help = "Every setting can also come from the project's [tool.muru.serve] table, or \
+                      an environment variable named MURU_SERVE_ and the flag in upper snake case, \
+                      such as MURU_SERVE_PROCESSES; a flag wins over both, and --print-config \
+                      shows where each came from. --config or MURU_SERVE_CONFIG names a project \
+                      settings file to read in place of the one beside the code."
     )]
     Serve(Box<serve::ServeArgs>),
 
@@ -618,11 +620,22 @@ struct RunArgs {
     #[arg(long = "host", value_name = "NAME")]
     hosts: Vec<String>,
 
-    /// Write the equivalent declarative configuration (appendix C) to
-    /// standard output instead of running: the path from a development
-    /// run to a long-running setup.
+    /// Print the settings the run would use, each with where it came
+    /// from, in the shape of the project's file, and exit.
     #[arg(long)]
     print_config: bool,
+
+    /// Write this run in the daemon's format (appendix C) to standard
+    /// output instead of running. Hidden until the path from a
+    /// development run to the daemon is worked out: the output restates
+    /// what the project's file already says.
+    #[arg(long, hide = true, conflicts_with = "print_config")]
+    print_daemon_config: bool,
+
+    /// The project settings file muructl serve was given, read in place
+    /// of the one beside the code (section 13.9).
+    #[arg(skip)]
+    settings_file: Option<PathBuf>,
 
     /// One process and one thread, serving without forking, for debuggers.
     /// Implies --processes 1 --threads 1.
@@ -895,14 +908,17 @@ fn main() -> anyhow::Result<()> {
                     shutdown,
                     timeout,
                     socket,
-                } => admin::daemon_stop(socket, shutdown, timeout).await,
-                admin::DaemonCommand::Reload { socket, output } => {
+                    files,
+                } => admin::daemon_stop(socket, files, shutdown, timeout).await,
+                admin::DaemonCommand::Reload { socket, output, .. } => {
                     admin::daemon_reload(socket, output.json).await
                 }
-                admin::DaemonCommand::Upgrade { timeout, socket } => {
-                    admin::daemon_upgrade(socket, timeout).await
-                }
-                admin::DaemonCommand::Status { socket, output } => {
+                admin::DaemonCommand::Upgrade {
+                    timeout,
+                    socket,
+                    files,
+                } => admin::daemon_upgrade(socket, files, timeout).await,
+                admin::DaemonCommand::Status { socket, output, .. } => {
                     admin::daemon_status(socket, output.json).await
                 }
             }
@@ -1689,6 +1705,8 @@ struct Resolved {
     scaling: Option<muru_config::Scaling>,
     /// How the run serves (section 13.1).
     serving: Serving,
+    /// The tables as they were read, for --print-config.
+    layers: print_config::Layers,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -1749,7 +1767,8 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         None => (None, chdir.unwrap_or_else(|| PathBuf::from("."))),
     };
 
-    let (source, table) = match muru_config::load_project(&project)? {
+    let (source, table) = match muru_config::load_settings(&project, args.settings_file.as_deref())?
+    {
         Some((path, table)) => (Some(path), table),
         None => (None, muru_config::ToolMuru::default()),
     };
@@ -1783,6 +1802,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         None => (None, muru_config::RunSettings::default(), None),
     };
 
+    let layers = print_config::Layers::new(&table, &run_table, &local_run);
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
 
     // Whether the entrypoint is a factory belongs to the entrypoint: the
@@ -1951,11 +1971,13 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         env: table.env,
         scaling: table.scaling,
         serving,
+        layers,
     })
 }
 
-/// The declarative file equivalent to this run, for --print-config: the
-/// release as section 6.8 would define it, the listeners and the limits.
+/// The declarative file equivalent to this run, for the hidden
+/// --print-daemon-config: the release as section 6.8 would define it,
+/// the listeners and the limits.
 fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
     use muru_config::{App, Document, Listener, Release};
 
@@ -2092,9 +2114,12 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
     };
     let text = document.to_toml().context("writing the configuration")?;
     Ok(format!(
-        "# The declarative equivalent of this muructl run, for muructl apply.\n\
+        "# This muructl run in the daemon's format. Save it as {name} and give it\n\
+         # to the daemon with: muructl apply -f {name}\n\
+         # It is not the project's muru.toml, which holds different keys.\n\
          # The release is written as r1; muructl deploy numbers releases itself.\n\
-         # Listeners and limits belong in the daemon configuration file.\n\n{text}"
+         # Listeners and limits belong in the daemon configuration file.\n\n{text}",
+        name = muru_config::DAEMON_FILE
     ))
 }
 
@@ -2422,6 +2447,19 @@ fn tls(args: &RunArgs, serving: &Serving, project: &Path) -> anyhow::Result<Opti
     }))
 }
 
+/// What to say when a project has both a muru.toml and a `[tool.muru]`
+/// table in its pyproject.toml: the first is used and the second is not
+/// read, and the two are never merged.
+pub(crate) fn passed_over_note(project: &Path) -> Option<String> {
+    muru_config::passed_over(project).map(|pyproject| {
+        format!(
+            "{} is used for the project's settings; the [tool.muru] table in {} is not read",
+            project.join("muru.toml").display(),
+            pyproject.display()
+        )
+    })
+}
+
 /// The interpreter to run the host with (sections 8.1 and 13.1): --python
 /// as a path or a request, else the active virtualenv, else the project's
 /// own .venv, else the project's request through the developer's own uv,
@@ -2556,6 +2594,10 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
             "muru: check: [tool.muru] from {} is valid",
             source.display()
         );
+    }
+
+    if let Some(note) = passed_over_note(&resolved.project) {
+        println!("muru: check: {note}");
     }
 
     let python = interpreter(&run_args, &resolved, false)?;
@@ -2829,12 +2871,23 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     }
 
     if args.print_config {
+        print!("{}", print_config::for_run(&args, &resolved));
+        return Ok(());
+    }
+
+    if args.print_daemon_config {
         print!("{}", declarative(&args, &resolved)?);
         return Ok(());
     }
 
     if let Some(source) = &resolved.source {
         muru_common::muru_println!("using [tool.muru] from {}", source.display());
+    }
+
+    if args.settings_file.is_none()
+        && let Some(note) = passed_over_note(&resolved.project)
+    {
+        muru_common::muru_println!("{note}");
     }
 
     // Section 8.2: run is build under the build mode, then serve. A
@@ -3054,6 +3107,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     let served = Arc::new(run_admin::Served {
         interpreter: std::sync::Mutex::new((spec.python.clone(), spec.pythonpath.clone())),
         env: spec.env.clone(),
+        file: args.settings_file.clone(),
     });
 
     let logs = Logs::default();

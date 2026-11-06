@@ -769,9 +769,8 @@ pub fn check_group_timeouts(timeouts: Option<&Timeouts>) -> Result<(), String> {
 }
 
 /// A release definition, the `[app.NAME.release.ID]` table (appendix C):
-/// the keys a deploy takes. `muructl run --print-config` writes one so a
-/// laptop setup can become a declared release, and `muructl apply` reads
-/// them.
+/// the keys a deploy takes, which `muructl apply` reads. What a table
+/// leaves out comes from the `[tool.muru]` table of its source.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Release {
@@ -5035,9 +5034,9 @@ impl RunSettings {
     }
 }
 
-/// The `[tool.muru.serve]` table (`[serve]` in muru.toml), and the file
-/// `MURU_SERVE_CONFIG` names: how `muructl serve` runs the application in
-/// a container (section 13.9). A key is a flag of the command in snake
+/// The `[tool.muru.serve]` table (`[serve]` in muru.toml, and in the
+/// file `muructl serve --config` names in its place): how `muructl serve`
+/// runs the application in a container (section 13.9). A key is a flag of the command in snake
 /// case, taking the flag's value; a list key takes the values the flag
 /// would be repeated with.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -5202,14 +5201,6 @@ impl std::fmt::Display for Count {
             Self::Named(name) => formatter.write_str(name),
         }
     }
-}
-
-/// Read the file `MURU_SERVE_CONFIG` or `--config` names, which holds the
-/// serve table's keys at its top level (section 13.9).
-pub fn load_serve_file(path: &Path) -> Result<ServeSettings, String> {
-    let text =
-        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// The `[tool.muru]` table: defaults an application ships with (section
@@ -5469,7 +5460,7 @@ pub fn load_project(dir: &Path) -> Result<Option<(PathBuf, ToolMuru)>, ProjectEr
             Some(
                 parse_muru_toml(&text).map_err(|message| ProjectError::Invalid {
                     path: path.clone(),
-                    message,
+                    message: with_daemon_hint(message, &text),
                 })?,
             )
         } else {
@@ -5485,6 +5476,94 @@ pub fn load_project(dir: &Path) -> Result<Option<(PathBuf, ToolMuru)>, ProjectEr
     }
 
     Ok(None)
+}
+
+/// The name by convention of a file in the daemon's format that is kept
+/// beside a project's code, where `muru.toml` is the project's settings.
+pub const DAEMON_FILE: &str = "muru.daemon.toml";
+
+/// A refusal of a project's settings file, with what the file is taken
+/// for when the key refused belongs to the daemon's format: an applied
+/// file saved as muru.toml beside the code is the usual cause.
+fn with_daemon_hint(message: String, text: &str) -> String {
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return message;
+    };
+
+    let project = schema::top_level_keys(schema::File::Project);
+    let daemon = schema::top_level_keys(schema::File::Daemon);
+
+    match table
+        .keys()
+        .find(|key| daemon.contains(*key) && !project.contains(*key))
+    {
+        Some(key) => format!(
+            "{message}\n`{key}` is a key of the daemon's format, and this file is read as the \
+             project's settings; a file in the daemon's format beside the code is named \
+             {DAEMON_FILE}"
+        ),
+        None => message,
+    }
+}
+
+/// Read a project's settings from one named file, used in place of the
+/// file beside the code (section 13.9): a file named pyproject.toml for
+/// its `[tool.muru]` table, and any other as a muru.toml, the keys at its
+/// top level.
+pub fn load_project_file(path: &Path) -> Result<(PathBuf, ToolMuru), ProjectError> {
+    let text = std::fs::read_to_string(path).map_err(|source| ProjectError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let invalid = |message: String| ProjectError::Invalid {
+        path: path.to_path_buf(),
+        message,
+    };
+
+    let table = if path
+        .file_name()
+        .is_some_and(|name| name == "pyproject.toml")
+    {
+        parse_pyproject(&text)
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("it has no [tool.muru] table".to_owned()))?
+    } else {
+        parse_muru_toml(&text).map_err(|message| invalid(with_daemon_hint(message, &text)))?
+    };
+
+    Ok((path.to_path_buf(), table))
+}
+
+/// A project's settings: from `file` when one is named, in place of
+/// whatever is beside the code, else from `dir` as [`load_project`]
+/// reads them.
+pub fn load_settings(
+    dir: &Path,
+    file: Option<&Path>,
+) -> Result<Option<(PathBuf, ToolMuru)>, ProjectError> {
+    match file {
+        Some(file) => load_project_file(file).map(Some),
+        None => load_project(dir),
+    }
+}
+
+/// The pyproject.toml whose `[tool.muru]` table is not read because the
+/// project has a muru.toml too, which is used in its place: the two are
+/// never merged.
+pub fn passed_over(dir: &Path) -> Option<PathBuf> {
+    if !dir.join("muru.toml").is_file() {
+        return None;
+    }
+
+    let path = dir.join("pyproject.toml");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let table = text.parse::<toml::Table>().ok()?;
+
+    table
+        .get("tool")
+        .and_then(|tool| tool.get("muru"))
+        .is_some()
+        .then_some(path)
 }
 
 /// The per-developer file beside a project's pyproject.toml or muru.toml
@@ -6580,6 +6659,83 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         let (path, table) = load_project(&dir).unwrap().unwrap();
         assert!(path.ends_with("muru.toml"));
         assert_eq!(table.entrypoint.as_deref(), Some("c:d"));
+
+        // The table passed over is named, so a command can say so.
+
+        assert_eq!(passed_over(&dir), Some(dir.join("pyproject.toml")));
+        std::fs::remove_file(dir.join("muru.toml")).unwrap();
+        assert_eq!(passed_over(&dir), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_named_file_is_read_in_place_of_the_projects() {
+        let dir = std::env::temp_dir().join(format!("muru-config-named-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("mounted")).unwrap();
+        std::fs::write(dir.join("muru.toml"), "entrypoint = 'in:project'\n").unwrap();
+
+        // Any name is read as a muru.toml, and pyproject.toml for its table.
+
+        let settings = dir.join("mounted/settings.toml");
+        std::fs::write(
+            &settings,
+            "entrypoint = 'in:mount'\n[serve]\nprocesses = 3\n",
+        )
+        .unwrap();
+        let (path, table) = load_settings(&dir, Some(&settings)).unwrap().unwrap();
+        assert_eq!(path, settings);
+        assert_eq!(table.entrypoint.as_deref(), Some("in:mount"));
+        assert!(table.serve.is_some());
+
+        let pyproject = dir.join("mounted/pyproject.toml");
+        std::fs::write(&pyproject, "[tool.muru]\nentrypoint = 'in:pyproject'\n").unwrap();
+        let (_, table) = load_project_file(&pyproject).unwrap();
+        assert_eq!(table.entrypoint.as_deref(), Some("in:pyproject"));
+        std::fs::write(&pyproject, "[project]\nname = 'x'\n").unwrap();
+        let error = load_project_file(&pyproject).unwrap_err().to_string();
+        assert!(error.ends_with("it has no [tool.muru] table"), "{error}");
+
+        // With none named, the project's own is read.
+
+        let (_, table) = load_settings(&dir, None).unwrap().unwrap();
+        assert_eq!(table.entrypoint.as_deref(), Some("in:project"));
+        assert!(matches!(
+            load_settings(&dir, Some(&dir.join("missing.toml"))),
+            Err(ProjectError::Read { .. })
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_daemon_format_file_read_as_a_projects_says_what_it_is_taken_for() {
+        let dir = std::env::temp_dir().join(format!("muru-config-daemon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("muru.toml"),
+            "[app.shop.release.r1]\nsource = '.'\n",
+        )
+        .unwrap();
+        let error = load_project(&dir).unwrap_err().to_string();
+        assert!(error.contains("unknown field `app`"), "{error}");
+        assert!(
+            error.contains(
+                "`app` is a key of the daemon's format, and this file is read as the project's \
+                 settings; a file in the daemon's format beside the code is named muru.daemon.toml"
+            ),
+            "{error}"
+        );
+
+        // A key neither format has is refused as it was.
+
+        std::fs::write(dir.join("muru.toml"), "entrypont = 'a:b'\n").unwrap();
+        let error = load_project(&dir).unwrap_err().to_string();
+        assert!(!error.contains("daemon's format"), "{error}");
+
+        // A key both formats have, wrongly typed, is the project's own.
+
+        std::fs::write(dir.join("muru.toml"), "error_pages = 3\n").unwrap();
+        let error = load_project(&dir).unwrap_err().to_string();
+        assert!(!error.contains("daemon's format"), "{error}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

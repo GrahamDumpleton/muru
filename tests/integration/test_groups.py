@@ -92,7 +92,7 @@ def test_print_config_writes_the_groups() -> None:
     muructl = support.muructl_path()
     assert muructl is not None
     completed = subprocess.run(
-        [str(muructl), "run", str(GROUPED), "--print-config", "--python", sys.executable],
+        [str(muructl), "run", str(GROUPED), "--print-daemon-config", "--python", sys.executable],
         capture_output=True,
         text=True,
         check=True,

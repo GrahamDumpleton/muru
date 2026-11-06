@@ -31,13 +31,17 @@ pub struct Context {
     /// The project's environment variables (section 10.8), over those
     /// the process already has.
     pub env: Vec<(String, String)>,
+    /// The project settings file read in place of the one beside the
+    /// code, when one is named (section 13.9).
+    pub file: Option<PathBuf>,
 }
 
-/// The commands the project declares, read from its file as it is now
-/// and checked as a release's are when it is created.
-pub fn declared(project: &Path) -> Result<Vec<CommandSpec>, String> {
+/// The commands the project declares, read from its file as it is now,
+/// or from `file` in its place, and checked as a release's are when it is
+/// created.
+pub fn declared(project: &Path, file: Option<&Path>) -> Result<Vec<CommandSpec>, String> {
     let Some((path, table)) =
-        muru_config::load_project(project).map_err(|error| error.to_string())?
+        muru_config::load_settings(project, file).map_err(|error| error.to_string())?
     else {
         return Ok(Vec::new());
     };
@@ -60,15 +64,18 @@ pub fn label(project: &Path, entrypoint: Option<&str>) -> String {
 
 /// The project's commands as `muructl command list` shows them, with no
 /// application or release to name, for a command run on its own.
-pub fn listed(project: &Path) -> Result<muru_proto::admin::v1::ListCommandsResponse, String> {
-    let entrypoint = muru_config::load_project(project)
+pub fn listed(
+    project: &Path,
+    file: Option<&Path>,
+) -> Result<muru_proto::admin::v1::ListCommandsResponse, String> {
+    let entrypoint = muru_config::load_settings(project, file)
         .map_err(|error| error.to_string())?
         .and_then(|(_, table)| table.entrypoint);
 
     Ok(muru_proto::admin::v1::ListCommandsResponse {
         app: label(project, entrypoint.as_deref()),
         release: String::new(),
-        commands: declared(project)?
+        commands: declared(project, file)?
             .iter()
             .map(|command| muru_controller::commands::info(command, None))
             .collect(),
@@ -102,9 +109,10 @@ pub fn prepare(context: &Context, request: CommandRequest) -> Result<Prepared, S
                 ));
             }
 
-            if !muru_config::PROJECT_FILES
-                .iter()
-                .any(|name| context.project.join(name).is_file())
+            if context.file.is_none()
+                && !muru_config::PROJECT_FILES
+                    .iter()
+                    .any(|name| context.project.join(name).is_file())
             {
                 return Err(format!(
                     "{} has no pyproject.toml or muru.toml to declare {name} in; to run a \
@@ -113,7 +121,7 @@ pub fn prepare(context: &Context, request: CommandRequest) -> Result<Prepared, S
                 ));
             }
 
-            let commands = declared(&context.project)?;
+            let commands = declared(&context.project, context.file.as_deref())?;
             let command =
                 muru_controller::commands::find(&commands, name, &subject(context))?.clone();
             let values = muru_controller::commands::input_values(&command, inputs)?;
@@ -215,10 +223,11 @@ pub struct ProjectArgs {
     #[arg(long, value_name = "DIR")]
     pub chdir: Option<PathBuf>,
 
-    /// A settings file as muructl serve takes with --config, for the
-    /// interpreter and the runtime directory (also MURU_SERVE_CONFIG).
+    /// A project settings file used in place of the pyproject.toml or
+    /// muru.toml beside the code, as muructl serve takes it (also
+    /// MURU_SERVE_CONFIG).
     #[arg(long, value_name = "FILE")]
-    pub serve_config: Option<PathBuf>,
+    pub config: Option<PathBuf>,
 
     /// The interpreter a command run on its own uses (default: as
     /// muructl serve and muructl run find it).
@@ -236,8 +245,8 @@ impl ProjectArgs {
     pub fn given(&self) -> Option<&'static str> {
         if self.chdir.is_some() {
             Some("--chdir")
-        } else if self.serve_config.is_some() {
-            Some("--serve-config")
+        } else if self.config.is_some() {
+            Some("--config")
         } else if self.python.is_some() {
             Some("--python")
         } else if self.runtime_dir.is_some() {
@@ -257,6 +266,14 @@ impl ProjectArgs {
             .unwrap_or_else(|| PathBuf::from("."));
         project.canonicalize().unwrap_or(project)
     }
+
+    /// The project settings file the flag or the environment names, in
+    /// place of the one beside the code.
+    pub fn file(&self) -> Option<PathBuf> {
+        crate::serve::settings_file(self.config.as_deref(), &|name: &str| {
+            std::env::var(name).ok()
+        })
+    }
 }
 
 /// What a command run on its own runs with: the project, interpreter,
@@ -267,13 +284,13 @@ impl ProjectArgs {
 pub async fn own(args: &ProjectArgs) -> anyhow::Result<Context> {
     let settings = crate::serve::command_settings(
         args.chdir.as_deref(),
-        args.serve_config.as_deref(),
+        args.config.as_deref(),
         args.python.as_deref(),
         args.runtime_dir.as_deref(),
         |name| std::env::var(name).ok(),
     )?;
 
-    let found = muru_config::load_project(&settings.project)?;
+    let found = muru_config::load_settings(&settings.project, settings.file.as_deref())?;
     anyhow::ensure!(
         settings.project.is_dir(),
         "{} is not a directory",
@@ -333,6 +350,7 @@ pub async fn own(args: &ProjectArgs) -> anyhow::Result<Context> {
         python: python.python.clone(),
         pythonpath: library.pythonpath.clone(),
         env,
+        file: settings.file,
     })
 }
 
@@ -350,6 +368,7 @@ mod tests {
             python: PathBuf::from("/venv/bin/python"),
             pythonpath: Some(PathBuf::from("/opt/muru")),
             env: vec![("SETTINGS".to_owned(), "shop.settings".to_owned())],
+            file: None,
         }
     }
 

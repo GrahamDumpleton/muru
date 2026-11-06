@@ -17,9 +17,53 @@ use muru_controller::locations::{Locations, Options};
 use muru_proto::admin::v1 as pb;
 use tokio_stream::StreamExt;
 
-/// Where the daemon keeps things, as section 13.8 lets a command line say.
+/// Where a running instance is found, as section 13.8 lets a command line
+/// say: what every command that talks to one takes.
 #[derive(Args, Clone, Default)]
-pub struct LocationArgs {
+pub struct InstanceArgs {
+    /// The runtime directory: the admin socket and the release run directories.
+    #[arg(long, global = true, value_name = "DIR")]
+    run_dir: Option<PathBuf>,
+
+    /// Use the system locations (/etc/muru, /var/lib/muru and so on)
+    /// whoever runs the command.
+    #[arg(long, global = true)]
+    system: bool,
+}
+
+impl InstanceArgs {
+    /// Resolve the locations for these options and the environment.
+    pub fn resolve(&self) -> Locations {
+        Locations::resolve(&Options {
+            run_dir: self.run_dir.clone(),
+            system: self.system,
+            ..Options::default()
+        })
+    }
+
+    /// The same options, for a muructl command run on this one's behalf.
+    pub fn as_arguments(&self) -> Vec<String> {
+        let mut arguments = Vec::new();
+
+        if let Some(path) = &self.run_dir {
+            arguments.push("--run-dir".to_owned());
+            arguments.push(path.display().to_string());
+        }
+
+        if self.system {
+            arguments.push("--system".to_owned());
+        }
+
+        arguments
+    }
+}
+
+/// The daemon's own files, as section 13.8 lets a command line say: taken
+/// by the commands that start or are the daemon and by those that read
+/// its files, and by no other, since a command that only talks to a
+/// running daemon reads none of them.
+#[derive(Args, Clone, Default)]
+pub struct DaemonFileArgs {
     /// The daemon configuration file.
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
@@ -28,10 +72,6 @@ pub struct LocationArgs {
     #[arg(long, global = true, value_name = "DIR")]
     state_dir: Option<PathBuf>,
 
-    /// The runtime directory: the admin socket and the release run directories.
-    #[arg(long, global = true, value_name = "DIR")]
-    run_dir: Option<PathBuf>,
-
     /// The log directory.
     #[arg(long, global = true, value_name = "DIR")]
     log_dir: Option<PathBuf>,
@@ -39,33 +79,16 @@ pub struct LocationArgs {
     /// The cache directory.
     #[arg(long, global = true, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
-
-    /// Use the system locations (/etc/muru, /var/lib/muru and so on)
-    /// whoever runs the command.
-    #[arg(long, global = true)]
-    system: bool,
 }
 
-impl LocationArgs {
-    /// Resolve the locations for these options and the environment.
-    pub fn resolve(&self) -> Locations {
-        Locations::resolve(&Options {
-            config: self.config.clone(),
-            state_dir: self.state_dir.clone(),
-            run_dir: self.run_dir.clone(),
-            log_dir: self.log_dir.clone(),
-            cache_dir: self.cache_dir.clone(),
-            system: self.system,
-        })
-    }
-
+impl DaemonFileArgs {
     /// The same options, for a daemon started in the background.
-    fn as_arguments(&self) -> Vec<String> {
+    pub fn as_arguments(&self) -> Vec<String> {
         let mut arguments = Vec::new();
+
         for (flag, value) in [
             ("--config", &self.config),
             ("--state-dir", &self.state_dir),
-            ("--run-dir", &self.run_dir),
             ("--log-dir", &self.log_dir),
             ("--cache-dir", &self.cache_dir),
         ] {
@@ -75,10 +98,43 @@ impl LocationArgs {
             }
         }
 
-        if self.system {
-            arguments.push("--system".to_owned());
-        }
+        arguments
+    }
+}
 
+/// Where the daemon keeps everything: what the commands that start or
+/// are the daemon take.
+#[derive(Args, Clone, Default)]
+pub struct LocationArgs {
+    #[command(flatten)]
+    instance: InstanceArgs,
+
+    #[command(flatten)]
+    files: DaemonFileArgs,
+}
+
+impl LocationArgs {
+    /// Resolve the locations for these options and the environment. The
+    /// daemon's configuration variable under the name it had before is
+    /// refused, since a daemon that passed it over would start with no
+    /// configuration and say nothing.
+    pub fn resolve(&self) -> anyhow::Result<Locations> {
+        muru_controller::locations::check_renamed().map_err(anyhow::Error::msg)?;
+
+        Ok(Locations::resolve(&Options {
+            config: self.files.config.clone(),
+            state_dir: self.files.state_dir.clone(),
+            run_dir: self.instance.run_dir.clone(),
+            log_dir: self.files.log_dir.clone(),
+            cache_dir: self.files.cache_dir.clone(),
+            system: self.instance.system,
+        }))
+    }
+
+    /// The same options, for a daemon started in the background.
+    fn as_arguments(&self) -> Vec<String> {
+        let mut arguments = self.files.as_arguments();
+        arguments.extend(self.instance.as_arguments());
         arguments
     }
 }
@@ -101,7 +157,7 @@ pub struct SocketArgs {
     socket: Option<PathBuf>,
 
     #[command(flatten)]
-    locations: LocationArgs,
+    locations: InstanceArgs,
 }
 
 impl SocketArgs {
@@ -117,7 +173,20 @@ impl SocketArgs {
         arguments
     }
 
-    /// The location options alone, for `muructl up`.
+    /// The daemon's log, for a command of the daemon's own that names
+    /// it: where the instance's options and the daemon's files put it.
+    fn daemon_log(&self, files: &DaemonFileArgs) -> PathBuf {
+        Locations::resolve(&Options {
+            run_dir: self.locations.run_dir.clone(),
+            system: self.locations.system,
+            log_dir: files.log_dir.clone(),
+            state_dir: files.state_dir.clone(),
+            ..Options::default()
+        })
+        .daemon_log()
+    }
+
+    /// The options that find the instance, for `muructl up`.
     pub fn location_arguments(&self) -> Vec<String> {
         self.locations.as_arguments()
     }
@@ -234,6 +303,10 @@ pub enum DaemonCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        /// The daemon's own files, as it was started with them.
+        #[command(flatten)]
+        files: DaemonFileArgs,
     },
 
     /// Re-read the daemon's configuration file and apply what changed:
@@ -242,6 +315,10 @@ pub enum DaemonCommand {
     Reload {
         #[command(flatten)]
         socket: SocketArgs,
+
+        /// The daemon's own files, as it was started with them.
+        #[command(flatten)]
+        files: DaemonFileArgs,
 
         #[command(flatten)]
         output: JsonArgs,
@@ -258,12 +335,20 @@ pub enum DaemonCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        /// The daemon's own files, as it was started with them.
+        #[command(flatten)]
+        files: DaemonFileArgs,
     },
 
     /// Show the daemon's status.
     Status {
         #[command(flatten)]
         socket: SocketArgs,
+
+        /// The daemon's own files, as it was started with them.
+        #[command(flatten)]
+        files: DaemonFileArgs,
 
         #[command(flatten)]
         output: JsonArgs,
@@ -331,7 +416,7 @@ fn upgrade_arguments() -> Vec<std::ffi::OsString> {
 
 /// Run the daemon in the foreground.
 pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
-    let locations = args.locations.resolve();
+    let locations = args.locations.resolve()?;
 
     // The file is read the same way here and on every reload, with the
     // command line's settings laid over it.
@@ -385,7 +470,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
 /// Start the daemon in the background: a detached `muructl daemon run`
 /// writing to the daemon log, waited for until its socket answers.
 pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
-    let locations = args.locations.resolve();
+    let locations = args.locations.resolve()?;
     locations
         .check_run_dir()
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -497,6 +582,7 @@ async fn status_within(path: &Path, bound: Duration) -> Option<pb::Status> {
 /// logged its exit, cannot hold the command past `timeout`.
 pub async fn daemon_stop(
     socket: SocketArgs,
+    files: DaemonFileArgs,
     shutdown: bool,
     timeout: Duration,
 ) -> anyhow::Result<()> {
@@ -558,13 +644,17 @@ pub async fn daemon_stop(
         "the daemon (pid {}) did not exit within {} seconds; see {}",
         status.pid,
         timeout.as_secs(),
-        socket.locations.resolve().daemon_log().display()
+        socket.daemon_log(&files).display()
     )
 }
 
 /// Re-execute the daemon from the installed binary and wait until it
 /// answers again with the edge replaced.
-pub async fn daemon_upgrade(socket: SocketArgs, timeout: Duration) -> anyhow::Result<()> {
+pub async fn daemon_upgrade(
+    socket: SocketArgs,
+    files: DaemonFileArgs,
+    timeout: Duration,
+) -> anyhow::Result<()> {
     let path = socket.socket()?;
     let mut client = client::connect(&path).await?;
     let before = client
@@ -620,7 +710,7 @@ pub async fn daemon_upgrade(socket: SocketArgs, timeout: Duration) -> anyhow::Re
             "the daemon (pid {}) did not answer again within {} seconds; see {}",
             before.pid,
             timeout.as_secs(),
-            socket.locations.resolve().daemon_log().display()
+            socket.daemon_log(&files).display()
         ),
     }
 }
@@ -2705,7 +2795,7 @@ pub async fn secret(command: SecretCommand) -> anyhow::Result<()> {
         }
         | SecretCommand::Remove {
             store, locations, ..
-        } => (store.clone(), locations.resolve()),
+        } => (store.clone(), locations.resolve()?),
     };
 
     let document = read_config(&locations.config.path)?;
@@ -2867,6 +2957,10 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     let source = source
         .canonicalize()
         .with_context(|| format!("{} does not exist", source.display()))?;
+
+    if let Some(note) = crate::passed_over_note(&source) {
+        eprintln!("muru: {note}");
+    }
 
     if args.server.is_none() && !args.command.is_empty() {
         anyhow::bail!("a command after -- needs --server PROFILE");
@@ -5895,7 +5989,8 @@ impl<'a> Place<'a> {
                     .into_inner())
             }
             Self::Own(project) => {
-                crate::project_commands::listed(&project.project()).map_err(anyhow::Error::msg)
+                crate::project_commands::listed(&project.project(), project.file().as_deref())
+                    .map_err(anyhow::Error::msg)
             }
         }
     }

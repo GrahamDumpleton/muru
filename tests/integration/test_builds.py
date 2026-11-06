@@ -53,7 +53,7 @@ def test_never_and_allow_public_do_not_build(tmp_path: Path) -> None:
             str(directory),
             "--build",
             "never",
-            "--print-config",
+            "--print-daemon-config",
             "--python",
             sys.executable,
         ],

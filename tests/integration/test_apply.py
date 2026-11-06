@@ -47,6 +47,42 @@ def apply(daemon: Daemon, path: Path, *arguments: str) -> subprocess.CompletedPr
     return daemon.muructl("apply", "-f", str(path), *arguments, check=False)
 
 
+def test_a_daemon_format_file_beside_the_code_is_named_muru_daemon_toml(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    # The coding agents guide's example: a file for muructl apply kept
+    # with the project, its source the directory it is in. What its
+    # table leaves out comes from the project's own settings.
+
+    project = tmp_path / "shop"
+    project.mkdir()
+    (project / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (project / "pyproject.toml").write_text(
+        "[tool.muru]\nentrypoint = 'app:application'\nthreads = 3\n"
+    )
+    declared = f"[app.shop.release.r1]\nsource = '.'\npython = '{sys.executable}'\nprocesses = 1\n"
+    (project / "muru.daemon.toml").write_text(declared)
+
+    applied = apply(daemon, project / "muru.daemon.toml")
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    daemon.wait_for_routing("shop")
+    shown = daemon.muructl("release", "show", "shop@r1").stdout
+    assert "app:application" in shown and "1 process of 3 threads" in shown, shown
+
+    # Saved as muru.toml it is the project's settings file, which holds
+    # other keys, and the refusal says what the file was taken for.
+
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (other / "muru.toml").write_text(declared.replace("shop", "other"))
+    refused = apply(daemon, other / "muru.toml")
+    output = refused.stdout + refused.stderr
+    assert refused.returncode != 0
+    assert "`app` is a key of the daemon's format, and this file is read as the project's" in output
+    assert "named muru.daemon.toml" in output, output
+
+
 def test_an_interpreter_relative_to_the_file_is_resolved_there(
     daemon: Daemon, tmp_path: Path
 ) -> None:

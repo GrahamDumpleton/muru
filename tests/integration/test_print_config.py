@@ -1,4 +1,4 @@
-"""`muructl run --print-config` (design specification section 13.1): the
+"""`muructl run --print-daemon-config` (design specification section 13.1): the
 declarative equivalent of a development run, written without running it."""
 
 from __future__ import annotations
@@ -22,14 +22,16 @@ def print_config(*args: str, python: str = sys.executable) -> dict[str, object]:
         pytest.skip("muructl is not built")
 
     completed = subprocess.run(
-        [str(muructl), "run", *args, "--print-config", "--python", python],
+        [str(muructl), "run", *args, "--print-daemon-config", "--python", python],
         capture_output=True,
         text=True,
         check=False,
         timeout=30,
     )
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.startswith("# The declarative equivalent")
+    assert completed.stdout.startswith(
+        "# This muructl run in the daemon's format. Save it as muru.daemon.toml"
+    )
     document: dict[str, object] = tomllib.loads(completed.stdout)
     return document
 

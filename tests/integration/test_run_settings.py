@@ -133,10 +133,17 @@ def test_the_run_table_sets_how_the_project_is_served(tmp_path: Path) -> None:
     finally:
         server.stop()
 
-    # --print-config leaves the table out and writes what it resolved.
+    # --print-daemon-config leaves the table out and writes what it resolved.
 
     completed = subprocess.run(
-        [str(muructl()), "run", str(directory), "--print-config", "--python", sys.executable],
+        [
+            str(muructl()),
+            "run",
+            str(directory),
+            "--print-daemon-config",
+            "--python",
+            sys.executable,
+        ],
         capture_output=True,
         text=True,
         check=True,
@@ -191,6 +198,62 @@ def test_the_local_file_lays_over_the_table_and_a_flag_over_both(tmp_path: Path)
         assert "not covered" not in server.log()
     finally:
         server.stop()
+
+
+def test_print_config_says_where_each_setting_came_from(tmp_path: Path) -> None:
+    # Section 13.1: the settings the run would use, in the shape of the
+    # project's file, each with the layer that set it.
+
+    directory = project(
+        tmp_path / "project",
+        "port = 8123\nhosts = ['table.localhost']\naccess_log = 'on'\n",
+        local="[run]\nhosts = ['local.localhost']\naccess_log = 'errors'\n",
+    )
+    pyproject = directory / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text().replace("[tool.muru.run]", "threads = 6\n\n[tool.muru.run]")
+        + "\n[tool.muru.serve]\nprocesses = 9\n\n[tool.muru.env]\nNAME = 'value'\n"
+    )
+    flags = ["--processes", "2", "--host", "flag.localhost", "--no-reload"]
+    completed = subprocess.run(
+        [str(muructl()), "run", str(directory), "--print-config", *flags],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    printed = completed.stdout
+    table = f"[tool.muru] in {pyproject}"
+    run_table = f"[tool.muru.run] in {pyproject}"
+    local = f"[run] in {directory / 'muru.local.toml'}"
+
+    def source(key: str) -> str:
+        lines = [line for line in printed.splitlines() if line.startswith(f"{key} = ")]
+        assert len(lines) == 1, printed
+        return lines[0].split("# ", 1)[1]
+
+    assert printed.startswith(
+        "# The settings this muructl run would use, and where each came from.\n"
+    ), printed
+    assert source("entrypoint") == table
+    assert source("threads") == table
+    assert source("processes") == "command line"
+    assert source("sync_threads") == "default"
+    assert source("port") == run_table
+    assert source("access_log") == local
+    assert source("reload") == "command line"
+    assert source("hosts") == f"{run_table}, then {local}, then command line"
+    assert f"# Used as {pyproject} has them: env." in printed
+    assert "# The serve table is muructl serve's, and is not read here." in printed
+
+    # It reads as the project's file does: the application's settings,
+    # then the run table, and nothing of the daemon's format.
+
+    document = tomllib.loads(printed)
+    assert document["processes"] == 2 and document["threads"] == 6
+    assert document["run"]["port"] == 8123 and document["run"]["access_log"] == "errors"
+    assert document["run"]["hosts"] == ["table.localhost", "local.localhost", "flag.localhost"]
+    assert "listener" not in document and "app" not in document
 
 
 def test_mistakes_name_the_file_they_are_in(tmp_path: Path) -> None:
