@@ -220,7 +220,7 @@ docker run -e MURU_SERVE_PROCESSES=8 registry.example.com/shop
 with where it came from, and exits. The output has the shape of the
 project's file, the application's settings and then a `[serve]` table:
 
-```console
+```text
 $ MURU_SERVE_PROCESSES=8 muructl serve --print-config
 # The settings this muructl serve would use, and where each came from.
 # The project's settings are read from /app/pyproject.toml.

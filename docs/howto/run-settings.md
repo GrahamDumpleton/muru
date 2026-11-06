@@ -65,7 +65,7 @@ own `[serve]` table.
 exits: the application's settings, then the `[run]` table, each with
 where it came from, in the shape of the project's file.
 
-```console
+```text
 $ muructl run --print-config --threads 2
 # The settings this muructl run would use, and where each came from.
 # The project's settings are read from ./pyproject.toml.
