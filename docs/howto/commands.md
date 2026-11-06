@@ -209,7 +209,9 @@ muru: the command stopped because muructl got SIGINT; it was killed by signal 15
 ```
 
 A second Ctrl-C, SIGTERM or SIGHUP kills the command, and anything it
-started, at once.
+started, at once. Output that `muructl` can no longer write, as when it
+is piped to `head`, stops the command the same way: `muructl` waits for
+it to end and exits with 1, saying why.
 
 ## What is recorded
 
