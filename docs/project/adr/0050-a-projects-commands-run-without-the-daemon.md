@@ -71,8 +71,8 @@ itself otherwise.
   project, the interpreter and the runtime library with the code
   `muructl serve` and `muructl run` use, starts the command and exits
   with its status. The settings are the few a command needs: `--chdir`,
-  `--python`, `--runtime-dir` and `--serve-config`, each also read from
-  where `serve` reads it. The image's runtime directory is used when a
+  `--config`, `--python` and `--runtime-dir`, each also read from where
+  `serve` reads it. The image's runtime directory is used when a
   setting names it or it holds a library; otherwise the library comes
   from where a development run takes it. No environment is built.
 
@@ -98,8 +98,10 @@ itself otherwise.
   in its environment or mounted, where a command sees them as the
   application does.
 
-- **The settings file flag is `--serve-config`**, not `--config`, which
-  on these commands already names the daemon's configuration file.
+- **The settings file flag is `--config`**, as on `muructl serve`: a
+  project settings file read in place of the one beside the code. The
+  daemon's own `--config` is no longer taken by these commands, which
+  never read it (ADR 0051).
 
 ### Consequences
 

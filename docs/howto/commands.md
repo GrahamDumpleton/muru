@@ -261,11 +261,12 @@ Where the command runs depends on what is running:
 | What | Where it is looked for, in order |
 | --- | --- |
 | The project | `--chdir`, `MURU_SERVE_CHDIR`, the current directory |
-| The interpreter | `--python`, `MURU_SERVE_PYTHON`, `python` in the file `--serve-config` or `MURU_SERVE_CONFIG` names, `python` in the project's serve table, `python` in `[tool.muru]`, the active virtual environment, the project's `.venv`, `/app/.venv`, `python3` on `PATH` |
+| The project's settings | The file `--config` or `MURU_SERVE_CONFIG` names, as [`muructl serve` takes it](containers.md#a-settings-file-from-outside-the-image); else the `muru.toml` or `pyproject.toml` in the project |
+| The interpreter | `--python`, `MURU_SERVE_PYTHON`, `python` in the settings' serve table, `python` in the settings, the active virtual environment, the project's `.venv`, `/app/.venv`, `python3` on `PATH` |
 | The runtime library | The interpreter's environment when it holds this version of `muru`; else the directory `--runtime-dir`, `MURU_SERVE_RUNTIME_DIR` or the serve table's `runtime_dir` names; else `/opt/muru` when it holds one; else where `muructl run` keeps it |
 
 A Job and a Deployment made from one image, with the same environment
-variables, so find the same interpreter and library. No environment is
+variables, so find the same settings, interpreter and library. No environment is
 built for a command: build it first, with `muructl build` or by running
 the application once.
 
@@ -286,8 +287,8 @@ and a command sees them as the application does.
 
 With an application named the command always goes to the daemon, which
 runs it with that release's own code and not with what is in the current
-directory. `--chdir`, `--python`, `--runtime-dir` and `--serve-config`
-are refused there.
+directory. `--chdir`, `--config`, `--python` and `--runtime-dir` are
+refused there.
 
 ## Migrations
 

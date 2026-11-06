@@ -71,7 +71,7 @@ the connections accepted from then on.
 
 `muructl run` takes `--max-connections`, `--max-connections-per-client`,
 `--max-requests-per-connection`, and `--timeout keep_alive=15s` or
-`--timeout keep_alive_proxy=90s`, and `--print-config` writes them.
+`--timeout keep_alive_proxy=90s`.
 
 The keep-alive timer is the one that bounds reading a request head on
 that connection, so on an untrusted connection the shorter of

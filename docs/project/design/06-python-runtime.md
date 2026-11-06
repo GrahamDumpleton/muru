@@ -147,7 +147,7 @@ The daemon starts hosts itself and imports applications as modules, so applicati
 | Entrypoint | module:callable, or a factory called per worker after post_fork (factory_phase = 'host' to call it during preload). The callable must take what the interface passes (two positional arguments for WSGI, three for ASGI), checked at load: one taking no required arguments is refused as a likely factory named without the setting, one fitting the other interface is refused rather than guessed at, and one whose signature cannot be read is taken as it is |
 | Environment variables | Primary application settings, layered system, application, release and secrets (including NAME_FILE secrets) |
 | Files | Files in the release, or files supplied by the release spec and snapshotted read-only into the run directory |
-| `[tool.muru]` in pyproject.toml, or muru.toml | Application-shipped defaults: entrypoint, interface, python requirement and the build table (section 8.2), process model, mounts, groups, hooks, readiness and liveness probes, release checks, static directories, commands (section 9.12) |
+| `[tool.muru]` in pyproject.toml, or muru.toml, which is used in place of the table when a project has both, the two never merged and the commands that read them saying so; or the file muructl serve is given in their place (section 13.9) | Application-shipped defaults: entrypoint, interface, python requirement and the build table (section 8.2), process model, mounts, groups, hooks, readiness and liveness probes, release checks, static directories, commands (section 9.12) |
 | Hooks module | Lifecycle hooks (section 6.3) |
 | MURU_* variables | Read-only runtime context (Appendix D) |
 

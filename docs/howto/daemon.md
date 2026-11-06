@@ -140,6 +140,20 @@ from the source's `[tool.muru]` table and then the defaults, exactly as
 a deploy resolves them. A directory applies every `.toml` file in it, in
 name order, as one configuration.
 
+So a release's table needs only its `source` when the project's own
+file says the rest:
+
+```toml
+# muru.daemon.toml, beside the project's pyproject.toml
+[app.shop.release.r1]
+source = "."
+```
+
+A file kept beside a project's code like this is named
+`muru.daemon.toml`. `muru.toml` there is the project's settings file,
+which has other keys, and a file in this format saved under that name is
+refused as one. Anywhere else, the file's name is yours to choose.
+
 An apply creates the applications the files name, deploys each declared
 release the daemon does not have (in id order, so the last declared
 release of an application is the one that serves), creates or updates
@@ -247,9 +261,16 @@ locations for the platform, or the system locations with `--system`:
 
 `--state-dir`, `--run-dir`, `--log-dir`, `--cache-dir` and `--config`
 override each, as do `MURU_STATE_DIR`, `MURU_RUN_DIR`, `MURU_LOG_DIR`,
-`MURU_CACHE_DIR` and `MURU_CONFIG`, and the directories systemd provides
-through `StateDirectory=` and its siblings are used when set. `muructl
-daemon run` prints every location and which rule chose it. The run
+`MURU_CACHE_DIR` and `MURU_DAEMON_CONFIG`, and the directories systemd
+provides through `StateDirectory=` and its siblings are used when set.
+`muructl daemon run` prints every location and which rule chose it.
+
+The daemon's own commands take all five flags: the `muructl daemon`
+commands, `muructl up` and `muructl mcp serve --up`, so one set of
+flags starts, stops and reloads a daemon. So does `muructl secret`,
+which reads the daemon's file. Every other command only talks to a
+running daemon, and takes `--socket`, `--run-dir` and `--system` to find
+it. The run
 directory must be an absolute path, and a Unix socket path is limited to
 104 bytes on macOS and 108 on Linux, so a run directory too deep to leave
 room for the workers' sockets, which sit about 35 bytes plus the
@@ -258,8 +279,7 @@ so.
 
 The configuration file is optional. Its `[[listener]]` entries name the
 addresses to serve, each with `tls = true` when the edge terminates TLS
-on it, and its `[limits]` table sets the body size limit and timeouts,
-with the same keys `muructl run --print-config` writes.
+on it, and its `[limits]` table sets the body size limit and timeouts.
 
 ## Running it
 

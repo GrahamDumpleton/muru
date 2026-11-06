@@ -60,6 +60,7 @@ flowchart LR
 - Options: whole system or --app, --split into one file per application, --full with comments naming each value's layer (default writes only non-default values), --all-releases, --resolve-rollouts, --redact, --param name=value to replace literals with variables, TOML or JSON.
 - Secrets are exported as references, never values. Output is deterministically ordered with a header naming version, node, time and state version.
 - apply supports --dry-run (below) and --prune, which removes objects that the files no longer contain.
+- A file in this format kept beside a project's code is named `muru.daemon.toml` by convention, since `muru.toml` there is the project's settings file (section 6.8), which has other keys and is read from a release's source. A project's settings file refused for a key of this format says what the file was taken for and names the convention (ADR 0051). A release's table needs only its `source` there, since what it leaves out comes from the source's own settings.
 
 **Dry runs and plans.** muructl apply --dry-run reports what an apply would change and what the system would do about it, without changing anything. The report has four parts:
 
