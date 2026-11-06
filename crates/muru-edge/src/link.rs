@@ -1388,6 +1388,18 @@ pub(crate) fn record(
 
 impl Recording {
     pub(crate) fn new(context: &Context<'_>, parts: &http::request::Parts) -> Self {
+        // Section 11.2: the combined format names the referrer and the
+        // user agent, which are kept only while it is written.
+
+        let agent = context.access_log.wants_agent();
+        let header = |parts: &http::request::Parts, name: http::HeaderName| {
+            parts
+                .headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
         let record = Record {
             started: SystemTime::now(),
             request_id: context.request_id.to_owned(),
@@ -1403,6 +1415,12 @@ impl Recording {
                 .as_deref()
                 .unwrap_or_default()
                 .to_owned(),
+            referer: agent
+                .then(|| header(parts, http::header::REFERER))
+                .flatten(),
+            user_agent: agent
+                .then(|| header(parts, http::header::USER_AGENT))
+                .flatten(),
             group: context.group.clone(),
             mount: if context.mount.is_empty() {
                 crate::routing::DEFAULT_GROUP.to_owned()

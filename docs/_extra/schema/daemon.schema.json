@@ -966,6 +966,15 @@
           },
           "type": "array"
         },
+        "access_log_file": {
+          "description": "A file in the daemon's log directory that takes the host's records in place of `access.log`, for example `shop.log`.",
+          "type": "string"
+        },
+        "access_log_format": {
+          "description": "How the host's records are written: `json` or `combined`.",
+          "type": "string",
+          "x-default": "`access_log_format` in `[logs]`"
+        },
         "canonical": {
           "description": "The name the host is known by, for `use_canonical_name`.",
           "type": "string"
@@ -1355,6 +1364,11 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "access_log_format": {
+          "default": "json",
+          "description": "How the access log's records are written: `json` (the default), one object a line, or `combined`, the combined log format of Apache and nginx.",
+          "type": "string"
         },
         "compress": {
           "default": "zstd",

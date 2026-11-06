@@ -79,3 +79,7 @@ Accepting the PROXY protocol on a listener, for a load balancer that passes TCP 
 ## 20.13 HTTP response trailers for ASGI
 
 Serving the ASGI HTTP trailers extension on ordinary responses: `http.response.start` with `trailers` set, then `http.response.trailers` messages after the body, sent by the worker on the END frame as a gRPC call's are, and by the edge as HTTP/2 trailers or on a chunked HTTP/1.1 response to a client that accepts them. Until then the extension is not advertised in the scope, and a trailers message is refused.
+
+## 20.14 Access log format templates
+
+A format for the access log written as a template of named fields, for an analyser or a pipeline that reads neither JSON nor the combined format (section 11.2). It needs a syntax for the fields, escaping rules for each value, and a decision on whether `muructl logs --access` can still read what it writes; the two named formats cover Muru's own tools and the common analysers meanwhile.

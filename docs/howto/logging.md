@@ -159,7 +159,7 @@ A JSON line has these fields:
 ```json
 {"time": "2026-10-24T05:42:22.836Z", "request_id": "01M5P6WZBK740HFT2N80MAV4YV",
  "client": "127.0.0.1", "app": "shop", "release": "r1", "host": "shop.example.com",
- "group": "default", "mount": "default", "method": "GET", "target": "/hello",
+ "virtual_host": "shop", "group": "default", "mount": "default", "method": "GET", "target": "/hello",
  "version": "HTTP/1.1", "status": 200, "reason": "", "bytes": 18, "worker": 0,
  "retried": false, "queue_ms": 0.2, "app_ms": 0.3, "total_ms": 0.7, "snapshot": 3,
  "redirects": [],
@@ -169,7 +169,9 @@ A JSON line has these fields:
 `reason` is empty for responses the application produced and names the
 cause for ones Muru generated; the [error responses](../reference/errors.md)
 page lists them. `app` and `release` name what served the request, `host`
-is the virtual host that matched or else the host the client asked for,
+is the name the request matched its virtual host with, or else the host
+the client asked for, `virtual_host` is that host's name in the
+configuration, empty when none took the request,
 `group` and `mount` are `default` or the named [worker
 group](worker-groups.md) and [mount](mounts.md), and `snapshot` is the
 version of the routing the edge used (0 in development mode).
@@ -309,6 +311,55 @@ apply` a changed application or host table, to the running edge without
 restarting anything: every request completed from then on is written by
 the new choice.
 
+### The format, and a file for a host
+
+The daemon's access log is JSON lines, which `muructl logs --access` and
+the dashboard read. A log analyser that reads the combined log format of
+Apache and nginx is given it with `access_log_format`, for the node or
+for one virtual host, and a virtual host's records go to a file of their
+own with `access_log_file`:
+
+```toml
+[logs]
+access_log_format = 'json'            # json (the default) or combined
+
+[host.shop]
+names = ['shop.example.com']
+access_log_file = 'shop.log'
+access_log_format = 'combined'
+
+[host.blog]
+names = ['blog.example.com']
+access_log_file = 'blog.log'
+```
+
+| Key | Where | Meaning |
+| --- | --- | --- |
+| `access_log_format` | `[logs]`, a host | `json`, or `combined`; a host's replaces the `[logs]` table's for its records |
+| `access_log_file` | a host | a file in the log directory that takes the host's records in place of `access.log` |
+
+Here the shop's requests are written to `shop.log` in the log directory,
+one line each:
+
+```
+203.0.113.9 - - [02/Nov/2026:05:42:22 +0000] "GET /catalogue HTTP/1.1" 200 118 "https://shop.example.com/" "Mozilla/5.0"
+```
+
+The blog's are written to `blog.log` as JSON, and every other request to
+`access.log`. A combined line has the client's address, the time in UTC,
+the request line, the status, the bytes sent, and the request's
+`Referer` and `User-Agent`, with `-` for what is absent; a WebSocket has
+one line, for its handshake. The file name is a plain name, not a path.
+Hosts may share a file when they give the same format. Which records
+are written is chosen as before, by `access_log`, `slow` and
+`access_log_exclude`. A host's files are
+[rotated](#rotation) and reopened with `access.log`.
+
+`muructl logs --access --host shop` shows a host's records: from its own
+file, printed as written when the file is in the combined format, or
+else the records in `access.log` whose `virtual_host` is the host.
+`muructl logs --access` alone shows `access.log`.
+
 ### Changing the access log for a while
 
 `muructl logging access` changes which requests the access log writes
@@ -338,9 +389,9 @@ starts again. The daemon records the `access_log.changed` and
 
 ## Rotation
 
-The daemon rotates its log files itself: the access log, the edge's own
-log, each release's log and, when it was started in the background, its
-own. A file is rotated when the period changes (daily, at midnight UTC,
+The daemon rotates its log files itself: the access log and the files
+virtual hosts name for their own records, the edge's own log, each
+release's log and, when it was started in the background, its own. A file is rotated when the period changes (daily, at midnight UTC,
 by default) or when it reaches `size`, if one is set: the daemon renames
 it with a timestamp (`access.log.20261025-000000`), has every writer open
 its file again by name, compresses the archive in the background

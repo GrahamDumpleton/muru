@@ -91,6 +91,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | accept_redirects_from, internal | route, mount | none, false | 4.10 |
 | names, listeners, tls, canonical, https_redirect, use_canonical_name, canonical_redirect | host | none, all, none, none, false, false, false | 4.3 |
 | access_log, slow, access_log_exclude | `[logs]`, host, application | on, 1s, none | 11.2 |
+| access_log_format | `[logs]`, host | json | 11.2 |
+| access_log_file | host | none (`access.log`) | 11.2 |
 | traffic: split, sticky, hash_key, salt, sticky_grace, classes | route | 100% to newest ready release, off, cookie, per route, 10m, none | 9.4, 4.14 |
 | retention of superseded releases | application | 30m | 9.1 |
 | reload.mode, paths, include, exclude, respect_gitignore, debounce, poll | application | off, source, `**/*.py`, none, true, 300ms, false | 9.8 |

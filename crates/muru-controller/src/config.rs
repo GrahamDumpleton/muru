@@ -940,6 +940,44 @@ fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: 
             valid = false;
         }
 
+        // Section 11.2: the format of the host's records and the file
+        // that takes them. Hosts that share a file write it in one
+        // format, so they name the same one or none.
+
+        if let Err(error) = muru_config::check_access_log_format(host.access_log_format.as_deref())
+        {
+            plan.errors.push(format!("host {name}: {error}"));
+            valid = false;
+        }
+
+        if let Some(file) = &host.access_log_file {
+            if let Err(error) = muru_config::check_access_log_file(file) {
+                plan.errors.push(format!("host {name}: {error}"));
+                valid = false;
+            }
+
+            let sharing = document
+                .host
+                .iter()
+                .chain(
+                    stored
+                        .iter()
+                        .filter(|(other, _)| !document.host.contains_key(*other)),
+                )
+                .find(|(other, table)| {
+                    *other != name
+                        && table.access_log_file.as_ref() == Some(file)
+                        && table.access_log_format != host.access_log_format
+                });
+
+            if let Some((other, _)) = sharing {
+                plan.errors.push(format!(
+                    "host {name}: access_log_file {file} is also host {other}'s, with another access_log_format"
+                ));
+                valid = false;
+            }
+        }
+
         // Section 4.12: what the host's maintenance mode lets through.
 
         if let Some(table) = &host.maintenance
@@ -5813,6 +5851,7 @@ mod tests {
                 mode: muru_edge::access::Mode::Errors,
                 slow: std::time::Duration::from_millis(250),
                 exclude: vec!["/static/*".to_owned(), "/healthz".to_owned()],
+                format: muru_edge::access::Format::Json,
             }
         );
 

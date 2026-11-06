@@ -28,7 +28,7 @@ use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,6 +58,35 @@ pub enum Destination {
     /// Nowhere, whatever the filter says; records are still counted and
     /// kept in memory.
     Off,
+}
+
+/// How a record is written to a file (section 11.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Format {
+    /// One JSON object a line, which Muru's own tools read.
+    #[default]
+    Json,
+    /// The combined log format of Apache and nginx, for log analysers.
+    Combined,
+}
+
+impl Format {
+    /// The format a word names; none for a word that names none.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "json" => Some(Self::Json),
+            "combined" => Some(Self::Combined),
+            _ => None,
+        }
+    }
+
+    /// The word for the format.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Combined => "combined",
+        }
+    }
 }
 
 /// Which records are written.
@@ -105,6 +134,8 @@ pub struct Filter {
     /// Path patterns whose requests are not written (`*` matches anything,
     /// `?` one character); they are still kept in memory.
     pub exclude: Vec<String>,
+    /// How records are written to a file.
+    pub format: Format,
 }
 
 impl Default for Filter {
@@ -113,6 +144,7 @@ impl Default for Filter {
             mode: Mode::On,
             slow: Duration::from_secs(1),
             exclude: Vec::new(),
+            format: Format::Json,
         }
     }
 }
@@ -124,6 +156,7 @@ impl Filter {
             mode: Mode::parse(&message.mode).unwrap_or_default(),
             slow: Duration::from_millis(message.slow_ms),
             exclude: message.exclude.clone(),
+            format: Format::parse(&message.format).unwrap_or_default(),
         }
     }
 
@@ -133,6 +166,7 @@ impl Filter {
             mode: self.mode.as_str().to_owned(),
             slow_ms: u64::try_from(self.slow.as_millis()).unwrap_or(u64::MAX),
             exclude: self.exclude.clone(),
+            format: self.format.as_str().to_owned(),
         }
     }
 }
@@ -150,6 +184,11 @@ pub struct Choice {
     /// Path patterns whose requests are not written, besides those of
     /// the levels beneath.
     pub exclude: Vec<String>,
+    /// How a virtual host's records are written, when the host says.
+    pub format: Option<Format>,
+    /// The file that takes a virtual host's records in place of the
+    /// node's, when the host names one.
+    pub file: Option<Arc<Path>>,
 }
 
 impl Choice {
@@ -159,6 +198,8 @@ impl Choice {
             mode: Mode::parse(&message.mode),
             slow: message.slow_ms.map(Duration::from_millis),
             exclude: message.exclude.clone(),
+            format: Format::parse(&message.format),
+            file: (!message.file.is_empty()).then(|| Arc::from(Path::new(&message.file))),
         }
     }
 
@@ -170,6 +211,12 @@ impl Choice {
                 .slow
                 .map(|slow| u64::try_from(slow.as_millis()).unwrap_or(u64::MAX)),
             exclude: self.exclude.clone(),
+            format: self.format.map_or("", Format::as_str).to_owned(),
+            file: self
+                .file
+                .as_ref()
+                .map(|file| file.display().to_string())
+                .unwrap_or_default(),
         }
     }
 
@@ -385,6 +432,27 @@ impl Filters {
         })
     }
 
+    /// Whether any record is written in the combined format, which
+    /// names the request's referrer and user agent.
+    fn wants_agent(&self) -> bool {
+        self.node.format == Format::Combined
+            || self
+                .hosts
+                .values()
+                .any(|choice| choice.format == Some(Format::Combined))
+    }
+
+    /// How a record is written to a file, and to which: its virtual
+    /// host's format and file, else the node's.
+    fn target(&self, record: &Record) -> (Format, Option<Arc<Path>>) {
+        let host = self.hosts.get(&record.virtual_host);
+        (
+            host.and_then(|choice| choice.format)
+                .unwrap_or(self.node.format),
+            host.and_then(|choice| choice.file.clone()),
+        )
+    }
+
     /// Whether a record is written: by the newest override in force that
     /// covers it, else by the filter of its application over its host's
     /// over the node's.
@@ -464,8 +532,13 @@ pub struct Record {
     /// The virtual host that matched, else the host the client asked for.
     pub host: String,
     /// The configured name of the virtual host that took the request,
-    /// which chooses its filter; empty without one. It is not written.
+    /// which chooses its filter, format and file; empty without one.
     pub virtual_host: String,
+    /// The request's Referer header, kept only while some record is
+    /// written in the combined format.
+    pub referer: Option<String>,
+    /// The request's User-Agent header, kept likewise.
+    pub user_agent: Option<String>,
     /// The worker group: `default`, or a named group's name.
     pub group: String,
     /// The mount: `default`, or a named mount's name.
@@ -1005,6 +1078,17 @@ impl AccessLog {
         change(&mut self.filters.write().expect("access log filters poisoned"))
     }
 
+    /// Whether a request's referrer and user agent are kept for its
+    /// record: only while some record is written in the combined format.
+    pub fn wants_agent(&self) -> bool {
+        matches!(self.destination, Destination::File(_))
+            && self
+                .filters
+                .read()
+                .expect("access log filters poisoned")
+                .wants_agent()
+    }
+
     /// The request metrics the records feed (section 11.1).
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
@@ -1285,15 +1369,39 @@ impl AccessLog {
         // line, or under muructl serve --log-format json the record
         // itself.
 
-        let line = match &self.destination {
-            Destination::File(_) => json_line(record),
-            _ if muru_common::log::json() => muru_common::log::with_identity(
-                json_line(record).replacen('{', "{\"kind\":\"access\",", 1),
+        let (line, file) = match &self.destination {
+            Destination::File(_) => {
+                // Section 11.2: the record's virtual host may have a
+                // format and a file of its own. The combined format has
+                // one line a request, so a WebSocket's closing record
+                // is left to its handshake's line.
+
+                let (format, file) = self
+                    .filters
+                    .read()
+                    .expect("access log filters poisoned")
+                    .target(record);
+
+                match format {
+                    Format::Json => (json_line(record), file),
+                    Format::Combined if record.websocket.is_some() => return,
+                    Format::Combined => (combined_line(record), file),
+                }
+            }
+            _ if muru_common::log::json() => (
+                muru_common::log::with_identity(json_line(record).replacen(
+                    '{',
+                    "{\"kind\":\"access\",",
+                    1,
+                )),
+                None,
             ),
-            _ => text_line(record),
+            _ => (text_line(record), None),
         };
 
-        if let Err(std::sync::mpsc::TrySendError::Full(_)) = writer.try_send(Message::Line(line)) {
+        if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+            writer.try_send(Message::Line { line, file })
+        {
             self.metrics.count_access_log_dropped();
         }
     }
@@ -1301,8 +1409,12 @@ impl AccessLog {
 
 /// What the writer thread is given.
 enum Message {
-    /// A line to write.
-    Line(String),
+    /// A line to write, to the file named or else the log's own
+    /// destination.
+    Line {
+        line: String,
+        file: Option<Arc<Path>>,
+    },
     /// Open the file again by name, answering how it went.
     Reopen(std::sync::mpsc::Sender<io::Result<()>>),
     /// Answer once every line before this one is written.
@@ -1366,31 +1478,55 @@ fn write_lines(
     let mut batch: Vec<u8> = Vec::with_capacity(WRITE_BATCH);
     let mut reported = 0;
 
+    // Section 11.2: the files virtual hosts name for their own records,
+    // each opened when a line first wants it and again after a reopen.
+
+    let mut others: HashMap<Arc<Path>, Other> = HashMap::new();
+
     while let Ok(first) = lines.recv() {
         let mut next = Some(first);
+        let mut gathered = 0;
 
         while let Some(message) = next.take() {
             match message {
-                Message::Line(line) => batch.extend_from_slice(line.as_bytes()),
+                Message::Line { line, file: None } => {
+                    gathered += line.len();
+                    batch.extend_from_slice(line.as_bytes());
+                }
+                Message::Line {
+                    line,
+                    file: Some(path),
+                } => {
+                    gathered += line.len();
+                    others
+                        .entry(path)
+                        .or_default()
+                        .batch
+                        .extend_from_slice(line.as_bytes());
+                }
                 Message::Reopen(answer) => {
                     output.write(&batch);
                     batch.clear();
+                    write_others(&mut others);
+                    others.clear();
                     let _ = answer.send(output.reopen());
                 }
                 Message::Flush(answer) => {
                     output.write(&batch);
                     batch.clear();
+                    write_others(&mut others);
                     let _ = answer.send(());
                 }
             }
 
-            if batch.len() < WRITE_BATCH {
+            if gathered < WRITE_BATCH {
                 next = lines.try_recv().ok();
             }
         }
 
         output.write(&batch);
         batch.clear();
+        write_others(&mut others);
         let now = dropped.load(Ordering::Relaxed);
 
         if now > reported {
@@ -1401,6 +1537,35 @@ fn write_lines(
             );
             reported = now;
         }
+    }
+}
+
+/// A file a virtual host names for its records: what is gathered for
+/// it, and the file once it has been opened.
+#[derive(Default)]
+struct Other {
+    batch: Vec<u8>,
+    file: Option<File>,
+}
+
+/// Write what has been gathered for each virtual host's own file,
+/// opening a file by name when it is first wanted. A file that cannot be
+/// opened or written to loses the lines and stops nothing.
+fn write_others(others: &mut HashMap<Arc<Path>, Other>) {
+    for (path, other) in others.iter_mut() {
+        if other.batch.is_empty() {
+            continue;
+        }
+
+        if other.file.is_none() {
+            other.file = OpenOptions::new().create(true).append(true).open(path).ok();
+        }
+
+        if let Some(file) = &mut other.file {
+            let _ = file.write_all(&other.batch);
+        }
+
+        other.batch.clear();
     }
 }
 
@@ -1501,12 +1666,13 @@ pub fn json_line(record: &Record) -> String {
     let mut line = String::with_capacity(320);
     let _ = write!(
         line,
-        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"retried\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{},\"websocket\":{},\"handoff\":{}}}",
+        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"virtual_host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"retried\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{},\"websocket\":{},\"handoff\":{}}}",
         json_string(&record.request_id),
         json_string(&record.client.to_string()),
         json_string(&record.app),
         json_string(&record.release),
         json_string(&record.host),
+        json_string(&record.virtual_host),
         json_string(&record.group),
         json_string(&record.mount),
         json_string(&record.method),
@@ -1548,6 +1714,66 @@ pub fn json_line(record: &Record) -> String {
     );
     line.push('\n');
     line
+}
+
+/// The combined log format of Apache and nginx: the client, the time in
+/// UTC, the request line, the status, the body bytes sent, the referrer
+/// and the user agent. The identity and user fields are always `-`.
+pub fn combined_line(record: &Record) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (date, hours, minutes, seconds, _) = civil(record.started);
+    let date = date.to_string();
+    let mut parts = date.splitn(3, '-');
+    let year = parts.next().unwrap_or("1970");
+    let month = parts
+        .next()
+        .and_then(|month| month.parse::<usize>().ok())
+        .and_then(|month| MONTHS.get(month.wrapping_sub(1)))
+        .unwrap_or(&"Jan");
+    let day = parts.next().unwrap_or("01");
+    let quoted = |text: Option<&str>| match text {
+        Some(text) if !text.is_empty() => format!("\"{}\"", combined_escape(text)),
+        _ => "\"-\"".to_owned(),
+    };
+
+    let bytes = if record.bytes == 0 {
+        "-".to_owned()
+    } else {
+        record.bytes.to_string()
+    };
+
+    format!(
+        "{} - - [{day}/{month}/{year}:{hours:02}:{minutes:02}:{seconds:02} +0000] \"{} {} {}\" {} {bytes} {} {}\n",
+        record.client,
+        combined_escape(&record.method),
+        combined_escape(&record.target),
+        combined_escape(&record.version),
+        record.status,
+        quoted(record.referer.as_deref()),
+        quoted(record.user_agent.as_deref()),
+    )
+}
+
+/// Text inside a quoted field of the combined format, as Apache writes
+/// it: a quote and a backslash behind a backslash, and anything that is
+/// not printable ASCII as `\xhh`.
+fn combined_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+
+    for byte in text.bytes() {
+        match byte {
+            b'"' => escaped.push_str("\\\""),
+            b'\\' => escaped.push_str("\\\\"),
+            b' '..=b'~' => escaped.push(byte as char),
+            _ => {
+                let _ = write!(escaped, "\\x{byte:02x}");
+            }
+        }
+    }
+
+    escaped
 }
 
 fn millis_f64(duration: Duration) -> f64 {
@@ -1714,6 +1940,8 @@ mod tests {
             release: String::new(),
             host: String::new(),
             virtual_host: String::new(),
+            referer: None,
+            user_agent: None,
             group: DEFAULT.to_owned(),
             mount: DEFAULT.to_owned(),
             snapshot: 0,
@@ -1743,6 +1971,7 @@ mod tests {
                 mode: Mode::Errors,
                 slow: Duration::from_millis(500),
                 exclude: vec!["/health*".to_owned()],
+                format: Format::Json,
             },
         })
         .expect("no file to open");
@@ -1797,6 +2026,7 @@ mod tests {
                 mode: Some(Mode::Errors),
                 slow: Some(Duration::from_secs(2)),
                 exclude: vec!["/static/*".to_owned()],
+                ..Choice::default()
             },
         );
         layered.apps.insert(
@@ -1852,6 +2082,104 @@ mod tests {
             Filters::from_snapshot(&muru_proto::edge::v1::Snapshot::default()),
             None
         );
+    }
+
+    #[test]
+    fn the_combined_format_is_the_one_log_analysers_read() {
+        let request = Record {
+            started: UNIX_EPOCH + Duration::from_secs(971_186_136),
+            client: "203.0.113.9".parse().expect("address"),
+            bytes: 2326,
+            referer: Some("http://www.example.com/start.html".to_owned()),
+            user_agent: Some("Mozilla/4.08 [en] \"quoted\" \\".to_owned()),
+            ..record("shop", 200, "/apache_pb.gif?x=\u{e9}", Duration::ZERO)
+        };
+        assert_eq!(
+            combined_line(&request),
+            "203.0.113.9 - - [10/Oct/2000:13:55:36 +0000] \"GET /apache_pb.gif?x=\\xc3\\xa9 HTTP/1.1\" \
+             200 2326 \"http://www.example.com/start.html\" \"Mozilla/4.08 [en] \\\"quoted\\\" \\\\\"\n"
+        );
+
+        // No body, referrer or user agent is a hyphen each.
+
+        let bare = Record {
+            started: UNIX_EPOCH,
+            ..record("shop", 304, "/", Duration::ZERO)
+        };
+        assert_eq!(
+            combined_line(&bare),
+            "127.0.0.1 - - [01/Jan/1970:00:00:00 +0000] \"GET / HTTP/1.1\" 304 - \"-\" \"-\"\n"
+        );
+    }
+
+    #[test]
+    fn a_virtual_host_has_a_format_and_a_file_of_its_own() {
+        let directory =
+            std::env::temp_dir().join(format!("muru-access-hosts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("directory");
+        let node = directory.join("access.log");
+        let shop = directory.join("shop.log");
+        let log = AccessLog::new(Config {
+            destination: Destination::File(node.clone()),
+            filter: Filter::default(),
+        })
+        .expect("log");
+        assert!(!log.wants_agent());
+
+        let mut filters = Filters::node(Filter::default());
+        filters.hosts.insert(
+            "shop".to_owned(),
+            Choice {
+                format: Some(Format::Combined),
+                file: Some(Arc::from(shop.as_path())),
+                ..Choice::default()
+            },
+        );
+        filters.hosts.insert(
+            "blog".to_owned(),
+            Choice {
+                format: Some(Format::Combined),
+                ..Choice::default()
+            },
+        );
+        log.set_filters(filters);
+        assert!(log.wants_agent());
+
+        let on = |host: &str, target: &str| Record {
+            virtual_host: host.to_owned(),
+            ..record("app", 200, target, Duration::ZERO)
+        };
+        log.record(on("shop", "/in-shop"));
+        log.record(on("blog", "/in-blog"));
+        log.record(on("", "/in-none"));
+        log.record(on("other", "/in-other"));
+        assert!(log.flush(Duration::from_secs(5)));
+
+        let own = std::fs::read_to_string(&shop).expect("the host's file");
+        assert_eq!(own.lines().count(), 1);
+        assert!(own.contains("\"GET /in-shop HTTP/1.1\" 200 -"), "{own}");
+
+        // A host with a format alone is written to the node's file in
+        // that format, beside the JSON records of the rest, which name
+        // their virtual host.
+
+        let rest = std::fs::read_to_string(&node).expect("the node's file");
+        let lines: Vec<&str> = rest.lines().collect();
+        assert_eq!(lines.len(), 3, "{rest}");
+        assert!(lines[0].contains("\"GET /in-blog HTTP/1.1\""), "{rest}");
+        assert!(lines[1].starts_with('{') && lines[1].contains("\"virtual_host\":\"\""));
+        assert!(lines[2].contains("\"virtual_host\":\"other\""), "{rest}");
+
+        // After a rotation the files are opened again by name.
+
+        std::fs::rename(&shop, directory.join("shop.log.1")).expect("rename");
+        log.reopen().expect("reopen");
+        log.record(on("shop", "/after"));
+        assert!(log.flush(Duration::from_secs(5)));
+        let own = std::fs::read_to_string(&shop).expect("the host's file again");
+        assert!(own.contains("/after") && !own.contains("/in-shop"), "{own}");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

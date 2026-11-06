@@ -781,6 +781,8 @@ message Host {
   string request_headers = 15;        // what the host removes from and sets on requests (section 4.7), as one phrase
   string response_headers = 16;       // what the host removes from, sets on and adds to responses, as one phrase
   bool maintenance = 17;              // the edge serves the maintenance page for the host (section 4.12)
+  string access_log_format = 18;      // how the host's access records are written, when it says: json or combined
+  string access_log_file = 19;        // the file in the log directory that takes the host's access records, when it names one
 }
 
 message ListRoutesRequest {}
@@ -843,6 +845,7 @@ message TailLogsRequest {
   bool follow = 3;                  // keep streaming as lines arrive
   uint32 lines = 4;                 // how many recent lines first; 0 for none
   bool access = 5;                  // the access log instead of a release
+  string host = 6;                  // with access: the file a virtual host names for its own records, when it names one
 }
 
 message LogLine {

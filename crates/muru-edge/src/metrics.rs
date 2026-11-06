@@ -1239,6 +1239,8 @@ mod tests {
             release: "r1".to_owned(),
             host: "shop.example.com".to_owned(),
             virtual_host: "shop".to_owned(),
+            referer: None,
+            user_agent: None,
             group: "default".to_owned(),
             mount: "default".to_owned(),
             snapshot: 3,

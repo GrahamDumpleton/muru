@@ -1415,6 +1415,7 @@ impl AccessLogSpec {
                 .and_then(|slow| muru_config::parse_duration(slow).ok())
                 .unwrap_or(node.slow),
             exclude,
+            format: node.format,
         }
     }
 
@@ -1440,6 +1441,8 @@ impl AccessLogSpec {
                 .as_deref()
                 .and_then(|slow| muru_config::parse_duration(slow).ok()),
             exclude: self.access_log_exclude.clone(),
+            format: None,
+            file: None,
         }
     }
 

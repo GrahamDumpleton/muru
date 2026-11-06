@@ -457,6 +457,17 @@ fn access_log_from(document: &muru_config::Document) -> Result<muru_edge::access
         filter.slow = muru_config::parse_duration(slow)?;
     }
 
+    muru_config::check_access_log_format(logs.access_log_format.as_deref())
+        .map_err(|error| format!("[logs] {error}"))?;
+
+    if let Some(format) = logs
+        .access_log_format
+        .as_deref()
+        .and_then(muru_edge::access::Format::parse)
+    {
+        filter.format = format;
+    }
+
     filter.exclude = logs.access_log_exclude.clone();
     Ok(filter)
 }
@@ -679,7 +690,8 @@ mod tests {
     #[test]
     fn the_logs_table_says_which_records_the_access_log_writes() {
         let settings = settings(
-            "[logs]\naccess_log = 'errors'\nslow = '500ms'\naccess_log_exclude = ['/healthz']\n",
+            "[logs]\naccess_log = 'errors'\nslow = '500ms'\naccess_log_exclude = ['/healthz']\n\
+             access_log_format = 'combined'\n",
         )
         .unwrap();
         assert_eq!(
@@ -688,7 +700,12 @@ mod tests {
                 mode: muru_edge::access::Mode::Errors,
                 slow: std::time::Duration::from_millis(500),
                 exclude: vec!["/healthz".to_owned()],
+                format: muru_edge::access::Format::Combined,
             }
+        );
+        assert_eq!(
+            super::tests::settings("[logs]\naccess_log_format = 'common'\n").unwrap_err(),
+            "[logs] access_log_format = \"common\" is not json or combined"
         );
     }
 

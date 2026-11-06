@@ -5336,9 +5336,16 @@ impl Daemon {
             )
             .ok()
             .and_then(|limits| request_limits_message(&limits));
-            let access_log = Some(AccessLogSpec::from_host(&host))
-                .filter(|choice| !choice.is_empty())
-                .map(|choice| choice.choice().to_message());
+            let mut choice = AccessLogSpec::from_host(&host).choice();
+            choice.format = host
+                .access_log_format
+                .as_deref()
+                .and_then(muru_edge::access::Format::parse);
+            choice.file = host
+                .access_log_file
+                .as_ref()
+                .map(|file| Arc::from(self.locations.logs.path.join(file).as_path()));
+            let access_log = (!choice.is_empty()).then(|| choice.to_message());
 
             // Section 4.12: the host's maintenance mode, with its
             // exemptions. A host removed since it was turned on is no
@@ -8289,6 +8296,23 @@ impl Daemon {
         if self.owns_log {
             candidates.push((self.locations.daemon_log(), false));
         }
+
+        // Section 11.2: the files virtual hosts name for their own
+        // records, which the edge writes and reopens as it does its own.
+
+        let mut own: Vec<String> = self
+            .store
+            .hosts()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, host)| host.access_log_file)
+            .collect();
+        own.sort();
+        own.dedup();
+        candidates.extend(
+            own.into_iter()
+                .map(|file| (self.locations.logs.path.join(file), false)),
+        );
 
         // Section 9.9: a managed server writes its log itself and cannot
         // be told to reopen it, so its log is rotated in place.

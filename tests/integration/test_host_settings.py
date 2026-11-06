@@ -484,3 +484,107 @@ app = "echo"
     assert unknown.returncode != 0 and "no virtual host named nowhere" in unknown.stderr
     both = daemon.muructl("maintenance", "on", "echo", "--host", "shop", check=False)
     assert both.returncode != 0
+
+
+def test_a_host_writes_its_access_records_in_its_own_format_and_file(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    config = tmp_path / "hosts.toml"
+    config.write_text(
+        ECHO
+        + """[host.shop]
+names = ["shop.test"]
+access_log_file = "shop.log"
+access_log_format = "combined"
+
+[host.blog]
+names = ["blog.test"]
+access_log_file = "blog.log"
+
+[host.plain]
+names = ["plain.test"]
+
+[[route]]
+host = "shop"
+app = "echo"
+
+[[route]]
+host = "blog"
+app = "echo"
+
+[[route]]
+host = "plain"
+app = "echo"
+"""
+    )
+    applied = apply(daemon, config)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    daemon.wait_for_routing("echo")
+    logs = tmp_path / "logs"
+    agent = {"User-Agent": "analyser/1.0", "Referer": "http://ref.test/from"}
+
+    assert daemon.request("/text?in-shop", host="shop.test", headers=agent).status == 200
+    assert daemon.request("/text?in-blog", host="blog.test").status == 200
+    assert daemon.request("/text?in-plain", host="plain.test").status == 200
+    assert daemon.request("/text?in-none", host="none.test").status == 421
+
+    def written(name: str, text: str) -> bool:
+        return (logs / name).exists() and text in (logs / name).read_text()
+
+    wait_for(lambda: written("shop.log", "in-shop"))
+    wait_for(lambda: written("blog.log", "in-blog"))
+    wait_for(lambda: written("access.log", "in-none"))
+
+    # The shop's records are in its file, in the combined format; the
+    # blog's in its file as JSON; the rest in the node's file, each
+    # naming its virtual host.
+
+    shop = (logs / "shop.log").read_text().splitlines()
+    assert len(shop) == 1
+    assert shop[0].startswith("127.0.0.1 - - [")
+    assert shop[0].endswith(
+        '"GET /text?in-shop HTTP/1.1" 200 4096 "http://ref.test/from" "analyser/1.0"'
+    ), shop[0]
+    blog = [json.loads(line) for line in (logs / "blog.log").read_text().splitlines()]
+    assert [(record["virtual_host"], record["target"]) for record in blog] == [
+        ("blog", "/text?in-blog")
+    ]
+    node = [json.loads(line) for line in (logs / "access.log").read_text().splitlines()]
+    assert {(record["virtual_host"], record["target"]) for record in node} == {
+        ("plain", "/text?in-plain"),
+        ("", "/text?in-none"),
+    }
+
+    # muructl shows a host's records from where they are: a file in a
+    # text format as written, and the node's file by the host each
+    # record names.
+
+    def shown(*arguments: str) -> str:
+        return daemon.muructl("logs", "--access", *arguments).stdout
+
+    assert shown("--host", "shop").strip() == shop[0]
+    assert "/text?in-blog" in shown("--host", "blog")
+    plain = shown("--host", "plain")
+    assert "/text?in-plain" in plain and "in-none" not in plain
+    everything = shown()
+    assert "in-plain" in everything and "in-none" in everything and "in-shop" not in everything
+    listed = daemon.muructl("host", "list").stdout
+    assert "[access records combined in shop.log]" in listed, listed
+    assert "[access records blog.log]" in listed, listed
+    unknown = daemon.muructl("logs", "--access", "--host", "nowhere", check=False)
+    assert unknown.returncode != 0 and "no virtual host named nowhere" in unknown.stderr
+
+    # The names and the format are checked, and hosts that share a file
+    # write it in one format.
+
+    for table, expected in [
+        ('access_log_file = "access.log"', "is a file the daemon writes itself"),
+        ('access_log_file = "../elsewhere.log"', "is not a file name"),
+        ('access_log_format = "common"', "is not json or combined"),
+        ('access_log_file = "shop.log"', "is also host shop's, with another access_log_format"),
+    ]:
+        broken = tmp_path / "broken.toml"
+        broken.write_text(f'[host.broken]\nnames = ["broken.test"]\n{table}\n')
+        refused = apply(daemon, broken)
+        assert refused.returncode != 0, table
+        assert expected in refused.stdout + refused.stderr, refused.stdout + refused.stderr

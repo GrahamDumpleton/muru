@@ -535,7 +535,29 @@ impl Admin for Service {
         // file, the current release's when none is named.
 
         let (app, release, path) = if request.access {
-            (String::new(), String::new(), locations.access_log())
+            // Section 11.2: a virtual host may name a file of its own.
+
+            let own = if request.host.is_empty() {
+                None
+            } else {
+                self.handle
+                    .store
+                    .hosts()
+                    .map_err(internal)?
+                    .into_iter()
+                    .find(|(name, _)| *name == request.host)
+                    .ok_or_else(|| {
+                        Status::not_found(format!("no virtual host named {}", request.host))
+                    })?
+                    .1
+                    .access_log_file
+            };
+
+            let path = own.map_or_else(
+                || locations.access_log(),
+                |file| locations.logs.path.join(file),
+            );
+            (String::new(), String::new(), path)
         } else {
             if request.app.is_empty() {
                 return Err(Status::invalid_argument(
@@ -1328,6 +1350,8 @@ impl Admin for Service {
                 .into_iter()
                 .map(|(name, host)| pb::Host {
                     maintenance: maintenance.iter().any(|(host, _)| *host == name),
+                    access_log_format: host.access_log_format.clone().unwrap_or_default(),
+                    access_log_file: host.access_log_file.clone().unwrap_or_default(),
                     name,
                     names: host.names,
                     listeners: host.listeners,

@@ -1182,6 +1182,46 @@ pub struct Logs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "1s"))]
     pub slow: Option<String>,
+    /// How the access log's records are written: `json` (the default),
+    /// one object a line, or `combined`, the combined log format of
+    /// Apache and nginx.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "json"))]
+    pub access_log_format: Option<String>,
+}
+
+/// Check an `access_log_format`: `json` or `combined`.
+pub fn check_access_log_format(format: Option<&str>) -> Result<(), String> {
+    match format {
+        None | Some("json" | "combined") => Ok(()),
+        Some(other) => Err(format!(
+            "access_log_format = {other:?} is not json or combined"
+        )),
+    }
+}
+
+/// Check a virtual host's `access_log_file`: the name of a file in the
+/// daemon's log directory, and not one of the daemon's own.
+pub fn check_access_log_file(name: &str) -> Result<(), String> {
+    let plain = !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte));
+
+    if !plain {
+        return Err(format!(
+            "access_log_file = {name:?} is not a file name of letters, digits, dots, hyphens and underscores"
+        ));
+    }
+
+    if ["access.log", "edge.log", "daemon.log"].contains(&name) {
+        return Err(format!(
+            "access_log_file = {name:?} is a file the daemon writes itself"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Check the access log keys a table shares (section 11.2): the mode is
@@ -1857,6 +1897,14 @@ pub struct Host {
     /// `[logs]` table leaves out.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_log_exclude: Vec<String>,
+    /// How the host's records are written: `json` or `combined`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`access_log_format` in `[logs]`"))]
+    pub access_log_format: Option<String>,
+    /// A file in the daemon's log directory that takes the host's
+    /// records in place of `access.log`, for example `shop.log`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_log_file: Option<String>,
     /// How responses to the host's requests are compressed (section
     /// 4.17), each key replacing the daemon's `[compression]` value. A
     /// route's own replace them.

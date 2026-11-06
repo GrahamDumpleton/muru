@@ -4460,6 +4460,18 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             names.push_str(&format!(" [access log {}]", host.access_log));
         }
 
+        if !host.access_log_file.is_empty() || !host.access_log_format.is_empty() {
+            let own = [
+                host.access_log_format.as_str(),
+                host.access_log_file.as_str(),
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" in ");
+            names.push_str(&format!(" [access records {own}]"));
+        }
+
         if !host.compression.is_empty() {
             names.push_str(&format!(" [compression {}]", host.compression));
         }
@@ -6107,6 +6119,11 @@ pub struct LogsArgs {
     #[arg(long)]
     access: bool,
 
+    /// With --access, the records of one virtual host: from the file it
+    /// names for them, or else those in the access log that name it.
+    #[arg(long, value_name = "HOST", requires = "access")]
+    host: Option<String>,
+
     /// Print each line as JSON: a release's output as the admin API's
     /// log lines, access log records as the JSON lines they are kept as.
     #[arg(long)]
@@ -6150,6 +6167,35 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
     };
 
     let mut client = client::connect(&args.socket.socket()?).await?;
+
+    // Section 11.2: a virtual host's records are in the file it names
+    // for them, or else among the access log's, where each JSON record
+    // names its virtual host.
+
+    let mut own_file = false;
+
+    if let Some(name) = &args.host {
+        let hosts = client
+            .list_hosts(pb::ListHostsRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner()
+            .hosts;
+        let host = hosts
+            .iter()
+            .find(|host| host.name == *name)
+            .ok_or_else(|| anyhow::anyhow!("no virtual host named {name}"))?;
+        own_file = !host.access_log_file.is_empty();
+
+        if !own_file && host.access_log_format == "combined" {
+            anyhow::bail!(
+                "host {name} writes its records to access.log in the combined format, which \
+                 does not name the host; give the host an access_log_file to keep them apart"
+            );
+        }
+    }
+
+    let named = args.host.as_deref().filter(|_| !own_file);
     let mut stream = client
         .tail_logs(pb::TailLogsRequest {
             app,
@@ -6157,6 +6203,7 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
             follow: args.follow,
             lines: args.lines,
             access: args.access,
+            host: args.host.clone().filter(|_| own_file).unwrap_or_default(),
         })
         .await
         .map_err(explain)?
@@ -6167,6 +6214,17 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
 
     while let Some(line) = stream.next().await {
         let line = line.map_err(explain)?;
+
+        if let Some(name) = named {
+            let of_host = serde_json::from_str::<serde_json::Value>(&line.line)
+                .ok()
+                .and_then(|record| Some(record.get("virtual_host")?.as_str()? == name))
+                .unwrap_or(false);
+
+            if !of_host {
+                continue;
+            }
+        }
 
         match (args.access, args.json) {
             (true, false) => println!("{}", format_access_line(&line.line, !args.no_timestamps)),
