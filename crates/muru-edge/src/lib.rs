@@ -38,6 +38,7 @@ pub mod connections;
 pub mod endpoints;
 pub mod errors;
 pub mod grpc;
+pub mod headers;
 pub mod ja4;
 pub mod link;
 pub mod metrics;
@@ -253,6 +254,213 @@ impl Limits {
     }
 }
 
+/// The limits one level sets on a request (section 4.6): a virtual
+/// host's, or a route's. Each is none where the level says nothing, and
+/// the level beneath's is in force.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestLimits {
+    /// The largest request body accepted.
+    pub max_body_size: Option<u64>,
+    /// How long a request may wait for a worker.
+    pub queue_timeout: Option<Duration>,
+    /// How long a request may take to produce its response head.
+    pub request_deadline: Option<Duration>,
+    /// How long a client may pause while sending a body.
+    pub body_idle_timeout: Option<Duration>,
+    /// How long a worker may pause mid-response.
+    pub response_idle_timeout: Option<Duration>,
+}
+
+impl RequestLimits {
+    /// The limits a snapshot carries for a level; a field at 0 says
+    /// nothing.
+    pub fn from_message(message: Option<&muru_proto::edge::v1::RequestLimits>) -> Self {
+        let Some(message) = message else {
+            return Self::default();
+        };
+
+        let duration = |millis: u64| (millis > 0).then(|| Duration::from_millis(millis));
+
+        Self {
+            max_body_size: (message.max_body_size > 0).then_some(message.max_body_size),
+            queue_timeout: duration(message.queue_timeout_ms),
+            request_deadline: duration(message.request_deadline_ms),
+            body_idle_timeout: duration(message.body_idle_timeout_ms),
+            response_idle_timeout: duration(message.response_idle_timeout_ms),
+        }
+    }
+
+    /// The limits as a snapshot carries them, or none when the level
+    /// says nothing.
+    pub fn to_message(&self) -> Option<muru_proto::edge::v1::RequestLimits> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let millis = |duration: Option<Duration>| {
+            duration.map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            })
+        };
+
+        Some(muru_proto::edge::v1::RequestLimits {
+            max_body_size: self.max_body_size.unwrap_or(0),
+            queue_timeout_ms: millis(self.queue_timeout),
+            request_deadline_ms: millis(self.request_deadline),
+            body_idle_timeout_ms: millis(self.body_idle_timeout),
+            response_idle_timeout_ms: millis(self.response_idle_timeout),
+        })
+    }
+
+    /// Whether the level says nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// These limits with the wider level's wherever these say nothing.
+    #[must_use]
+    pub fn or(self, wider: Self) -> Self {
+        Self {
+            max_body_size: self.max_body_size.or(wider.max_body_size),
+            queue_timeout: self.queue_timeout.or(wider.queue_timeout),
+            request_deadline: self.request_deadline.or(wider.request_deadline),
+            body_idle_timeout: self.body_idle_timeout.or(wider.body_idle_timeout),
+            response_idle_timeout: self.response_idle_timeout.or(wider.response_idle_timeout),
+        }
+    }
+
+    /// The node's limits with these laid over them.
+    #[must_use]
+    pub fn over(&self, node: &Limits) -> Limits {
+        let mut limits = node.clone();
+
+        if let Some(size) = self.max_body_size {
+            limits.max_body_size = size;
+        }
+
+        for (value, field) in [
+            (self.queue_timeout, &mut limits.queue_timeout),
+            (self.request_deadline, &mut limits.request_deadline),
+            (self.body_idle_timeout, &mut limits.body_idle_timeout),
+            (
+                self.response_idle_timeout,
+                &mut limits.response_idle_timeout,
+            ),
+        ] {
+            if let Some(duration) = value {
+                *field = duration;
+            }
+        }
+
+        limits
+    }
+}
+
+/// A listener's own limits on its connections and on reading a request's
+/// head (sections 4.6 and 4.18), each in place of the node's for the
+/// connections the listener accepts, and none where it says nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListenerLimits {
+    /// Bytes of request head accepted.
+    pub max_header_bytes: Option<usize>,
+    /// Request headers accepted.
+    pub max_headers: Option<usize>,
+    /// Time allowed for a complete request head.
+    pub header_read_timeout: Option<Duration>,
+    /// Open connections on the listener.
+    pub max_connections: Option<usize>,
+    /// Open connections per client address; 0 disables it.
+    pub max_connections_per_client: Option<usize>,
+    /// Idle time before a keep-alive connection is closed.
+    pub keep_alive_timeout: Option<Duration>,
+    /// The same, for connections from trusted proxies.
+    pub keep_alive_timeout_proxy: Option<Duration>,
+    /// Requests served on one connection before it is closed; 0 leaves
+    /// it open.
+    pub max_requests_per_connection: Option<u64>,
+    /// Concurrent streams per HTTP/2 connection.
+    pub http2_max_concurrent_streams: Option<u32>,
+}
+
+impl ListenerLimits {
+    /// The limits a snapshot carries for a listener.
+    pub fn from_message(message: &muru_proto::edge::v1::ListenerLimits) -> Self {
+        let size =
+            |value: Option<u64>| value.map(|value| usize::try_from(value).unwrap_or(usize::MAX));
+
+        Self {
+            max_header_bytes: size(message.max_header_bytes),
+            max_headers: message.max_headers.map(|count| count as usize),
+            header_read_timeout: message.header_read_timeout_ms.map(Duration::from_millis),
+            max_connections: size(message.max_connections),
+            max_connections_per_client: size(message.max_connections_per_client),
+            keep_alive_timeout: message.keep_alive_timeout_ms.map(Duration::from_millis),
+            keep_alive_timeout_proxy: message
+                .keep_alive_timeout_proxy_ms
+                .map(Duration::from_millis),
+            max_requests_per_connection: message.max_requests_per_connection,
+            http2_max_concurrent_streams: message.http2_max_concurrent_streams,
+        }
+    }
+
+    /// The limits as a snapshot carries them for the listener at
+    /// `address`.
+    pub fn to_message(&self, address: &str) -> muru_proto::edge::v1::ListenerLimits {
+        let millis = |duration: Option<Duration>| {
+            duration.map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        };
+
+        muru_proto::edge::v1::ListenerLimits {
+            listener: address.to_owned(),
+            max_header_bytes: self.max_header_bytes.map(|bytes| bytes as u64),
+            max_headers: self
+                .max_headers
+                .map(|count| u32::try_from(count).unwrap_or(u32::MAX)),
+            header_read_timeout_ms: millis(self.header_read_timeout),
+            max_connections: self.max_connections.map(|count| count as u64),
+            max_connections_per_client: self.max_connections_per_client.map(|count| count as u64),
+            keep_alive_timeout_ms: millis(self.keep_alive_timeout),
+            keep_alive_timeout_proxy_ms: millis(self.keep_alive_timeout_proxy),
+            max_requests_per_connection: self.max_requests_per_connection,
+            http2_max_concurrent_streams: self.http2_max_concurrent_streams,
+        }
+    }
+
+    /// Whether the listener says nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The node's limits with the listener's laid over them.
+    #[must_use]
+    pub fn over(&self, node: &Limits) -> Limits {
+        let mut limits = node.clone();
+
+        macro_rules! lay {
+            ($($field:ident),*) => {
+                $(
+                    if let Some(value) = self.$field {
+                        limits.$field = value;
+                    }
+                )*
+            };
+        }
+
+        lay!(
+            max_header_bytes,
+            max_headers,
+            header_read_timeout,
+            max_connections,
+            max_connections_per_client,
+            keep_alive_timeout,
+            keep_alive_timeout_proxy,
+            max_requests_per_connection,
+            http2_max_concurrent_streams
+        );
+        limits
+    }
+}
+
 /// The limits in force with what is derived from them, swapped together
 /// when a snapshot changes them (section 4.6); a connection takes those
 /// current when it is accepted and keeps them.
@@ -349,8 +557,14 @@ struct Shared {
     development: bool,
     occasions: occasions::Setting,
     access_log: Arc<access::AccessLog>,
-    /// The limits in force, which a snapshot may replace.
-    tuning: RwLock<Arc<Tuning>>,
+    /// The node's limits in force, which a snapshot may replace.
+    limits: RwLock<Arc<Limits>>,
+    /// Each listener's limits in force, in listener order: the node's
+    /// with the listener's own laid over them (section 4.18).
+    tuning: Vec<RwLock<Arc<Tuning>>>,
+    /// The listeners' addresses, in listener order, by which a snapshot
+    /// names them.
+    addresses: Vec<SocketAddr>,
     /// Where plain HTTP requests are redirected instead of being served.
     redirect_to: Option<SocketAddr>,
     /// The port of the first TLS listener, for hosts that insist on HTTPS.
@@ -396,9 +610,10 @@ enum Phase {
 }
 
 impl Shared {
-    /// The limits in force now, for a connection being accepted.
-    fn tuning(&self) -> Arc<Tuning> {
-        Arc::clone(&self.tuning.read().expect("tuning poisoned"))
+    /// The limits in force now on a listener, for a connection it is
+    /// accepting.
+    fn tuning(&self, listener: usize) -> Arc<Tuning> {
+        Arc::clone(&self.tuning[listener].read().expect("tuning poisoned"))
     }
 }
 
@@ -410,24 +625,37 @@ pub struct LimitsControl {
 }
 
 impl LimitsControl {
-    /// The limits in force now.
+    /// The node's limits in force now.
     pub fn current(&self) -> Arc<Limits> {
-        Arc::clone(&self.shared.tuning().limits)
+        Arc::clone(&self.shared.limits.read().expect("limits poisoned"))
     }
 
     /// Put new limits in force: connections accepted from now on take
     /// them, the listeners' connection limits and the spool's quota
     /// change at once, and connections already open keep what they had.
-    pub fn apply(&self, limits: Limits) {
-        for admission in &self.shared.admission {
-            admission.set_limits(limits.max_connections, limits.max_connections_per_client);
+    ///
+    /// A listener named in `listeners` has its own laid over the node's
+    /// (section 4.18); the others have the node's.
+    pub fn apply(
+        &self,
+        limits: Limits,
+        listeners: &std::collections::HashMap<SocketAddr, ListenerLimits>,
+    ) {
+        let shared = &self.shared;
+
+        for (index, address) in shared.addresses.iter().enumerate() {
+            let own = listeners
+                .get(address)
+                .map_or_else(|| limits.clone(), |own| own.over(&limits));
+            shared.admission[index].set_limits(own.max_connections, own.max_connections_per_client);
+            *shared.tuning[index].write().expect("tuning poisoned") = Arc::new(Tuning::new(own));
         }
 
-        if let Some(spool) = &self.shared.spool {
+        if let Some(spool) = &shared.spool {
             spool.set_quota((limits.spool_quota > 0).then_some(limits.spool_quota));
         }
 
-        *self.shared.tuning.write().expect("tuning poisoned") = Arc::new(Tuning::new(limits));
+        *shared.limits.write().expect("limits poisoned") = Arc::new(limits);
     }
 }
 
@@ -597,6 +825,12 @@ impl Edge {
             })
             .collect();
 
+        let tuning = bound
+            .iter()
+            .map(|_| RwLock::new(Arc::new(Tuning::new(config.limits.clone()))))
+            .collect();
+        let addresses = bound.iter().map(|(_, address, _)| *address).collect();
+
         Ok(Self {
             listeners: bound,
             local,
@@ -606,7 +840,9 @@ impl Edge {
                 development: config.development,
                 occasions: config.occasions,
                 access_log,
-                tuning: RwLock::new(Arc::new(Tuning::new(config.limits))),
+                tuning,
+                addresses,
+                limits: RwLock::new(Arc::new(config.limits)),
                 redirect_to,
                 https_port,
                 draining: tokio::sync::watch::channel(Phase::Serving).0,
@@ -801,7 +1037,7 @@ async fn accept(
         // listener answers 503 while the reserve lasts and closes beyond
         // it, pausing a moment before the next accept.
 
-        let trusted = shared.pools.current().trust().trusts(&peer);
+        let trusted = shared.pools.current().trust_on(&local).trusts(&peer);
 
         let guard = match admission.admit(peer.ip(), trusted) {
             connections::Admission::Accept(guard) => guard,
@@ -853,7 +1089,7 @@ async fn accept(
         // current now are the connection's for its life.
 
         let token = Arc::clone(&shared.connections);
-        let tuning = shared.tuning();
+        let tuning = shared.tuning(index);
 
         match acceptor.clone() {
             None => {
@@ -1025,7 +1261,7 @@ async fn serve<I>(
 
             let routing = shared.pools.current();
             let (mut parts, body) = request.into_parts();
-            let forwarded = routing.trust().resolve(&peer, &mut parts.headers);
+            let forwarded = routing.trust_on(&local).resolve(&peer, &mut parts.headers);
             let accept_encoding = parts.headers.get(http::header::ACCEPT_ENCODING).cloned();
             let method = parts.method.clone();
 
@@ -1071,6 +1307,13 @@ async fn serve<I>(
                     .map(str::to_owned)
                     .or_else(|| parts.uri.host().map(str::to_owned))
             });
+
+            // Sections 4.7 and 4.17: what the host and the route the
+            // client's request names set for it besides where it goes,
+            // the compression policy and the header rules.
+
+            let site = routing.site(host.as_deref(), parts.uri.path(), &client_class, &listener);
+            let compression = site.compression;
             let mut body = Some(body);
             let mut buffered: Option<Bytes> = None;
             let mut origin: Option<routing::Origin> = None;
@@ -1082,6 +1325,12 @@ async fn serve<I>(
             let mut handling: Option<Handling> = None;
             let mut checks = 0usize;
             let mut admitted = false;
+
+            // Section 4.6: the limits of the route the client's own
+            // request matched, over its host's and the node's, which its
+            // sub-requests keep.
+
+            let mut in_force = Arc::clone(&limits);
 
             let response = loop {
                 let decision = routing.select(
@@ -1101,6 +1350,14 @@ async fn serve<I>(
                     },
                     origin.as_ref(),
                 );
+
+                if origin.is_none() && handling.is_none() {
+                    let own = decision.request_limits();
+
+                    if !own.is_empty() {
+                        in_force = Arc::new(own.over(&limits));
+                    }
+                }
 
                 // Section 4.12: the error pages in force come from the
                 // route, the release the request was routed to, the host
@@ -1134,8 +1391,9 @@ async fn serve<I>(
                     development: shared.development,
                     occasions: shared.occasions,
                     access_log: Arc::clone(&shared.access_log),
-                    limits: Arc::clone(&limits),
+                    limits: Arc::clone(&in_force),
                     server_name: None,
+                    virtual_host: routing.host_name(host.as_deref(), &listener),
                     app: String::new(),
                     release: String::new(),
                     group: String::new(),
@@ -1199,6 +1457,20 @@ async fn serve<I>(
                         && let Some(problem) = methods.refuse(&parts.method)
                     {
                         break link::reject(&parts, &context, problem);
+                    }
+
+                    // Section 4.7: the host's and then the route's rules
+                    // for request headers, once, before an authentication
+                    // handler, a worker, an upstream or a redirect's
+                    // target sees the request.
+
+                    if matches!(
+                        decision,
+                        routing::Decision::Serve { .. } | routing::Decision::Static { .. }
+                    ) {
+                        for rules in site.request_headers.iter().flatten() {
+                            rules.apply(&mut parts.headers);
+                        }
                     }
                 }
 
@@ -1306,7 +1578,7 @@ async fn serve<I>(
                             cookies,
                             auth: _,
                             upload,
-                            max_body_size,
+                            request_limits: _,
                             limits: _,
                             methods: _,
                             mode,
@@ -1347,17 +1619,11 @@ async fn serve<I>(
                             context.sendfile = selection.sendfile;
                             context.grpc_web = selection.grpc_web;
 
-                            // Sections 4.6 and 4.11: the route's body limit
-                            // and uploads apply to a client's own request,
-                            // whose body has not been read yet.
+                            // Section 4.11: the route's uploads apply to
+                            // a client's own request, whose body has not
+                            // been read yet.
 
                             if origin.is_none() {
-                                if let Some(size) = max_body_size {
-                                    let mut limits = (*context.limits).clone();
-                                    limits.max_body_size = size;
-                                    context.limits = Arc::new(limits);
-                                }
-
                                 context.upload = upload;
                             }
 
@@ -1390,7 +1656,7 @@ async fn serve<I>(
                                     &within,
                                     &target,
                                     &parts.headers,
-                                    routing.compression(),
+                                    compression,
                                 )
                                 .await
                                 {
@@ -1416,12 +1682,24 @@ async fn serve<I>(
                             }
                         }
                     }
-                    (None, routing::Decision::Redirect) => {
-                        link::Handled::Response(link::redirect_to_https(
+                    (None, routing::Decision::Redirect { https, canonical }) => {
+                        link::Handled::Response(link::redirect(
                             &parts,
                             &context,
-                            SocketAddr::new(local.ip(), shared.https_port.unwrap_or(443)),
+                            https.then(|| {
+                                SocketAddr::new(local.ip(), shared.https_port.unwrap_or(443))
+                            }),
+                            canonical.as_deref(),
                         ))
+                    }
+                    (None, routing::Decision::Maintenance { retry_after }) => {
+                        let mut problem = errors::Problem::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "maintenance",
+                            "The site is down for maintenance.",
+                        );
+                        problem.retry_after = Some(retry_after);
+                        link::Handled::Response(link::reject(&parts, &context, problem))
                     }
                     (None, routing::Decision::Misdirected) => {
                         link::Handled::Response(link::reject(
@@ -1471,6 +1749,7 @@ async fn serve<I>(
                             server_name,
                             cookies,
                             auth: _,
+                            request_limits: _,
                             limits: _,
                         },
                     ) => {
@@ -1494,7 +1773,7 @@ async fn serve<I>(
                             &within,
                             &target,
                             &parts.headers,
-                            routing.compression(),
+                            compression,
                         )
                         .await;
 
@@ -1721,15 +2000,18 @@ async fn serve<I>(
                 }
             }
 
+            // Section 4.7: the host's and then the route's rules for
+            // response headers, whatever answered.
+
+            for rules in site.response_headers.iter().flatten() {
+                rules.apply(response.headers_mut());
+            }
+
             // Section 4.17: compressed for the client when the policy and
             // the response allow it.
 
-            let mut response = compression::apply(
-                routing.compression(),
-                &method,
-                accept_encoding.as_ref(),
-                response,
-            );
+            let mut response =
+                compression::apply(compression, &method, accept_encoding.as_ref(), response);
 
             // Section 4.18: the connection closes after its share of
             // requests.

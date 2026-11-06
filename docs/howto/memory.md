@@ -46,7 +46,10 @@ proportional set size (PSS) splits shared pages between the processes
 that share them, and the resident set size (RSS) counts every resident
 page. On Linux the figures come from the kernel's own accounting; on
 macOS the resident size is reported, and the task's physical footprint
-stands in for USS and PSS.
+stands in for USS and PSS. The resident size on macOS leaves out memory
+the system has compressed, so a worker that holds memory without
+touching it can measure well under what it has allocated; the physical
+footprint counts compressed memory.
 
 ## What happens
 

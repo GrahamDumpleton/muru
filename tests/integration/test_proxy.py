@@ -217,6 +217,59 @@ app = "shop"
         daemon.stop()
 
 
+def test_a_listener_has_proxy_settings_of_its_own(tmp_path: Path) -> None:
+    public, internal = support.free_port(), support.free_port()
+    daemon = start_daemon(
+        tmp_path,
+        listeners=[(public, False), (internal, False)],
+        config_extra=(
+            "\n[listener.proxy]\ntrusted = ['loopback']\nheaders = ['x-forwarded-for']\n"
+            "\n[proxy]\ntrusted = ['loopback']\n"
+        ),
+    )
+
+    def seen(port: int) -> dict[str, Any]:
+        headers = {"X-Forwarded-For": "203.0.113.5", "X-Forwarded-Proto": "https"}
+        response = daemon.request("/info", port=port, headers=headers)
+        assert response.status == 200, response.body
+        environ: dict[str, Any] = json.loads(response.body)["environ"]
+        return environ
+
+    try:
+        deploy_echo(daemon)
+
+        # The internal listener's table replaces the node's whole for its
+        # connections: the address is believed and the scheme, a header
+        # type it does not name, is not. The public listener has the
+        # node's table, which names the scheme by default.
+
+        environ = seen(internal)
+        assert environ["REMOTE_ADDR"] == "203.0.113.5"
+        assert environ["wsgi.url_scheme"] == "http"
+        environ = seen(public)
+        assert environ["REMOTE_ADDR"] == "203.0.113.5"
+        assert environ["wsgi.url_scheme"] == "https"
+
+        # A reload hands the edge a changed table: an empty one trusts
+        # nothing on that listener, whatever the node trusts.
+
+        config = tmp_path / "muru.toml"
+        config.write_text(
+            config.read_text().replace(
+                "[listener.proxy]\ntrusted = ['loopback']\nheaders = ['x-forwarded-for']\n",
+                "[listener.proxy]\n",
+            )
+        )
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert "[[listener]] proxy (the edge has it)" in reloaded, reloaded
+        environ = seen(internal)
+        assert environ["REMOTE_ADDR"] == "127.0.0.1"
+        assert "HTTP_X_FORWARDED_FOR" not in environ
+        assert seen(public)["REMOTE_ADDR"] == "203.0.113.5"
+    finally:
+        daemon.stop()
+
+
 def test_a_bad_proxy_table_refuses_to_start(tmp_path: Path) -> None:
     # The run directory is short, so the proxy table is what refuses.
 

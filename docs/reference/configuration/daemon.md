@@ -81,7 +81,8 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `kind` | string | `"workers"` | What the release runs: `workers` from an entrypoint, the default, or `http`, an HTTP server started from `command`. `workers`: Muru's own workers, from an entrypoint. `http`: An HTTP server Muru starts and supervises, from a command. |
 | `logging` | table, {ref}`[app.NAME.release.ID.logging] <config-daemon-app-name-release-id-logging>` |  | How Python logging is set up in the workers. |
-| `maintenance` | table, {ref}`[app.NAME.release.ID.maintenance] <config-daemon-app-name-release-id-maintenance>` |  | What maintenance mode lets through. |
+| `maintenance` | table, {ref}`[host.NAME.maintenance] <config-daemon-host-name-maintenance>` |  | What maintenance mode lets through. |
+| `max_body_size` | string | the host's, else `max_body_size` in `[limits]` | The largest body of a request the release serves, for example 50MB, which the edge enforces. |
 | `max_lifetime` | string |  | How long a worker lives before it is replaced, for example 1h, with jitter; off when absent. |
 | `max_requests` | integer |  | Requests a worker serves before it is replaced, with jitter; off when absent. |
 | `memory` | table, {ref}`[app.NAME.release.ID.memory] <config-daemon-app-name-release-id-memory>` |  | The memory policy for the workers. |
@@ -100,7 +101,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `stop_signal` | string | the profile's, `TERM` | The signal that stops an `http` release's instance gracefully: TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic profile; the other profiles know their server's. |
 | `sync_threads` | integer | `8` | Threads for synchronous code called from an ASGI application. |
 | `threads` | integer | `4` | Application threads per worker. |
-| `timeouts` | table, {ref}`[app.NAME.release.ID.timeouts] <config-daemon-app-name-release-id-timeouts>` |  | The timeouts the host enforces on its workers. |
+| `timeouts` | table, {ref}`[app.NAME.release.ID.timeouts] <config-daemon-app-name-release-id-timeouts>` |  | The timeouts the host enforces on its workers, and those of a request the release serves, which the edge enforces. |
 
 (config-daemon-app-name-release-id-build)=
 ## `[app.NAME.release.ID.build]`
@@ -172,6 +173,7 @@ A worker group, the `[app.NAME.release.ID.groups.NAME]` or `[tool.muru.groups.NA
 | --- | --- | --- | --- |
 | `concurrency` | integer | the release's | Requests an ASGI worker's event loop takes at once. |
 | `match` | table, {ref}`[app.NAME.release.ID.groups.NAME.match] <config-daemon-app-name-release-id-groups-name-match>` |  | What the group asks of a request beside its path: the client classes, hosts and methods it takes, each list any of its entries; a group asking more comes before one asking less, and a group with lists and no `paths` takes every path. |
+| `max_body_size` | string | the release's | The largest body of a request the group serves, for example 200MB, which the edge enforces. |
 | `max_lifetime` | string | the release's | How long a worker of the group lives before it is replaced, for example 1h, with jitter. |
 | `max_requests` | integer | the release's | Requests a worker of the group serves before it is replaced, with jitter. |
 | `memory` | table, {ref}`[app.NAME.release.ID.memory] <config-daemon-app-name-release-id-memory>` |  | The group's own memory policy, each key the release's when absent. |
@@ -216,18 +218,6 @@ The `[logging.python]` table: what loggers without handlers of their own do, set
 | `level` | string | `"WARNING"` | The root logger's level. `DEBUG`: Everything. `INFO`: Informational messages and above. `WARNING`: Python's default: warnings and above. `ERROR`: Errors and above. `CRITICAL`: Only critical messages. |
 | `loggers` | table of strings |  | Levels for named loggers. |
 
-(config-daemon-app-name-release-id-maintenance)=
-## `[app.NAME.release.ID.maintenance]`
-
-What maintenance mode lets through, the `maintenance` table of a release.
-
-| Key | Type | Default | Description |
-| --- | --- | --- | --- |
-| `bypass_cookie` | string |  | A `name=value` cookie that lets a client through. |
-| `exempt_addresses` | array of strings |  | Client addresses, or ranges in CIDR form, served as usual. |
-| `exempt_paths` | array of strings |  | Path prefixes served as usual while the application is in maintenance. |
-| `retry_after` | string | `"60s"` | The `Retry-After` the maintenance page carries, for example 5m. |
-
 (config-daemon-app-name-release-id-memory)=
 ## `[app.NAME.release.ID.memory]`
 
@@ -259,6 +249,7 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `handoff` | string |  | The interface the mount's requests may be handed to; none when absent. `asgi`: Continue the request as an ASGI application on the event loop. `wsgi`: Continue the request as a WSGI callable on the thread pool. |
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `internal` | boolean | `false` | Reachable only through internal redirects: a client's request for its path is answered 404. |
+| `max_body_size` | string | the worker group's, else the release's | The largest body of a request the mount serves, for example 200MB, which the edge enforces. |
 | `max_connections` | integer |  | Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; each holds a request slot when absent. |
 | `path` | string |  | The path prefix; the longest wins, on segment boundaries. A gRPC mount has none: its calls are matched by service name. |
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
@@ -330,16 +321,20 @@ A directory of an application's own files, an entry of the `[[tool.muru.static]]
 (config-daemon-app-name-release-id-timeouts)=
 ## `[app.NAME.release.ID.timeouts]`
 
-The `[timeouts]` table of a release or a `[tool.muru]` table: the timeouts the host enforces on its workers. The edge's own timeouts are the daemon's `[limits]`.
+The `[timeouts]` table of a release or a `[tool.muru]` table: the timeouts the host enforces on its workers, and the four the edge enforces on a request the release serves, which are otherwise the virtual host's or the daemon's `[limits]`.
 
 The same keys apply at `[app.NAME.release.ID.groups.NAME.timeouts]`.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `body_idle_timeout` | string | the host's, else `body_idle_timeout` in `[limits]` | Time a client may pause while sending a body to what is served here. |
 | `gil_stall_timeout` | string | `"30s"` | How long a worker may go with no thread running Python, or with no report to its host, before it is replaced as for the hard timeout. |
 | `hard_drain_grace` | string | `"10s"` | How long a worker being replaced is given to finish its other requests before it is told to stop. |
 | `hard_timeout` | string |  | How long a request may run in a worker before the worker is replaced, for example 60s; off when absent. Must exceed the soft timeout by at least 5s. |
 | `loop_stall_timeout` | string | `"10s"` | How long an ASGI worker's event loop may go without running before the worker is replaced as for the hard timeout. |
+| `queue_timeout` | string | the host's, else `queue_timeout` in `[limits]` | Time a request served here may wait for a worker, which the edge enforces; the virtual host's when absent, or else the daemon's `[limits]` value. |
+| `request_deadline` | string | the host's, else `request_deadline` in `[limits]` | Time a request served here may take to produce its response head. |
+| `response_idle_timeout` | string | the host's, else `response_idle_timeout` in `[limits]` | Time a worker here may pause mid-response. |
 | `shutdown_timeout` | string | `"5s"` | How long a worker told to stop is given before it is killed, counted from when its WebSockets are closed. |
 | `soft_timeout` | string |  | How long a request may run in a worker before it is interrupted by raising `muru.RequestTimeout` in its thread, for example 30s; off when absent. |
 | `websocket_drain_grace` | string | `"0s"` | How long a worker told to stop keeps its open WebSockets before it closes them with 1001. |
@@ -387,7 +382,9 @@ A `[[client_class]]` rule. A request gets the class when every input the rule na
 (config-daemon-compression)=
 ## `[compression]`
 
-The `[compression]` table: how the edge compresses responses. Every key is optional.
+The `[compression]` table: how the edge compresses responses. Every key is optional. A virtual host and a route take the same table, where a key left out is the level beneath's.
+
+The same keys apply at `[host.NAME.compression]` and `[route.compression]`.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -486,16 +483,81 @@ A virtual host, the `[host.NAME]` table.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `access_log` | string | `access_log` in `[logs]` | Which of the host's requests the access log writes: `on`, `errors` or `off`, replacing the `[logs]` table's. An application's own replaces it. |
+| `access_log_exclude` | array of strings |  | Paths whose requests the access log leaves out, besides those the `[logs]` table leaves out. |
+| `access_log_file` | string |  | A file in the daemon's log directory that takes the host's records in place of `access.log`, for example `shop.log`. |
+| `access_log_format` | string | `access_log_format` in `[logs]` | How the host's records are written: `json` or `combined`. |
 | `canonical` | string |  | The name the host is known by, for `use_canonical_name`. |
+| `canonical_redirect` | boolean | `false` | Redirect requests for the host's other names to the canonical name. |
+| `compression` | table, {ref}`[compression] <config-daemon-compression>` |  | How responses to the host's requests are compressed, each key replacing the daemon's `[compression]` value. A route's own replace them. |
 | `default` | boolean | `false` | Answer requests whose host matches no virtual host, which are otherwise refused with 421. |
 | `error_override` | table, {ref}`[error_override] <config-daemon-error-override>` |  | Replace the application's own error responses with error pages. |
 | `error_pages` | table of tables, {ref}`[error_pages.STATUS] <config-daemon-error-pages-status>` |  | Custom error pages, by status or status:reason. |
 | `https_redirect` | boolean | `false` | Redirect plain HTTP requests to HTTPS. |
 | `listeners` | array of strings |  | The listener addresses it answers on; every listener when empty. |
+| `maintenance` | table, {ref}`[host.NAME.maintenance] <config-daemon-host-name-maintenance>` |  | What the host's maintenance mode lets through, while `muructl maintenance on --host` has it on. |
+| `max_body_size` | string | `max_body_size` in `[limits]` | The largest request body for the host's routes, for example 1MB, replacing the daemon's `[limits]` value. A route's own replaces it. |
 | `names` | array of strings |  | The names it answers to: exact names, or `*.example.com` for one label. Compared case-insensitively, without a port or trailing dot. |
 | `rate_limits` | array of strings |  | The `[rate_limit.NAME]` tables applied to every request for the host, before a route's. |
+| `request_headers` | table, {ref}`[host.NAME.request_headers] <config-daemon-host-name-request-headers>` |  | Headers removed from, and set on, the host's requests before anything is asked to serve them. A route's own are applied after them. |
+| `response_headers` | table, {ref}`[host.NAME.response_headers] <config-daemon-host-name-response-headers>` |  | Headers removed from, set on and added to every response to the host's requests. A route's own are applied after them. |
+| `slow` | string | `slow` in `[logs]` | How slow a request is to be written under `access_log = "errors"`. |
+| `timeouts` | table, {ref}`[host.NAME.timeouts] <config-daemon-host-name-timeouts>` |  | The timeouts of a request for the host's routes, each replacing the daemon's `[limits]` value. A route's own replace them. |
 | `tls` | table, {ref}`[host.NAME.tls] <config-daemon-host-name-tls>` |  | Its certificate and key, for TLS listeners. |
 | `use_canonical_name` | boolean | `false` | Give the application the canonical name as SERVER_NAME rather than the name matched. |
+
+(config-daemon-host-name-maintenance)=
+## `[host.NAME.maintenance]`
+
+What maintenance mode lets through, the `maintenance` table of a release.
+
+The same keys apply at `[app.NAME.release.ID.maintenance]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `bypass_cookie` | string |  | A `name=value` cookie that lets a client through. |
+| `exempt_addresses` | array of strings |  | Client addresses, or ranges in CIDR form, served as usual. |
+| `exempt_paths` | array of strings |  | Path prefixes served as usual while the application is in maintenance. |
+| `retry_after` | string | `"60s"` | The `Retry-After` the maintenance page carries, for example 5m. |
+
+(config-daemon-host-name-request-headers)=
+## `[host.NAME.request_headers]`
+
+What a virtual host or a route does to the headers of a request before anything is asked to serve it: the `request_headers` table. The names are removed first, then the headers set.
+
+The same keys apply at `[route.request_headers]` and `[overlay.NAME.routes.NAME.request_headers]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `remove` | array of strings |  | Headers removed from the request, by name. |
+| `set` | table of strings |  | Headers set on the request, by name, each replacing any the client sent. |
+
+(config-daemon-host-name-response-headers)=
+## `[host.NAME.response_headers]`
+
+What a virtual host or a route does to the headers of a response: the `response_headers` table. The names are removed first, then the headers set, then those added.
+
+The same keys apply at `[route.response_headers]` and `[overlay.NAME.routes.NAME.response_headers]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `add` | table of strings or arrays of strings |  | Headers added to the response beside any it has, by name: a value, or a list of values for a header sent more than once. |
+| `remove` | array of strings |  | Headers removed from the response, by name. |
+| `set` | table of strings |  | Headers set on the response, by name, each replacing any the response has. |
+
+(config-daemon-host-name-timeouts)=
+## `[host.NAME.timeouts]`
+
+The timeouts of one request, the `timeouts` table of a virtual host or a route. Each key replaces the same key of the level beneath, down to the daemon's `[limits]`.
+
+The same keys apply at `[route.timeouts]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `body_idle_timeout` | string | `body_idle_timeout` in `[limits]` | Time a client may pause while sending a body. |
+| `queue_timeout` | string | `queue_timeout` in `[limits]` | Time a request may wait for a worker. |
+| `request_deadline` | string | `request_deadline` in `[limits]` | Time a request may take to produce its response head. |
+| `response_idle_timeout` | string | `response_idle_timeout` in `[limits]` | Time a worker may pause mid-response. |
 
 (config-daemon-host-name-tls)=
 ## `[host.NAME.tls]`
@@ -535,6 +597,8 @@ The `[limits]` table: sizes and durations as the configuration writes them.
 
 The `[limits.http2]` table.
 
+The same keys apply at `[listener.limits.http2]`.
+
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_concurrent_streams` | integer | `128` | Concurrent streams per connection. |
@@ -548,7 +612,26 @@ A listener, one of the `[[listener]]` entries, in the daemon's own file.
 | --- | --- | --- | --- |
 | `address` | string | required | The address, as IP:PORT. |
 | `h2c` | array of strings | every client | On a listener without TLS, the clients that may speak HTTP/2 in cleartext (h2c), as addresses, ranges, loopback or private; every client when omitted, none when empty. The others are served HTTP/1.1. |
+| `limits` | table, {ref}`[listener.limits] <config-daemon-listener-limits>` |  | The listener's own limits on its connections and on reading a request's head, each replacing the `[limits]` value for the connections it accepts. |
+| `proxy` | table, {ref}`[proxy] <config-daemon-proxy>` |  | The listener's own trusted proxies and header types, in place of the whole `[proxy]` table for the connections it accepts. An empty table trusts nothing. |
 | `tls` | boolean | `false` | Whether TLS is terminated on it, with the certificates of the virtual hosts it serves, chosen by SNI. |
+
+(config-daemon-listener-limits)=
+## `[listener.limits]`
+
+A listener's `limits` table: the keys of `[limits]` that bound a connection and the reading of a request's head, each replacing the node's for the connections the listener accepts.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `header_read_timeout` | string | `header_read_timeout` in `[limits]` | Time allowed for a complete request head. |
+| `http2` | table, {ref}`[limits.http2] <config-daemon-limits-http2>` |  | HTTP/2 settings. |
+| `keep_alive_timeout` | string | `keep_alive_timeout` in `[limits]` | Idle time before a keep-alive connection is closed. |
+| `keep_alive_timeout_proxy` | string | `keep_alive_timeout_proxy` in `[limits]` | The same for connections from trusted proxies. |
+| `max_connections` | integer | `max_connections` in `[limits]` | Open connections on the listener. |
+| `max_connections_per_client` | integer | `max_connections_per_client` in `[limits]` | Open connections per client address; 0 disables it. |
+| `max_header_bytes` | string | `max_header_bytes` in `[limits]` | Largest request head, for example 64KB. |
+| `max_headers` | integer | `max_headers` in `[limits]` | Most headers in a request. |
+| `max_requests_per_connection` | integer | `max_requests_per_connection` in `[limits]` | Requests served on one connection before it is closed; 0 for no limit. |
 
 (config-daemon-logs)=
 ## `[logs]`
@@ -559,6 +642,7 @@ The `[logs]` table of the daemon's file: how the daemon rotates the log files it
 | --- | --- | --- | --- |
 | `access_log` | string | `"on"` | Which requests the access log writes: `on` (the default), `errors` (4xx and 5xx responses, requests at least `slow`, and WebSockets that closed other than normally or going away) or `off`. Requests not written are still counted in the metrics and shown on the dashboard. |
 | `access_log_exclude` | array of strings |  | Paths whose requests the access log leaves out: `*` matches any run of characters and `?` one, for example `/static/*`. |
+| `access_log_format` | string | `"json"` | How the access log's records are written: `json` (the default), one object a line, or `combined`, the combined log format of Apache and nginx. |
 | `compress` | string | `"zstd"` | How archives are compressed: `zstd` (the default), `gzip` or `off`. |
 | `every` | string | `"daily"` | Rotate by the clock: `off`, `hourly`, `daily` (the default) or `weekly`, at the period's start in UTC. |
 | `keep` | integer | `14` | Archives kept per log. |
@@ -633,6 +717,8 @@ The same keys apply at `[overlay.NAME.routes.NAME.client_routes.NAME]`.
 | `error_pages` | table of tables, {ref}`[error_pages.STATUS] <config-daemon-error-pages-status>` |  | Error pages, by status or status:reason, each in place of the route's page for the same key. |
 | `mode` | string |  | The site mode. |
 | `rate_limits` | array of strings |  | The rate limits, in place of the route's. |
+| `request_headers` | table, {ref}`[host.NAME.request_headers] <config-daemon-host-name-request-headers>` |  | The headers removed from and set on the route's requests, in place of the route's `request_headers`. |
+| `response_headers` | table, {ref}`[host.NAME.response_headers] <config-daemon-host-name-response-headers>` |  | The headers removed from, set on and added to the route's responses, in place of the route's `response_headers`. |
 | `target` | table, {ref}`[overlay.NAME.routes.NAME.target] <config-daemon-overlay-name-routes-name-target>` |  | What serves the route instead. |
 | `traffic` | table, {ref}`[overlay.NAME.routes.NAME.traffic] <config-daemon-overlay-name-routes-name-traffic>` |  | The traffic policy: a pin sends every request to one release. |
 
@@ -706,6 +792,8 @@ The `[overlay_webhook]` table: where the daemon takes signed requests from monit
 
 The `[proxy]` table: which peers are trusted to speak for the client, and through which headers.
 
+The same keys apply at `[listener.proxy]`.
+
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `forwarded_headers` | string | `"keep"` | What becomes of the forwarding headers once applied. `keep`: The configured headers stay for the application, other forwarding headers are removed. `consume`: Every forwarding header is removed; the application sees only the resolved values. |
@@ -753,6 +841,7 @@ A route, one of the `[[route]]` entries: a path prefix of a virtual host to an a
 | `auth` | table, {ref}`[route.auth] <config-daemon-route-auth>` |  | An authorisation decision the edge asks an application for before it serves the route. |
 | `cache` | table, {ref}`[route.cache] <config-daemon-route-cache>` |  | The cache headers files are sent with. |
 | `case` | string | `"strict"` | `strict` (the default), which matches names as they are on disk, or `insensitive`. |
+| `compression` | table, {ref}`[compression] <config-daemon-compression>` |  | How the route's responses are compressed, each key replacing the host's, or else the daemon's `[compression]` value. |
 | `error_override` | table, {ref}`[error_override] <config-daemon-error-override>` |  | Replace the application's own error responses with error pages. |
 | `error_pages` | table of tables, {ref}`[error_pages.STATUS] <config-daemon-error-pages-status>` |  | Custom error pages, by status or status:reason. |
 | `fallback` | table, {ref}`[route.fallback] <config-daemon-route-fallback>` |  | What takes a request no file answers. |
@@ -761,7 +850,7 @@ A route, one of the `[[route]]` entries: a path prefix of a virtual host to an a
 | `index` | array of strings | `["index.html"]` | The files tried, in order, when a directory is requested. |
 | `internal` | boolean | `false` | Reachable only through internal redirects: a client's request for the path is answered 404. |
 | `match` | table, {ref}`[rate_limit.NAME.match] <config-daemon-rate-limit-name-match>` |  | The client classes the route takes; every request without it. Among routes with the same path, one naming the request's class comes first. |
-| `max_body_size` | string | `max_body_size` in `[limits]` | The largest request body, for example 1GB, replacing the daemon's `[limits]` value for the route. On an upload route it bounds the body as received, files included. |
+| `max_body_size` | string | the host's `max_body_size` | The largest request body, for example 1GB, replacing the host's, or else the daemon's `[limits]` value, for the route. On an upload route it bounds the body as received, files included. |
 | `max_file_size` | string |  | The largest uploaded file, for example 512MB; no limit without it. |
 | `max_files` | integer | `100` | The most files in one request. |
 | `methods` | table, {ref}`[route.methods] <config-daemon-route-methods>` |  | Methods the route refuses. |
@@ -771,8 +860,11 @@ A route, one of the `[[route]]` entries: a path prefix of a virtual host to an a
 | `precheck` | boolean | `false` | Ask the application with the request's headers alone first, and read the body only when it answers 2xx. |
 | `rate_limits` | array of strings |  | The `[rate_limit.NAME]` tables applied to the route's requests, after the host's. |
 | `redirect_slash` | boolean | `true` | Whether a directory asked for without a trailing slash is redirected to the slash form. |
+| `request_headers` | table, {ref}`[host.NAME.request_headers] <config-daemon-host-name-request-headers>` |  | Headers removed from, and set on, the route's requests before anything is asked to serve them, after the host's. |
+| `response_headers` | table, {ref}`[host.NAME.response_headers] <config-daemon-host-name-response-headers>` |  | Headers removed from, set on and added to every response to the route's requests, after the host's. |
 | `spool_quota` | string | `"10GB"` | What the application's stored uploads may hold at once when a request on the route arrives. |
 | `static` | string |  | The directory served by the edge, instead of an application. |
+| `timeouts` | table, {ref}`[host.NAME.timeouts] <config-daemon-host-name-timeouts>` |  | The timeouts of the route's requests, each replacing the host's, or else the daemon's `[limits]` value. |
 | `traffic` | table, {ref}`[route.traffic] <config-daemon-route-traffic>` |  | How requests are shared between the application's releases; without it every request goes to the serving release. |
 | `upload` | string |  | `multipart` or `raw` makes the edge receive and store uploads before the application sees the request; off without it. |
 | `upstream` | string |  | The HTTP upstream that takes the requests, instead of an application. |

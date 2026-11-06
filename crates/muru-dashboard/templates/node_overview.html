@@ -94,7 +94,7 @@
 <table>
   <tr><th>Host</th><th>Names</th><th>Listeners</th><th>TLS</th><th>Default</th></tr>
   {% for host in data.hosts %}
-  <tr><td>{{ host.name }}</td><td>{{ host.names.join(", ") }}</td><td>{{ host.listeners.join(", ") }}</td><td>{% if host.tls %}yes{% endif %}</td><td>{% if host.default %}yes{% endif %}</td></tr>
+  <tr><td>{{ host.name }}{% if !host.maintenance_since.is_empty() %} <span class="state-draining">maintenance since {{ host.maintenance_since }}</span>{% endif %}</td><td>{{ host.names.join(", ") }}</td><td>{{ host.listeners.join(", ") }}</td><td>{% if host.tls %}yes{% endif %}</td><td>{% if host.default %}yes{% endif %}</td></tr>
   {% endfor %}
 </table>
 {% endif %}

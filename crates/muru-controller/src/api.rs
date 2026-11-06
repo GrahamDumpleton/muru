@@ -225,15 +225,41 @@ impl Admin for Service {
         request: Request<pb::SetMaintenanceRequest>,
     ) -> Result<Response<pb::MaintenanceStatus>, Status> {
         let request = request.into_inner();
-        self.handle.store.app(&request.app).map_err(not_found)?;
         let (done_tx, done_rx) = oneshot::channel();
-        self.handle
-            .commands
-            .send(Command::SetMaintenance {
+
+        // Section 4.12: a virtual host, or an application.
+
+        let command = if request.host.is_empty() {
+            self.handle.store.app(&request.app).map_err(not_found)?;
+            Command::SetMaintenance {
                 app: request.app.clone(),
                 on: request.on,
                 done: done_tx,
-            })
+            }
+        } else if !request.app.is_empty() {
+            return Err(Status::invalid_argument(
+                "maintenance is for an application or a virtual host, not both",
+            ));
+        } else {
+            let hosts = self.handle.store.hosts().map_err(internal)?;
+
+            if !hosts.iter().any(|(name, _)| *name == request.host) {
+                return Err(Status::not_found(format!(
+                    "no virtual host named {}",
+                    request.host
+                )));
+            }
+
+            Command::SetHostMaintenance {
+                host: request.host.clone(),
+                on: request.on,
+                done: done_tx,
+            }
+        };
+
+        self.handle
+            .commands
+            .send(command)
             .await
             .map_err(|_| Status::unavailable(STOPPING))?;
         let since = done_rx
@@ -242,6 +268,7 @@ impl Admin for Service {
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(pb::MaintenanceStatus {
             app: request.app,
+            host: request.host,
             on: since.is_some(),
             since_unix_ms: since.unwrap_or(0),
         }))
@@ -508,7 +535,29 @@ impl Admin for Service {
         // file, the current release's when none is named.
 
         let (app, release, path) = if request.access {
-            (String::new(), String::new(), locations.access_log())
+            // Section 11.2: a virtual host may name a file of its own.
+
+            let own = if request.host.is_empty() {
+                None
+            } else {
+                self.handle
+                    .store
+                    .hosts()
+                    .map_err(internal)?
+                    .into_iter()
+                    .find(|(name, _)| *name == request.host)
+                    .ok_or_else(|| {
+                        Status::not_found(format!("no virtual host named {}", request.host))
+                    })?
+                    .1
+                    .access_log_file
+            };
+
+            let path = own.map_or_else(
+                || locations.access_log(),
+                |file| locations.logs.path.join(file),
+            );
+            (String::new(), String::new(), path)
         } else {
             if request.app.is_empty() {
                 return Err(Status::invalid_argument(
@@ -1295,10 +1344,14 @@ impl Admin for Service {
         _: Request<pb::ListHostsRequest>,
     ) -> Result<Response<pb::ListHostsResponse>, Status> {
         let hosts = self.handle.store.hosts().map_err(internal)?;
+        let maintenance = self.handle.store.host_maintenance().map_err(internal)?;
         Ok(Response::new(pb::ListHostsResponse {
             hosts: hosts
                 .into_iter()
                 .map(|(name, host)| pb::Host {
+                    maintenance: maintenance.iter().any(|(host, _)| *host == name),
+                    access_log_format: host.access_log_format.clone().unwrap_or_default(),
+                    access_log_file: host.access_log_file.clone().unwrap_or_default(),
                     name,
                     names: host.names,
                     listeners: host.listeners,
@@ -1308,6 +1361,17 @@ impl Admin for Service {
                     https_redirect: host.https_redirect,
                     use_canonical_name: host.use_canonical_name,
                     default: host.default,
+                    canonical_redirect: host.canonical_redirect,
+                    max_body_size: host.max_body_size.unwrap_or_default(),
+                    timeouts: timeouts_map(host.timeouts.as_ref()),
+                    access_log: host.access_log.unwrap_or_default(),
+                    compression: compression_note(host.compression.as_ref()),
+                    request_headers: crate::overlays::describe_request_headers(
+                        host.request_headers.as_ref(),
+                    ),
+                    response_headers: crate::overlays::describe_response_headers(
+                        host.response_headers.as_ref(),
+                    ),
                 })
                 .collect(),
         }))
@@ -1388,6 +1452,14 @@ impl Admin for Service {
                         (None, _) => String::new(),
                     },
                     max_body_size: route.max_body_size.clone().unwrap_or_default(),
+                    timeouts: timeouts_map(route.timeouts.as_ref()),
+                    compression: compression_note(route.compression.as_ref()),
+                    request_headers: crate::overlays::describe_request_headers(
+                        route.request_headers.as_ref(),
+                    ),
+                    response_headers: crate::overlays::describe_response_headers(
+                        route.response_headers.as_ref(),
+                    ),
                     host: route.host,
                     path: route.path,
                     app: route.app,
@@ -1576,10 +1648,20 @@ impl Admin for Service {
         }
 
         let (attributions, layers) = if request.effective {
-            (
-                config::make_effective(&self.handle.store, &mut document, app).map_err(internal)?,
-                config::release_layers(&self.handle.store, &document).map_err(internal)?,
-            )
+            let attributions =
+                config::make_effective(&self.handle.store, &mut document, app).map_err(internal)?;
+            let mut layers =
+                config::release_layers(&self.handle.store, &document).map_err(internal)?;
+            let limits = self
+                .handle
+                .info
+                .limits
+                .read()
+                .expect("limits poisoned")
+                .clone();
+            layers.extend(config::served_layers(&self.handle.store, &document).map_err(internal)?);
+            layers.extend(config::route_layers(&self.handle.store, &document, &limits));
+            (attributions, layers)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1595,6 +1677,35 @@ impl Admin for Service {
             attributions,
             layers,
         }))
+    }
+}
+
+/// A host's or a route's own request timeouts (section 4.6), by key, as
+/// configured.
+fn timeouts_map(timeouts: Option<&muru_config::RequestTimeouts>) -> BTreeMap<String, String> {
+    let Some(timeouts) = timeouts else {
+        return BTreeMap::new();
+    };
+
+    [
+        ("queue_timeout", &timeouts.queue_timeout),
+        ("request_deadline", &timeouts.request_deadline),
+        ("body_idle_timeout", &timeouts.body_idle_timeout),
+        ("response_idle_timeout", &timeouts.response_idle_timeout),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| Some((key.to_owned(), value.clone()?)))
+    .collect()
+}
+
+/// A host's or a route's own compression settings (section 4.17) as one
+/// word: off when it turns compression off, set when it sets anything
+/// else, and nothing without a table.
+fn compression_note(table: Option<&muru_config::Compression>) -> String {
+    match table {
+        None => String::new(),
+        Some(table) if table.enabled == Some(false) => "off".to_owned(),
+        Some(_) => "set".to_owned(),
     }
 }
 

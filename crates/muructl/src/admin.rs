@@ -4227,11 +4227,17 @@ async fn list_overlays(socket: &SocketArgs, json: bool) -> anyhow::Result<()> {
 /// The `muructl maintenance` subcommands (section 4.12).
 #[derive(Subcommand)]
 pub enum MaintenanceCommand {
-    /// Serve the application's maintenance page at the edge: 503
-    /// maintenance, except for what its exemptions let through.
+    /// Serve the maintenance page at the edge for an application, or
+    /// with --host for every route of a virtual host: 503 maintenance,
+    /// except for what its exemptions let through.
     On {
         /// The application.
-        app: String,
+        #[arg(required_unless_present = "host", conflicts_with = "host")]
+        app: Option<String>,
+
+        /// The virtual host, instead of an application.
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
 
         #[command(flatten)]
         socket: SocketArgs,
@@ -4240,10 +4246,16 @@ pub enum MaintenanceCommand {
         output: JsonArgs,
     },
 
-    /// Serve the application as usual again.
+    /// Serve the application, or with --host the virtual host, as usual
+    /// again.
     Off {
         /// The application.
-        app: String,
+        #[arg(required_unless_present = "host", conflicts_with = "host")]
+        app: Option<String>,
+
+        /// The virtual host, instead of an application.
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
 
         #[command(flatten)]
         socket: SocketArgs,
@@ -4255,28 +4267,47 @@ pub enum MaintenanceCommand {
 
 /// Turn maintenance mode on or off.
 pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
-    let (app, on, socket, json) = match command {
+    let (app, host, on, socket, json) = match command {
         MaintenanceCommand::On {
             app,
+            host,
             socket,
             output,
-        } => (app, true, socket, output.json),
+        } => (app, host, true, socket, output.json),
         MaintenanceCommand::Off {
             app,
+            host,
             socket,
             output,
-        } => (app, false, socket, output.json),
+        } => (app, host, false, socket, output.json),
     };
 
     let mut client = client::connect(&socket.socket()?).await?;
     let status = client
-        .set_maintenance(pb::SetMaintenanceRequest { app, on })
+        .set_maintenance(pb::SetMaintenanceRequest {
+            app: app.unwrap_or_default(),
+            host: host.unwrap_or_default(),
+            on,
+        })
         .await
         .map_err(explain)?
         .into_inner();
 
     if json {
         return print_answer(&status);
+    }
+
+    if !status.host.is_empty() {
+        if status.on {
+            println!(
+                "muru: host {} is in maintenance: clients get 503 maintenance until `muructl maintenance off --host {}`",
+                status.host, status.host
+            );
+        } else {
+            println!("muru: host {} serves as usual again", status.host);
+        }
+
+        return Ok(());
     }
 
     if status.on {
@@ -4405,6 +4436,56 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             });
         }
 
+        // Section 4.12: the edge serves the host's maintenance page.
+
+        if host.maintenance {
+            names.push_str(" [maintenance]");
+        }
+
+        // Sections 4.3, 4.6 and 11.2: what the host sets for its routes.
+
+        if host.canonical_redirect {
+            names.push_str(&format!(" [redirects to {}]", host.canonical));
+        }
+
+        if !host.max_body_size.is_empty() {
+            names.push_str(&format!(" [max body {}]", host.max_body_size));
+        }
+
+        if !host.timeouts.is_empty() {
+            names.push_str(&format!(" [{}]", timeouts_note(&host.timeouts)));
+        }
+
+        if !host.access_log.is_empty() {
+            names.push_str(&format!(" [access log {}]", host.access_log));
+        }
+
+        if !host.access_log_file.is_empty() || !host.access_log_format.is_empty() {
+            let own = [
+                host.access_log_format.as_str(),
+                host.access_log_file.as_str(),
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" in ");
+            names.push_str(&format!(" [access records {own}]"));
+        }
+
+        if !host.compression.is_empty() {
+            names.push_str(&format!(" [compression {}]", host.compression));
+        }
+
+        // Section 4.7: its rules for headers.
+
+        if !host.request_headers.is_empty() {
+            names.push_str(&format!(" [request headers: {}]", host.request_headers));
+        }
+
+        if !host.response_headers.is_empty() {
+            names.push_str(&format!(" [response headers: {}]", host.response_headers));
+        }
+
         println!(
             "{:<16} {:<8} {:<10} {names}",
             host.name,
@@ -4418,6 +4499,16 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// A host's or a route's own request timeouts as one note, in the order
+/// of the keys.
+fn timeouts_note(timeouts: &std::collections::BTreeMap<String, String>) -> String {
+    timeouts
+        .iter()
+        .map(|(key, value)| format!("{key} {value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The upstream subcommands (section 4.13).
@@ -4587,6 +4678,24 @@ pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
 
         if !route.max_body_size.is_empty() {
             target.push_str(&format!(" [max body {}]", route.max_body_size));
+        }
+
+        if !route.timeouts.is_empty() {
+            target.push_str(&format!(" [{}]", timeouts_note(&route.timeouts)));
+        }
+
+        if !route.compression.is_empty() {
+            target.push_str(&format!(" [compression {}]", route.compression));
+        }
+
+        // Section 4.7: its rules for headers.
+
+        if !route.request_headers.is_empty() {
+            target.push_str(&format!(" [request headers: {}]", route.request_headers));
+        }
+
+        if !route.response_headers.is_empty() {
+            target.push_str(&format!(" [response headers: {}]", route.response_headers));
         }
 
         if !route.upload.is_empty() {
@@ -5300,7 +5409,7 @@ pub async fn config_show(
     }
 
     if !export.layers.is_empty() {
-        println!("# The releases' settings, and the layer each came from:");
+        println!("# The releases' settings and the routes' limits, and the layer each came from:");
 
         for line in &export.layers {
             println!("#   {line}");
@@ -6010,6 +6119,11 @@ pub struct LogsArgs {
     #[arg(long)]
     access: bool,
 
+    /// With --access, the records of one virtual host: from the file it
+    /// names for them, or else those in the access log that name it.
+    #[arg(long, value_name = "HOST", requires = "access")]
+    host: Option<String>,
+
     /// Print each line as JSON: a release's output as the admin API's
     /// log lines, access log records as the JSON lines they are kept as.
     #[arg(long)]
@@ -6053,6 +6167,35 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
     };
 
     let mut client = client::connect(&args.socket.socket()?).await?;
+
+    // Section 11.2: a virtual host's records are in the file it names
+    // for them, or else among the access log's, where each JSON record
+    // names its virtual host.
+
+    let mut own_file = false;
+
+    if let Some(name) = &args.host {
+        let hosts = client
+            .list_hosts(pb::ListHostsRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner()
+            .hosts;
+        let host = hosts
+            .iter()
+            .find(|host| host.name == *name)
+            .ok_or_else(|| anyhow::anyhow!("no virtual host named {name}"))?;
+        own_file = !host.access_log_file.is_empty();
+
+        if !own_file && host.access_log_format == "combined" {
+            anyhow::bail!(
+                "host {name} writes its records to access.log in the combined format, which \
+                 does not name the host; give the host an access_log_file to keep them apart"
+            );
+        }
+    }
+
+    let named = args.host.as_deref().filter(|_| !own_file);
     let mut stream = client
         .tail_logs(pb::TailLogsRequest {
             app,
@@ -6060,6 +6203,7 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
             follow: args.follow,
             lines: args.lines,
             access: args.access,
+            host: args.host.clone().filter(|_| own_file).unwrap_or_default(),
         })
         .await
         .map_err(explain)?
@@ -6070,6 +6214,17 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
 
     while let Some(line) = stream.next().await {
         let line = line.map_err(explain)?;
+
+        if let Some(name) = named {
+            let of_host = serde_json::from_str::<serde_json::Value>(&line.line)
+                .ok()
+                .and_then(|record| Some(record.get("virtual_host")?.as_str()? == name))
+                .unwrap_or(false);
+
+            if !of_host {
+                continue;
+            }
+        }
 
         match (args.access, args.json) {
             (true, false) => println!("{}", format_access_line(&line.line, !args.no_timestamps)),

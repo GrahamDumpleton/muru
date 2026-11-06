@@ -38,6 +38,12 @@ pub struct NodeSettings {
     /// Section 6.13: the listeners that limit cleartext HTTP/2 to some
     /// clients, with those clients.
     pub h2c: Vec<pb::H2cPolicy>,
+    /// Section 4.18: the listeners with limits of their own, with those
+    /// limits.
+    pub listener_limits: Vec<pb::ListenerLimits>,
+    /// Section 4.7: the listeners with proxy settings of their own, with
+    /// those settings.
+    pub listener_proxies: Vec<pb::ListenerProxy>,
     /// Where the Prometheus exposition is served, or nowhere.
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard and JSON gateway are served, or nowhere.
@@ -153,6 +159,8 @@ impl NodeSettings {
             listeners,
             limits: limits_from(document)?,
             h2c: h2c_from(document)?,
+            listener_limits: listener_limits_from(document)?,
+            listener_proxies: listener_proxies_from(document)?,
             metrics: metrics_from(document, overrides.metrics)?,
             dashboard: dashboard_from(document, overrides.dashboard)?,
             dashboard_actions: document
@@ -323,6 +331,109 @@ fn h2c_from(document: &muru_config::Document) -> Result<Vec<pb::H2cPolicy>, Stri
     Ok(policies)
 }
 
+/// Section 4.7: each listener's own `proxy` table as the snapshot carries
+/// it, checked as the `[proxy]` table is.
+fn listener_proxies_from(
+    document: &muru_config::Document,
+) -> Result<Vec<pb::ListenerProxy>, String> {
+    let mut all = Vec::new();
+
+    for listener in &document.listener {
+        let Some(table) = &listener.proxy else {
+            continue;
+        };
+
+        let proxy = crate::daemon::proxy_message(table);
+        muru_edge::proxy::Trust::from_snapshot(&proxy)
+            .map_err(|error| format!("listener {}: proxy: {error}", listener.address))?;
+        all.push(pb::ListenerProxy {
+            listener: listener.address.clone(),
+            proxy: Some(proxy),
+        });
+    }
+
+    Ok(all)
+}
+
+/// Section 4.18: each listener's own `limits` table as the snapshot
+/// carries it, checked as the `[limits]` table's same keys are.
+fn listener_limits_from(
+    document: &muru_config::Document,
+) -> Result<Vec<pb::ListenerLimits>, String> {
+    let mut all = Vec::new();
+
+    for listener in &document.listener {
+        let Some(table) = &listener.limits else {
+            continue;
+        };
+
+        let address = &listener.address;
+        let label = |key: &str| format!("listener {address}: limits.{key}");
+        let mut limits = muru_edge::ListenerLimits::default();
+
+        if let Some(size) = &table.max_header_bytes {
+            let bytes = muru_config::parse_size(size)
+                .map_err(|error| format!("{}: {error}", label("max_header_bytes")))?;
+            limits.max_header_bytes =
+                Some(usize::try_from(bytes).map_err(|_| {
+                    format!("{} = {size:?} is too large", label("max_header_bytes"))
+                })?);
+        }
+
+        limits.max_headers = table.max_headers;
+
+        if table.max_connections == Some(0) {
+            return Err(format!("{} must be at least 1", label("max_connections")));
+        }
+
+        limits.max_connections = table.max_connections;
+        limits.max_connections_per_client = table.max_connections_per_client;
+        limits.max_requests_per_connection = table.max_requests_per_connection;
+        limits.http2_max_concurrent_streams = table
+            .http2
+            .as_ref()
+            .and_then(|http2| http2.max_concurrent_streams);
+
+        if limits.http2_max_concurrent_streams == Some(0) {
+            return Err(format!(
+                "{} must be at least 1",
+                label("http2.max_concurrent_streams")
+            ));
+        }
+
+        for (key, value, field) in [
+            (
+                "header_read_timeout",
+                &table.header_read_timeout,
+                &mut limits.header_read_timeout,
+            ),
+            (
+                "keep_alive_timeout",
+                &table.keep_alive_timeout,
+                &mut limits.keep_alive_timeout,
+            ),
+            (
+                "keep_alive_timeout_proxy",
+                &table.keep_alive_timeout_proxy,
+                &mut limits.keep_alive_timeout_proxy,
+            ),
+        ] {
+            if let Some(text) = value {
+                *field = Some(
+                    muru_config::parse_duration(text)
+                        .map_err(|error| format!("{}: {error}", label(key)))?,
+                );
+            }
+        }
+
+        if !limits.is_empty() {
+            all.push(limits.to_message(address));
+        }
+    }
+
+    Ok(all)
+}
+
 /// Which records the access log writes, from the [logs] table, with the
 /// defaults for what it leaves out.
 fn access_log_from(document: &muru_config::Document) -> Result<muru_edge::access::Filter, String> {
@@ -344,6 +455,17 @@ fn access_log_from(document: &muru_config::Document) -> Result<muru_edge::access
 
     if let Some(slow) = &logs.slow {
         filter.slow = muru_config::parse_duration(slow)?;
+    }
+
+    muru_config::check_access_log_format(logs.access_log_format.as_deref())
+        .map_err(|error| format!("[logs] {error}"))?;
+
+    if let Some(format) = logs
+        .access_log_format
+        .as_deref()
+        .and_then(muru_edge::access::Format::parse)
+    {
+        filter.format = format;
     }
 
     filter.exclude = logs.access_log_exclude.clone();
@@ -473,9 +595,103 @@ mod tests {
     }
 
     #[test]
+    fn a_listener_has_limits_of_its_own_over_the_nodes() {
+        let settings = settings(
+            "[[listener]]\naddress = '0.0.0.0:80'\n\
+             [[listener]]\naddress = '10.0.0.1:8080'\n\
+             [listener.limits]\nmax_connections = 100\nmax_connections_per_client = 0\n\
+             keep_alive_timeout = '90s'\nmax_header_bytes = '16KB'\nhttp2 = { max_concurrent_streams = 32 }\n\
+             [[listener]]\naddress = '0.0.0.0:443'\ntls = true\nlimits = {}\n\
+             [limits]\nmax_connections = 5000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            settings.listener_limits.len(),
+            1,
+            "an empty table says nothing"
+        );
+        let own = muru_edge::ListenerLimits::from_message(&settings.listener_limits[0]);
+        assert_eq!(settings.listener_limits[0].listener, "10.0.0.1:8080");
+        assert_eq!(own.max_connections, Some(100));
+        assert_eq!(
+            own.max_connections_per_client,
+            Some(0),
+            "0 turns the share off"
+        );
+        assert_eq!(own.max_requests_per_connection, None);
+
+        let in_force = own.over(&settings.limits);
+        assert_eq!(in_force.max_connections, 100);
+        assert_eq!(in_force.max_connections_per_client, 0);
+        assert_eq!(in_force.keep_alive_timeout.as_secs(), 90);
+        assert_eq!(in_force.max_header_bytes, 16 * 1024);
+        assert_eq!(in_force.http2_max_concurrent_streams, 32);
+        assert_eq!(in_force.max_headers, settings.limits.max_headers);
+        assert_eq!(in_force.max_body_size, settings.limits.max_body_size);
+        assert_eq!(settings.limits.max_connections, 5000);
+
+        let refused = |table: &str| {
+            super::tests::settings(&format!(
+                "[[listener]]\naddress = '0.0.0.0:80'\n[listener.limits]\n{table}\n"
+            ))
+            .unwrap_err()
+        };
+        assert_eq!(
+            refused("max_connections = 0"),
+            "listener 0.0.0.0:80: limits.max_connections must be at least 1"
+        );
+        assert!(
+            refused("keep_alive_timeout = 'long'")
+                .starts_with("listener 0.0.0.0:80: limits.keep_alive_timeout:")
+        );
+        assert!(
+            refused("http2 = { max_concurrent_streams = 0 }")
+                .ends_with("limits.http2.max_concurrent_streams must be at least 1")
+        );
+        assert!(
+            muru_config::Document::parse(
+                "[[listener]]\naddress = '0.0.0.0:80'\n[listener.limits]\nmax_body_size = '1MB'\n"
+            )
+            .is_err(),
+            "a limit on one request is not a listener's to set"
+        );
+    }
+
+    #[test]
+    fn a_listener_has_proxy_settings_of_its_own_in_place_of_the_nodes() {
+        let settings = settings(
+            "[proxy]\ntrusted = ['loopback']\n\
+             [[listener]]\naddress = '0.0.0.0:80'\nproxy = {}\n\
+             [[listener]]\naddress = '10.0.0.1:8080'\n\
+             [listener.proxy]\ntrusted = ['10.0.0.0/8']\nheaders = ['x-forwarded-for']\nrecursive = false\n\
+             [[listener]]\naddress = '0.0.0.0:443'\ntls = true\n",
+        )
+        .unwrap();
+        assert_eq!(settings.listener_proxies.len(), 2);
+        let public = &settings.listener_proxies[0];
+        assert_eq!(public.listener, "0.0.0.0:80");
+        assert!(
+            public.proxy.as_ref().unwrap().trusted.is_empty(),
+            "an empty table trusts nothing"
+        );
+        let internal = settings.listener_proxies[1].proxy.as_ref().unwrap();
+        assert_eq!(internal.trusted, ["10.0.0.0/8"]);
+        assert_eq!(internal.headers, ["x-forwarded-for"]);
+        assert!(!internal.recursive);
+        assert_eq!(settings.proxy.as_ref().unwrap().trusted, ["loopback"]);
+
+        let error = super::tests::settings(
+            "[[listener]]\naddress = '0.0.0.0:80'\nproxy = { trusted = ['not an address'] }\n",
+        )
+        .unwrap_err();
+        assert!(error.starts_with("listener 0.0.0.0:80: proxy:"), "{error}");
+    }
+
+    #[test]
     fn the_logs_table_says_which_records_the_access_log_writes() {
         let settings = settings(
-            "[logs]\naccess_log = 'errors'\nslow = '500ms'\naccess_log_exclude = ['/healthz']\n",
+            "[logs]\naccess_log = 'errors'\nslow = '500ms'\naccess_log_exclude = ['/healthz']\n\
+             access_log_format = 'combined'\n",
         )
         .unwrap();
         assert_eq!(
@@ -484,7 +700,12 @@ mod tests {
                 mode: muru_edge::access::Mode::Errors,
                 slow: std::time::Duration::from_millis(500),
                 exclude: vec!["/healthz".to_owned()],
+                format: muru_edge::access::Format::Combined,
             }
+        );
+        assert_eq!(
+            super::tests::settings("[logs]\naccess_log_format = 'common'\n").unwrap_err(),
+            "[logs] access_log_format = \"common\" is not json or combined"
         );
     }
 

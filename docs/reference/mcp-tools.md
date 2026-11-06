@@ -34,7 +34,7 @@ ones it names.
 | `run_command` | changes | `muructl command run`, the output returned as an array of lines (the last 500) with `exit_code` and `message`, as a tool error when the exit status is not 0 | `target`, `name`, `inputs` (an object), `secret_inputs` (an object of STORE/KEY references) |
 | `restart` | changes | `muructl restart` | `target`, `worker`, `all`, `force` |
 | `overlay` | changes | `muructl overlay activate`, `end` or `promote` | `action`, `name`, `for` |
-| `maintenance` | changes | `muructl maintenance on` or `off` | `app`, `on` |
+| `maintenance` | changes | `muructl maintenance on` or `off` | `app` or `host`, `on` |
 | `apply` | changes | `muructl apply` | `file`, `dry_run` |
 | `log_level` | changes | `muructl logging level` | `target`, `levels`, `for`, `reset` |
 | `access_log` | changes | `muructl logging access` | `mode`, `app`, `paths`, `for`, `reset` |

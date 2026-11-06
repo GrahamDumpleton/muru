@@ -164,6 +164,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     )
     .await?;
     let pools = edge.pools();
+    let routed = Arc::clone(&pools);
     let listeners = edge.listeners();
     let connections = edge.connections();
     let limits = edge.limits();
@@ -251,8 +252,13 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     // Whatever waits in a listener's backlog is accepted by the daemon's
     // next edge, which holds the same sockets.
 
+    // The grace is the longest request deadline in force, a host's or a
+    // route's own included (section 4.6).
+
     if outcome.is_ok() {
-        let grace = limits.current().request_deadline;
+        let grace = routed
+            .current()
+            .longest_deadline(limits.current().request_deadline);
         muru_common::muru_eprintln!("edge draining (pid {})", std::process::id());
 
         if !drainer.drain(grace).await {
@@ -378,7 +384,21 @@ impl EdgeControl for Control {
         // connections accepted from now on.
 
         if let Some(limits) = &snapshot.limits {
-            self.limits.apply(muru_edge::Limits::from_message(limits));
+            // Section 4.18: a listener's own are laid over them, by its
+            // address.
+
+            let listeners = snapshot
+                .listener_limits
+                .iter()
+                .filter_map(|own| {
+                    Some((
+                        own.listener.parse().ok()?,
+                        muru_edge::ListenerLimits::from_message(own),
+                    ))
+                })
+                .collect();
+            self.limits
+                .apply(muru_edge::Limits::from_message(limits), &listeners);
         }
 
         // Section 11.2: so do the access log's filters, for the records

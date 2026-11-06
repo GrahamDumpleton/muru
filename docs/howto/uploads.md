@@ -120,7 +120,7 @@ is logged as part of it rather than as a line of its own.
 
 | Key | Where | Default | Answer when exceeded |
 | --- | --- | --- | --- |
-| `max_body_size` | route | the daemon's `[limits]` value, 10MB | 413 `body_too_large` |
+| `max_body_size` | route | the release's, mount's or group's, else the host's, else the daemon's `[limits]` value, 10MB | 413 `body_too_large` |
 | `max_file_size` | route | no limit | 413 `upload_too_large` |
 | `max_files` | route | 100, at most 500 | 413 `too_many_files` |
 | `spool_quota` | route | 10GB | 507 `upload_spool_full` |

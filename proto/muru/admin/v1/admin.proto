@@ -455,14 +455,16 @@ message DashboardLoginLink {
 }
 
 message SetMaintenanceRequest {
-  string app = 1;
+  string app = 1;                   // the application, or empty with host
   bool on = 2;
+  string host = 3;                  // the virtual host instead of an application
 }
 
 message MaintenanceStatus {
-  string app = 1;
+  string app = 1;                   // the application, or empty for a virtual host
   bool on = 2;
   uint64 since_unix_ms = 3;         // when it was turned on, 0 when off
+  string host = 4;                  // the virtual host, or empty for an application
 }
 
 message OverrideAccessLogRequest {
@@ -752,7 +754,7 @@ message ExportConfigResponse {
   uint64 time_unix_ms = 4;
   uint64 state_version = 5;         // the last event sequence number
   repeated string attributions = 6; // with effective: what each active overlay sets that is in force
-  repeated string layers = 7;       // with effective: each release setting and the layer it came from (section 3.3)
+  repeated string layers = 7;       // with effective: each release setting and each route's limits, with the layer it came from (section 3.3)
 }
 
 message ListHostsRequest {}
@@ -771,6 +773,16 @@ message Host {
   bool https_redirect = 7;
   bool use_canonical_name = 8;
   bool default = 9;
+  bool canonical_redirect = 10;       // other names are redirected to the canonical name
+  string max_body_size = 11;          // the host's own body limit, as configured (section 4.6)
+  map<string, string> timeouts = 12;  // the host's own request timeouts, as configured
+  string access_log = 13;             // the host's own access log choice (section 11.2): on, errors or off
+  string compression = 14;            // "off" when the host turns compression off, "set" when it has other settings of its own (section 4.17)
+  string request_headers = 15;        // what the host removes from and sets on requests (section 4.7), as one phrase
+  string response_headers = 16;       // what the host removes from, sets on and adds to responses, as one phrase
+  bool maintenance = 17;              // the edge serves the maintenance page for the host (section 4.12)
+  string access_log_format = 18;      // how the host's access records are written, when it says: json or combined
+  string access_log_file = 19;        // the file in the log directory that takes the host's access records, when it names one
 }
 
 message ListRoutesRequest {}
@@ -797,6 +809,10 @@ message Route {
   string max_body_size = 15;        // the route's own body limit, as configured (section 4.6)
   repeated string client_classes = 16; // the client classes the route takes (section 4.14); every request when empty
   map<string, string> traffic_classes = 17; // a client class to the release, or upstream:NAME, that takes its requests
+  map<string, string> timeouts = 18; // the route's own request timeouts, as configured (section 4.6)
+  string compression = 19;          // "off" when the route turns compression off, "set" when it has other settings of its own (section 4.17)
+  string request_headers = 20;      // what the route removes from and sets on requests (section 4.7), as one phrase
+  string response_headers = 21;     // what the route removes from, sets on and adds to responses, as one phrase
 }
 
 message ListUpstreamsRequest {}
@@ -829,6 +845,7 @@ message TailLogsRequest {
   bool follow = 3;                  // keep streaming as lines arrive
   uint32 lines = 4;                 // how many recent lines first; 0 for none
   bool access = 5;                  // the access log instead of a release
+  string host = 6;                  // with access: the file a virtual host names for its own records, when it names one
 }
 
 message LogLine {

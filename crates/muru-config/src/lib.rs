@@ -429,6 +429,11 @@ pub struct Mount {
     /// 6.14); none when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<Handoff>,
+    /// The largest body of a request the mount serves, for example 200MB
+    /// (section 4.6), which the edge enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the worker group's, else the release's"))]
+    pub max_body_size: Option<String>,
 }
 
 /// Check a name against section 3.2: lowercase letters, digits and
@@ -706,6 +711,11 @@ pub struct Group {
     /// the release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<Timeouts>,
+    /// The largest body of a request the group serves, for example 200MB
+    /// (section 4.6), which the edge enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
+    pub max_body_size: Option<String>,
     /// The group's own memory policy (section 7.7), each key the
     /// release's when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -898,9 +908,16 @@ pub struct Release {
     /// example 1h, with jitter; off when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lifetime: Option<String>,
-    /// The timeouts the host enforces on its workers (section 7.6).
+    /// The timeouts the host enforces on its workers (section 7.6), and
+    /// those of a request the release serves, which the edge enforces
+    /// (section 4.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<Timeouts>,
+    /// The largest body of a request the release serves, for example
+    /// 50MB (section 4.6), which the edge enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the host's, else `max_body_size` in `[limits]`"))]
+    pub max_body_size: Option<String>,
     /// The memory policy for the workers (section 7.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Memory>,
@@ -1165,6 +1182,46 @@ pub struct Logs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "1s"))]
     pub slow: Option<String>,
+    /// How the access log's records are written: `json` (the default),
+    /// one object a line, or `combined`, the combined log format of
+    /// Apache and nginx.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "json"))]
+    pub access_log_format: Option<String>,
+}
+
+/// Check an `access_log_format`: `json` or `combined`.
+pub fn check_access_log_format(format: Option<&str>) -> Result<(), String> {
+    match format {
+        None | Some("json" | "combined") => Ok(()),
+        Some(other) => Err(format!(
+            "access_log_format = {other:?} is not json or combined"
+        )),
+    }
+}
+
+/// Check a virtual host's `access_log_file`: the name of a file in the
+/// daemon's log directory, and not one of the daemon's own.
+pub fn check_access_log_file(name: &str) -> Result<(), String> {
+    let plain = !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte));
+
+    if !plain {
+        return Err(format!(
+            "access_log_file = {name:?} is not a file name of letters, digits, dots, hyphens and underscores"
+        ));
+    }
+
+    if ["access.log", "edge.log", "daemon.log"].contains(&name) {
+        return Err(format!(
+            "access_log_file = {name:?} is a file the daemon writes itself"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Check the access log keys a table shares (section 11.2): the mode is
@@ -1326,8 +1383,9 @@ pub struct SecretStore {
 }
 
 /// The `[timeouts]` table of a release or a `[tool.muru]` table (section
-/// 7.6): the timeouts the host enforces on its workers. The edge's own
-/// timeouts are the daemon's `[limits]`.
+/// 7.6): the timeouts the host enforces on its workers, and the four the
+/// edge enforces on a request the release serves (section 4.6), which
+/// are otherwise the virtual host's or the daemon's `[limits]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Timeouts {
@@ -1366,6 +1424,49 @@ pub struct Timeouts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "30s"))]
     pub gil_stall_timeout: Option<String>,
+    /// Time a request served here may wait for a worker, which the edge
+    /// enforces (section 4.6); the virtual host's when absent, or else
+    /// the daemon's `[limits]` value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the host's, else `queue_timeout` in `[limits]`"))]
+    pub queue_timeout: Option<String>,
+    /// Time a request served here may take to produce its response head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the host's, else `request_deadline` in `[limits]`"))]
+    pub request_deadline: Option<String>,
+    /// Time a client may pause while sending a body to what is served
+    /// here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the host's, else `body_idle_timeout` in `[limits]`"))]
+    pub body_idle_timeout: Option<String>,
+    /// Time a worker here may pause mid-response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the host's, else `response_idle_timeout` in `[limits]`"))]
+    pub response_idle_timeout: Option<String>,
+}
+
+impl Timeouts {
+    /// The timeouts of one request the table sets (section 4.6), which
+    /// the edge enforces, apart from those the host does.
+    pub fn request(&self) -> RequestTimeouts {
+        RequestTimeouts {
+            queue_timeout: self.queue_timeout.clone(),
+            request_deadline: self.request_deadline.clone(),
+            body_idle_timeout: self.body_idle_timeout.clone(),
+            response_idle_timeout: self.response_idle_timeout.clone(),
+        }
+    }
+}
+
+/// Check and parse the limits a release, a worker group or a mount sets
+/// on the requests it serves (section 4.6): its `max_body_size`, and the
+/// request timeouts of its `timeouts` table.
+pub fn check_served_limits(
+    max_body_size: Option<&str>,
+    timeouts: Option<&Timeouts>,
+) -> Result<RequestLimitSettings, String> {
+    let request = timeouts.map(Timeouts::request);
+    check_request_limits(max_body_size, request.as_ref())
 }
 
 /// The `[logging.python]` table (section 11.4): what loggers without
@@ -1558,7 +1659,8 @@ pub struct Http2Limits {
 }
 
 /// The `[compression]` table (section 4.17): how the edge compresses
-/// responses. Every key is optional.
+/// responses. Every key is optional. A virtual host and a route take the
+/// same table, where a key left out is the level beneath's.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Compression {
@@ -1606,6 +1708,61 @@ pub struct Listener {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "every client"))]
     pub h2c: Option<Vec<String>>,
+    /// The listener's own limits on its connections and on reading a
+    /// request's head (sections 4.6 and 4.18), each replacing the
+    /// `[limits]` value for the connections it accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ListenerLimits>,
+    /// The listener's own trusted proxies and header types (section
+    /// 4.7), in place of the whole `[proxy]` table for the connections
+    /// it accepts. An empty table trusts nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<Proxy>,
+}
+
+/// A listener's `limits` table (sections 4.6 and 4.18): the keys of
+/// `[limits]` that bound a connection and the reading of a request's
+/// head, each replacing the node's for the connections the listener
+/// accepts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerLimits {
+    /// Largest request head, for example 64KB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_header_bytes` in `[limits]`"))]
+    pub max_header_bytes: Option<String>,
+    /// Most headers in a request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_headers` in `[limits]`"))]
+    pub max_headers: Option<usize>,
+    /// Time allowed for a complete request head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`header_read_timeout` in `[limits]`"))]
+    pub header_read_timeout: Option<String>,
+    /// Open connections on the listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_connections` in `[limits]`"))]
+    pub max_connections: Option<usize>,
+    /// Open connections per client address; 0 disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_connections_per_client` in `[limits]`"))]
+    pub max_connections_per_client: Option<usize>,
+    /// Idle time before a keep-alive connection is closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`keep_alive_timeout` in `[limits]`"))]
+    pub keep_alive_timeout: Option<String>,
+    /// The same for connections from trusted proxies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`keep_alive_timeout_proxy` in `[limits]`"))]
+    pub keep_alive_timeout_proxy: Option<String>,
+    /// Requests served on one connection before it is closed; 0 for no
+    /// limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_requests_per_connection` in `[limits]`"))]
+    pub max_requests_per_connection: Option<u64>,
+    /// HTTP/2 settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http2: Option<Http2Limits>,
 }
 
 /// How forwarding headers are left after they have been applied.
@@ -1710,6 +1867,368 @@ pub struct Host {
     /// host (section 4.15), before a route's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rate_limits: Vec<String>,
+    /// Redirect requests for the host's other names to the canonical
+    /// name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
+    pub canonical_redirect: bool,
+    /// The largest request body for the host's routes, for example 1MB,
+    /// replacing the daemon's `[limits]` value (section 4.6). A route's
+    /// own replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_body_size` in `[limits]`"))]
+    pub max_body_size: Option<String>,
+    /// The timeouts of a request for the host's routes, each replacing
+    /// the daemon's `[limits]` value (section 4.6). A route's own
+    /// replace them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<RequestTimeouts>,
+    /// Which of the host's requests the access log writes: `on`,
+    /// `errors` or `off`, replacing the `[logs]` table's (section 11.2).
+    /// An application's own replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`access_log` in `[logs]`"))]
+    pub access_log: Option<String>,
+    /// How slow a request is to be written under `access_log = "errors"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`slow` in `[logs]`"))]
+    pub slow: Option<String>,
+    /// Paths whose requests the access log leaves out, besides those the
+    /// `[logs]` table leaves out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_log_exclude: Vec<String>,
+    /// How the host's records are written: `json` or `combined`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`access_log_format` in `[logs]`"))]
+    pub access_log_format: Option<String>,
+    /// A file in the daemon's log directory that takes the host's
+    /// records in place of `access.log`, for example `shop.log`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_log_file: Option<String>,
+    /// How responses to the host's requests are compressed (section
+    /// 4.17), each key replacing the daemon's `[compression]` value. A
+    /// route's own replace them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Compression>,
+    /// Headers removed from, and set on, the host's requests before
+    /// anything is asked to serve them (section 4.7). A route's own are
+    /// applied after them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<RequestHeaders>,
+    /// Headers removed from, set on and added to every response to the
+    /// host's requests (section 4.7). A route's own are applied after
+    /// them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<ResponseHeaders>,
+    /// What the host's maintenance mode lets through (section 4.12),
+    /// while `muructl maintenance on --host` has it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<Maintenance>,
+}
+
+/// What a virtual host or a route does to the headers of a request
+/// before anything is asked to serve it (section 4.7): the
+/// `request_headers` table. The names are removed first, then the
+/// headers set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestHeaders {
+    /// Headers removed from the request, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<String>,
+    /// Headers set on the request, by name, each replacing any the
+    /// client sent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub set: BTreeMap<String, String>,
+}
+
+/// What a virtual host or a route does to the headers of a response
+/// (section 4.7): the `response_headers` table. The names are removed
+/// first, then the headers set, then those added.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseHeaders {
+    /// Headers removed from the response, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<String>,
+    /// Headers set on the response, by name, each replacing any the
+    /// response has.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub set: BTreeMap<String, String>,
+    /// Headers added to the response beside any it has, by name: a value,
+    /// or a list of values for a header sent more than once.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub add: BTreeMap<String, HeaderValues>,
+}
+
+/// One value of a header, or several for a header sent more than once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum HeaderValues {
+    /// One value.
+    One(String),
+    /// A value for each time the header is sent.
+    Many(Vec<String>),
+}
+
+impl HeaderValues {
+    /// The values, in order.
+    pub fn values(&self) -> &[String] {
+        match self {
+            Self::One(value) => std::slice::from_ref(value),
+            Self::Many(values) => values,
+        }
+    }
+}
+
+/// The headers a `request_headers` or `response_headers` table may not
+/// name: those that describe one connection, the ones the edge reads the
+/// message's framing and host from, and Muru's own.
+const PROTECTED_HEADERS: [&str; 11] = [
+    "connection",
+    "content-length",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Check a header name a table names: a token, and not one of the
+/// protected headers.
+fn check_header_name(key: &str, name: &str) -> Result<(), String> {
+    let token = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte));
+
+    if !token {
+        return Err(format!("{key}: {name:?} is not a header name"));
+    }
+
+    let lower = name.to_ascii_lowercase();
+
+    if PROTECTED_HEADERS.contains(&lower.as_str()) || lower.starts_with("x-muru-") {
+        return Err(format!(
+            "{key}: {name} cannot be set or removed; the edge handles it"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check a header value a table gives: printable ASCII, with no space at
+/// either end.
+fn check_header_value(key: &str, name: &str, value: &str) -> Result<(), String> {
+    let printable = value
+        .bytes()
+        .all(|byte| byte == b'\t' || (b' '..=b'~').contains(&byte));
+
+    if !printable || value.trim() != value {
+        return Err(format!(
+            "{key}.{name}: {value:?} is not a header value: printable ASCII with no space at either end"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check the names of one part of a header table, and that none is
+/// given twice in different case.
+fn check_header_names<'a>(
+    key: &str,
+    names: impl Iterator<Item = &'a String>,
+) -> Result<(), String> {
+    let mut seen: Vec<String> = Vec::new();
+
+    for name in names {
+        check_header_name(key, name)?;
+        let lower = name.to_ascii_lowercase();
+
+        if seen.contains(&lower) {
+            return Err(format!("{key}: {name} is named twice"));
+        }
+
+        seen.push(lower);
+    }
+
+    Ok(())
+}
+
+/// Check a `request_headers` table (section 4.7). A header set has no
+/// underscore in its name, since the edge passes none on.
+pub fn check_request_headers(table: &RequestHeaders) -> Result<(), String> {
+    check_header_names("request_headers.remove", table.remove.iter())?;
+    check_header_names("request_headers.set", table.set.keys())?;
+
+    for (name, value) in &table.set {
+        if name.contains('_') {
+            return Err(format!(
+                "request_headers.set: {name} has an underscore; the edge passes no such header on"
+            ));
+        }
+
+        check_header_value("request_headers.set", name, value)?;
+    }
+
+    Ok(())
+}
+
+/// Check a `response_headers` table (section 4.7).
+pub fn check_response_headers(table: &ResponseHeaders) -> Result<(), String> {
+    check_header_names("response_headers.remove", table.remove.iter())?;
+    check_header_names("response_headers.set", table.set.keys())?;
+    check_header_names("response_headers.add", table.add.keys())?;
+
+    for (name, value) in &table.set {
+        check_header_value("response_headers.set", name, value)?;
+    }
+
+    for (name, values) in &table.add {
+        if values.values().is_empty() {
+            return Err(format!("response_headers.add.{name} gives no value"));
+        }
+
+        for value in values.values() {
+            check_header_value("response_headers.add", name, value)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Check the header tables of a virtual host, a route or an overlay's
+/// change to a route.
+pub fn check_header_tables(
+    request: Option<&RequestHeaders>,
+    response: Option<&ResponseHeaders>,
+) -> Result<(), String> {
+    if let Some(table) = request {
+        check_request_headers(table)?;
+    }
+
+    if let Some(table) = response {
+        check_response_headers(table)?;
+    }
+
+    Ok(())
+}
+
+/// The timeouts of one request (section 4.6), the `timeouts` table of a
+/// virtual host or a route. Each key replaces the same key of the level
+/// beneath, down to the daemon's `[limits]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestTimeouts {
+    /// Time a request may wait for a worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`queue_timeout` in `[limits]`"))]
+    pub queue_timeout: Option<String>,
+    /// Time a request may take to produce its response head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`request_deadline` in `[limits]`"))]
+    pub request_deadline: Option<String>,
+    /// Time a client may pause while sending a body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`body_idle_timeout` in `[limits]`"))]
+    pub body_idle_timeout: Option<String>,
+    /// Time a worker may pause mid-response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`response_idle_timeout` in `[limits]`"))]
+    pub response_idle_timeout: Option<String>,
+}
+
+/// The limits one level sets on a request (section 4.6), as numbers:
+/// the body size in bytes and the timeouts. Each is none where the level
+/// says nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestLimitSettings {
+    /// The largest request body, in bytes.
+    pub max_body_size: Option<u64>,
+    /// Time a request may wait for a worker.
+    pub queue_timeout: Option<Duration>,
+    /// Time a request may take to produce its response head.
+    pub request_deadline: Option<Duration>,
+    /// Time a client may pause while sending a body.
+    pub body_idle_timeout: Option<Duration>,
+    /// Time a worker may pause mid-response.
+    pub response_idle_timeout: Option<Duration>,
+}
+
+impl RequestLimitSettings {
+    /// Whether the level sets nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Check and parse the limits a level sets on a request: `max_body_size`
+/// of at least a byte, and timeouts of more than nothing.
+pub fn check_request_limits(
+    max_body_size: Option<&str>,
+    timeouts: Option<&RequestTimeouts>,
+) -> Result<RequestLimitSettings, String> {
+    let mut settings = RequestLimitSettings::default();
+
+    if let Some(size) = max_body_size {
+        let bytes = parse_size(size).map_err(|error| format!("max_body_size: {error}"))?;
+
+        if bytes == 0 {
+            return Err(
+                "max_body_size must be at least 1 byte; leave it out for the max_body_size of [limits]"
+                    .to_owned(),
+            );
+        }
+
+        settings.max_body_size = Some(bytes);
+    }
+
+    let Some(timeouts) = timeouts else {
+        return Ok(settings);
+    };
+
+    for (key, value, field) in [
+        (
+            "queue_timeout",
+            &timeouts.queue_timeout,
+            &mut settings.queue_timeout,
+        ),
+        (
+            "request_deadline",
+            &timeouts.request_deadline,
+            &mut settings.request_deadline,
+        ),
+        (
+            "body_idle_timeout",
+            &timeouts.body_idle_timeout,
+            &mut settings.body_idle_timeout,
+        ),
+        (
+            "response_idle_timeout",
+            &timeouts.response_idle_timeout,
+            &mut settings.response_idle_timeout,
+        ),
+    ] {
+        let Some(text) = value else {
+            continue;
+        };
+
+        let duration = parse_duration(text).map_err(|error| format!("timeouts.{key}: {error}"))?;
+
+        if duration.is_zero() {
+            return Err(format!(
+                "timeouts.{key} must be more than 0; leave it out for the {key} of [limits]"
+            ));
+        }
+
+        *field = Some(duration);
+    }
+
+    Ok(settings)
 }
 
 /// A virtual host's certificate chain and private key, as PEM files.
@@ -1802,12 +2321,29 @@ pub struct Route {
     /// it serves the route (section 4.16).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
-    /// The largest request body, for example 1GB, replacing the daemon's
-    /// `[limits]` value for the route (section 4.6). On an upload route
-    /// it bounds the body as received, files included.
+    /// The largest request body, for example 1GB, replacing the host's,
+    /// or else the daemon's `[limits]` value, for the route (section
+    /// 4.6). On an upload route it bounds the body as received, files
+    /// included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("x-default" = "`max_body_size` in `[limits]`"))]
+    #[schemars(extend("x-default" = "the host's `max_body_size`"))]
     pub max_body_size: Option<String>,
+    /// The timeouts of the route's requests, each replacing the host's,
+    /// or else the daemon's `[limits]` value (section 4.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<RequestTimeouts>,
+    /// How the route's responses are compressed (section 4.17), each key
+    /// replacing the host's, or else the daemon's `[compression]` value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Compression>,
+    /// Headers removed from, and set on, the route's requests before
+    /// anything is asked to serve them (section 4.7), after the host's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<RequestHeaders>,
+    /// Headers removed from, set on and added to every response to the
+    /// route's requests (section 4.7), after the host's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<ResponseHeaders>,
     /// Section 4.11: `multipart` or `raw` makes the edge receive and store
     /// uploads before the application sees the request; off without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1893,6 +2429,10 @@ pub fn check_route_policies(route: &Route) -> Result<(), String> {
     }
 
     check_client_match(route.matches.as_ref())?;
+    check_header_tables(
+        route.request_headers.as_ref(),
+        route.response_headers.as_ref(),
+    )?;
 
     for class in route
         .traffic
@@ -2099,6 +2639,14 @@ pub struct RouteOverlay {
     /// place of the route's page for the same key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_pages: Option<BTreeMap<String, ErrorPage>>,
+    /// The headers removed from and set on the route's requests (section
+    /// 4.7), in place of the route's `request_headers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<RequestHeaders>,
+    /// The headers removed from, set on and added to the route's
+    /// responses, in place of the route's `response_headers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<ResponseHeaders>,
     /// Routes for client classes (section 4.14) at the route's host and
     /// path, by class: each a copy of the route with these changes, or the
     /// route for that class already there with them.
@@ -2416,6 +2964,11 @@ fn check_route_overlay(change: &RouteOverlay, outer: bool) -> Result<(), String>
 
         check_error_pages(pages, false)?;
     }
+
+    check_header_tables(
+        change.request_headers.as_ref(),
+        change.response_headers.as_ref(),
+    )?;
 
     if let Some(traffic) = &change.traffic
         && traffic.pin.is_some() == traffic.split.is_some()
@@ -2974,14 +3527,7 @@ pub const DEFAULT_SPOOL_QUOTA: u64 = 10 * 1024 * 1024 * 1024;
 /// The upload keys other than `upload` need it, and `max_files` stays
 /// within what one request can pass to a worker.
 pub fn check_upload(route: &Route) -> Result<Option<UploadSettings>, String> {
-    if let Some(size) = &route.max_body_size
-        && parse_size(size).map_err(|error| format!("max_body_size: {error}"))? == 0
-    {
-        return Err(
-            "max_body_size must be at least 1 byte; leave it out for the max_body_size of [limits]"
-                .to_owned(),
-        );
-    }
+    check_request_limits(route.max_body_size.as_deref(), route.timeouts.as_ref())?;
 
     let Some(mode) = &route.upload else {
         let stray = [
@@ -4752,9 +5298,16 @@ pub struct ToolMuru {
     /// How long a worker lives before it is replaced (section 7.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lifetime: Option<String>,
-    /// The timeouts the host enforces on its workers (section 7.6).
+    /// The timeouts the host enforces on its workers (section 7.6), and
+    /// those of a request the release serves, which the edge enforces
+    /// (section 4.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<Timeouts>,
+    /// The largest body of a request the release serves, for example
+    /// 50MB (section 4.6), which the edge enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the host's, else `max_body_size` in `[limits]`"))]
+    pub max_body_size: Option<String>,
     /// The memory policy for the workers (section 7.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Memory>,
@@ -5420,6 +5973,119 @@ traffic = { classes = { ai-crawler = 'r1' } }"
     }
 
     #[test]
+    fn a_levels_request_limits_are_parsed_and_must_be_more_than_nothing() {
+        assert_eq!(
+            check_request_limits(None, None),
+            Ok(RequestLimitSettings::default())
+        );
+        assert!(check_request_limits(None, None).unwrap().is_empty());
+
+        let timeouts = RequestTimeouts {
+            queue_timeout: Some("2s".to_owned()),
+            request_deadline: Some("30s".to_owned()),
+            body_idle_timeout: None,
+            response_idle_timeout: Some("250ms".to_owned()),
+        };
+        assert_eq!(
+            check_request_limits(Some("1MB"), Some(&timeouts)),
+            Ok(RequestLimitSettings {
+                max_body_size: Some(1024 * 1024),
+                queue_timeout: Some(Duration::from_secs(2)),
+                request_deadline: Some(Duration::from_secs(30)),
+                body_idle_timeout: None,
+                response_idle_timeout: Some(Duration::from_millis(250)),
+            })
+        );
+
+        let error = check_request_limits(Some("0"), None).unwrap_err();
+        assert!(
+            error.starts_with("max_body_size must be at least 1 byte"),
+            "{error}"
+        );
+        let error = check_request_limits(Some("lots"), None).unwrap_err();
+        assert!(error.starts_with("max_body_size:"), "{error}");
+
+        let zero = RequestTimeouts {
+            request_deadline: Some("0s".to_owned()),
+            ..RequestTimeouts::default()
+        };
+        let error = check_request_limits(None, Some(&zero)).unwrap_err();
+        assert!(
+            error.starts_with("timeouts.request_deadline must be more than 0"),
+            "{error}"
+        );
+
+        let unreadable = RequestTimeouts {
+            queue_timeout: Some("soon".to_owned()),
+            ..RequestTimeouts::default()
+        };
+        let error = check_request_limits(None, Some(&unreadable)).unwrap_err();
+        assert!(error.starts_with("timeouts.queue_timeout:"), "{error}");
+        assert!(toml::from_str::<Host>("timeouts = { deadline = '1s' }").is_err());
+    }
+
+    #[test]
+    fn header_tables_name_headers_the_edge_does_not_handle() {
+        let table = |text: &str| toml::from_str::<Route>(&format!("host = 'shop'\n{text}"));
+        let checked = |text: &str| {
+            let route = table(text).unwrap();
+            check_header_tables(
+                route.request_headers.as_ref(),
+                route.response_headers.as_ref(),
+            )
+        };
+
+        assert_eq!(
+            checked(
+                "request_headers = { remove = ['X-Debug'], set = { X-Site = 'shop' } }\n\
+                 response_headers = { remove = ['Server'], set = { X-Frame-Options = 'DENY' }, \
+                 add = { Link = ['</a>; rel=preload', '</b>; rel=preload'], Via = '1.1 edge' } }"
+            ),
+            Ok(())
+        );
+
+        for (text, expected) in [
+            (
+                "request_headers = { set = { host = 'x' } }",
+                "request_headers.set: host cannot be set or removed",
+            ),
+            (
+                "request_headers = { remove = ['Transfer-Encoding'] }",
+                "request_headers.remove: Transfer-Encoding cannot be set or removed",
+            ),
+            (
+                "response_headers = { add = { X-Muru-Compress = 'off' } }",
+                "response_headers.add: X-Muru-Compress cannot be set or removed",
+            ),
+            (
+                "response_headers = { set = { 'X A' = '1' } }",
+                "response_headers.set: \"X A\" is not a header name",
+            ),
+            (
+                "request_headers = { set = { X_Site = 'shop' } }",
+                "request_headers.set: X_Site has an underscore",
+            ),
+            (
+                "response_headers = { set = { X-A = ' padded' } }",
+                "response_headers.set.X-A: \" padded\" is not a header value",
+            ),
+            (
+                "response_headers = { set = { X-A = '1', x-a = '2' } }",
+                "response_headers.set: x-a is named twice",
+            ),
+            (
+                "response_headers = { add = { Link = [] } }",
+                "response_headers.add.Link gives no value",
+            ),
+        ] {
+            let error = checked(text).unwrap_err();
+            assert!(error.starts_with(expected), "{text}: {error}");
+        }
+
+        assert!(table("request_headers = { add = { X-A = '1' } }").is_err());
+    }
+
+    #[test]
     fn sizes_and_durations_are_written_in_the_largest_exact_unit() {
         assert_eq!(format_size(100 * 1024 * 1024), "100MB");
         assert_eq!(format_size(64 * 1024), "64KB");
@@ -5435,6 +6101,14 @@ traffic = { classes = { ai-crawler = 'r1' } }"
                 address: "127.0.0.1:8080".to_owned(),
                 tls: false,
                 h2c: Some(vec!["loopback".to_owned()]),
+                limits: Some(ListenerLimits {
+                    max_connections: Some(500),
+                    ..ListenerLimits::default()
+                }),
+                proxy: Some(Proxy {
+                    trusted: vec!["10.0.0.0/8".to_owned()],
+                    ..Proxy::default()
+                }),
             }],
             limits: Some(Limits {
                 max_body_size: Some("100MB".to_owned()),
@@ -5475,6 +6149,14 @@ traffic = { classes = { ai-crawler = 'r1' } }"
                     key: "certs/shop-key.pem".to_owned(),
                 }),
                 https_redirect: true,
+                canonical: Some("shop.example.com".to_owned()),
+                canonical_redirect: true,
+                max_body_size: Some("1MB".to_owned()),
+                timeouts: Some(RequestTimeouts {
+                    request_deadline: Some("30s".to_owned()),
+                    ..RequestTimeouts::default()
+                }),
+                access_log: Some("errors".to_owned()),
                 ..Host::default()
             },
         );
@@ -5502,6 +6184,25 @@ traffic = { classes = { ai-crawler = 'r1' } }"
                 ..Traffic::default()
             }),
             max_body_size: Some("1GB".to_owned()),
+            timeouts: Some(RequestTimeouts {
+                queue_timeout: Some("2s".to_owned()),
+                ..RequestTimeouts::default()
+            }),
+            compression: Some(Compression {
+                enabled: Some(false),
+                ..Compression::default()
+            }),
+            request_headers: Some(RequestHeaders {
+                remove: vec!["X-Debug".to_owned()],
+                set: BTreeMap::new(),
+            }),
+            response_headers: Some(ResponseHeaders {
+                add: BTreeMap::from([(
+                    "Link".to_owned(),
+                    HeaderValues::Many(vec!["</a>; rel=preload".to_owned()]),
+                )]),
+                ..ResponseHeaders::default()
+            }),
             upload: Some("multipart".to_owned()),
             max_file_size: None,
             max_files: Some(5),
@@ -5527,6 +6228,20 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(text.contains("[route.traffic]"), "{text}");
         assert!(text.contains("r2 = 10"), "{text}");
         assert!(text.contains("[host.shop]"), "{text}");
+        assert!(text.contains("[listener.limits]"), "{text}");
+        assert!(text.contains("[listener.proxy]"), "{text}");
+        assert!(text.contains("trusted = [\"10.0.0.0/8\"]"), "{text}");
+        assert!(text.contains("max_connections = 500"), "{text}");
+        assert!(text.contains("canonical_redirect = true"), "{text}");
+        assert!(text.contains("[host.shop.timeouts]"), "{text}");
+        assert!(text.contains("request_deadline = \"30s\""), "{text}");
+        assert!(text.contains("[route.timeouts]"), "{text}");
+        assert!(text.contains("[route.compression]"), "{text}");
+        assert!(text.contains("[route.request_headers]"), "{text}");
+        assert!(text.contains("remove = [\"X-Debug\"]"), "{text}");
+        assert!(text.contains("[route.response_headers.add]"), "{text}");
+        assert!(text.contains("enabled = false"), "{text}");
+        assert!(text.contains("queue_timeout = \"2s\""), "{text}");
         assert!(text.contains("[[route]]"), "{text}");
         assert!(
             text.contains("entrypoint = \"shop.wsgi:application\""),

@@ -79,8 +79,8 @@ $ muructl release show shop@r9 --json
 | `muructl overlay activate` | The outcome: `message` |
 | `muructl overlay end` | The outcome: `message` |
 | `muructl overlay promote` | The outcome: `message` |
-| `muructl maintenance on` | `app`, `on` and `since_unix_ms` |
-| `muructl maintenance off` | `app`, `on` and `since_unix_ms` (0) |
+| `muructl maintenance on` | `app`, or `host` with `--host`, `on` and `since_unix_ms` |
+| `muructl maintenance off` | `app`, or `host` with `--host`, `on` and `since_unix_ms` (0) |
 | `muructl dashboard login` | The sign-in link: `url`, `code`, `expires_in_s`, and with `--token` the `token` |
 | `muructl apply` | The report: `errors`, `warnings`, `notes`, `changes`, `unchanged`, `applied`. Each change has `action`, `subject`, `detail` and, once applied, `outcome`, which for a release that failed is `failed:` and the reason |
 | `muructl config diff` | The report, as `apply` prints it |

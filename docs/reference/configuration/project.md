@@ -30,6 +30,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `interface` | string | `"auto"` | The interface the entrypoint speaks. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `logging` | table, {ref}`[tool.muru.logging] <config-project-tool-muru-logging>` |  | How Python logging is set up in the workers. |
 | `maintenance` | table, {ref}`[tool.muru.maintenance] <config-project-tool-muru-maintenance>` |  | What maintenance mode lets through. |
+| `max_body_size` | string | the host's, else `max_body_size` in `[limits]` | The largest body of a request the release serves, for example 50MB, which the edge enforces. |
 | `max_lifetime` | string |  | How long a worker lives before it is replaced. |
 | `max_requests` | integer |  | Requests a worker serves before it is replaced. |
 | `memory` | table, {ref}`[tool.muru.memory] <config-project-tool-muru-memory>` |  | The memory policy for the workers. |
@@ -46,7 +47,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `static` | array of tables, {ref}`[[tool.muru.static]] <config-project-tool-muru-static>` |  | The application's own static directories, served by the edge from the release's source, which is the project directory under `muructl run`. |
 | `sync_threads` | integer | `8` | Threads for synchronous code called from an ASGI application. |
 | `threads` | integer | `4` | Application threads per worker. |
-| `timeouts` | table, {ref}`[tool.muru.timeouts] <config-project-tool-muru-timeouts>` |  | The timeouts the host enforces on its workers. |
+| `timeouts` | table, {ref}`[tool.muru.timeouts] <config-project-tool-muru-timeouts>` |  | The timeouts the host enforces on its workers, and those of a request the release serves, which the edge enforces. |
 
 (config-project-tool-muru-build)=
 ## `[tool.muru.build]`
@@ -140,6 +141,7 @@ A worker group, the `[app.NAME.release.ID.groups.NAME]` or `[tool.muru.groups.NA
 | --- | --- | --- | --- |
 | `concurrency` | integer | the release's | Requests an ASGI worker's event loop takes at once. |
 | `match` | table, {ref}`[tool.muru.groups.NAME.match] <config-project-tool-muru-groups-name-match>` |  | What the group asks of a request beside its path: the client classes, hosts and methods it takes, each list any of its entries; a group asking more comes before one asking less, and a group with lists and no `paths` takes every path. |
+| `max_body_size` | string | the release's | The largest body of a request the group serves, for example 200MB, which the edge enforces. |
 | `max_lifetime` | string | the release's | How long a worker of the group lives before it is replaced, for example 1h, with jitter. |
 | `max_requests` | integer | the release's | Requests a worker of the group serves before it is replaced, with jitter. |
 | `memory` | table, {ref}`[tool.muru.memory] <config-project-tool-muru-memory>` |  | The group's own memory policy, each key the release's when absent. |
@@ -227,6 +229,7 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `handoff` | string |  | The interface the mount's requests may be handed to; none when absent. `asgi`: Continue the request as an ASGI application on the event loop. `wsgi`: Continue the request as a WSGI callable on the thread pool. |
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `internal` | boolean | `false` | Reachable only through internal redirects: a client's request for its path is answered 404. |
+| `max_body_size` | string | the worker group's, else the release's | The largest body of a request the mount serves, for example 200MB, which the edge enforces. |
 | `max_connections` | integer |  | Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; each holds a request slot when absent. |
 | `path` | string |  | The path prefix; the longest wins, on segment boundaries. A gRPC mount has none: its calls are matched by service name. |
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
@@ -368,16 +371,20 @@ A static route's cache headers.
 (config-project-tool-muru-timeouts)=
 ## `[tool.muru.timeouts]`
 
-The `[timeouts]` table of a release or a `[tool.muru]` table: the timeouts the host enforces on its workers. The edge's own timeouts are the daemon's `[limits]`.
+The `[timeouts]` table of a release or a `[tool.muru]` table: the timeouts the host enforces on its workers, and the four the edge enforces on a request the release serves, which are otherwise the virtual host's or the daemon's `[limits]`.
 
 The same keys apply at `[tool.muru.groups.NAME.timeouts]`.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `body_idle_timeout` | string | the host's, else `body_idle_timeout` in `[limits]` | Time a client may pause while sending a body to what is served here. |
 | `gil_stall_timeout` | string | `"30s"` | How long a worker may go with no thread running Python, or with no report to its host, before it is replaced as for the hard timeout. |
 | `hard_drain_grace` | string | `"10s"` | How long a worker being replaced is given to finish its other requests before it is told to stop. |
 | `hard_timeout` | string |  | How long a request may run in a worker before the worker is replaced, for example 60s; off when absent. Must exceed the soft timeout by at least 5s. |
 | `loop_stall_timeout` | string | `"10s"` | How long an ASGI worker's event loop may go without running before the worker is replaced as for the hard timeout. |
+| `queue_timeout` | string | the host's, else `queue_timeout` in `[limits]` | Time a request served here may wait for a worker, which the edge enforces; the virtual host's when absent, or else the daemon's `[limits]` value. |
+| `request_deadline` | string | the host's, else `request_deadline` in `[limits]` | Time a request served here may take to produce its response head. |
+| `response_idle_timeout` | string | the host's, else `response_idle_timeout` in `[limits]` | Time a worker here may pause mid-response. |
 | `shutdown_timeout` | string | `"5s"` | How long a worker told to stop is given before it is killed, counted from when its WebSockets are closed. |
 | `soft_timeout` | string |  | How long a request may run in a worker before it is interrupted by raising `muru.RequestTimeout` in its thread, for example 30s; off when absent. |
 | `websocket_drain_grace` | string | `"0s"` | How long a worker told to stop keeps its open WebSockets before it closes them with 1001. |

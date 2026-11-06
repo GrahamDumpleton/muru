@@ -13,7 +13,7 @@ client, and how long and how much each one may be used:
 | `http2.max_concurrent_streams` | 128 | concurrent streams per HTTP/2 connection |
 
 Under the daemon the keys go in the `[limits]` table of its
-configuration file and are read when the daemon starts:
+configuration file:
 
 ```toml
 [limits]
@@ -26,6 +26,48 @@ max_requests_per_connection = 1000
 [limits.http2]
 max_concurrent_streams = 256
 ```
+
+## A listener's own limits
+
+A `[[listener]]` entry takes a `limits` table with the same keys, and
+the three that bound reading a request's head, for the connections that
+listener accepts. A key it leaves out is the `[limits]` table's:
+
+```toml
+[limits]
+max_connections = 10000
+keep_alive_timeout = '15s'
+
+[[listener]]
+address = '0.0.0.0:443'
+tls = true
+
+[[listener]]
+address = '10.0.0.5:8080'
+
+[listener.limits]
+max_connections = 500
+max_connections_per_client = 0
+keep_alive_timeout = '120s'
+max_header_bytes = '16KB'
+```
+
+The public listener holds 10000 connections and closes an idle one
+after 15 seconds. The internal one, which a load balancer connects to,
+holds 500, gives no client a share, keeps an idle connection for two
+minutes and accepts request heads of at most 16KB.
+
+| Key in a listener's `limits` | Meaning |
+| --- | --- |
+| `max_connections`, `max_connections_per_client`, `keep_alive_timeout`, `keep_alive_timeout_proxy`, `max_requests_per_connection`, `http2.max_concurrent_streams` | as in the table above |
+| `max_header_bytes` | the largest request head, 64KB by default; a larger one is answered 431 |
+| `max_headers` | the most headers in a request, 100 by default; more are answered 431 |
+| `header_read_timeout` | how long a complete request head may take, 30s by default |
+
+These are the limits the edge applies before it knows which [virtual
+host](virtual-hosts.md) a request is for, so they belong to the listener
+and not to a host. `muructl daemon reload` applies a changed table to
+the connections accepted from then on.
 
 `muructl run` takes `--max-connections`, `--max-connections-per-client`,
 `--max-requests-per-connection`, and `--timeout keep_alive=15s` or

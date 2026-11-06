@@ -1271,7 +1271,20 @@ impl HostTimeouts {
             websocket_drain_grace: Some(muru_config::format_duration(self.websocket_drain_grace)),
             loop_stall_timeout: Some(muru_config::format_duration(self.loop_stall)),
             gil_stall_timeout: Some(muru_config::format_duration(self.gil_stall)),
+            ..muru_config::Timeouts::default()
         }
+    }
+}
+
+/// The limits a table sets on the requests it serves (section 4.6), as
+/// the edge takes them.
+fn served_limits(settings: &muru_config::RequestLimitSettings) -> muru_edge::RequestLimits {
+    muru_edge::RequestLimits {
+        max_body_size: settings.max_body_size,
+        queue_timeout: settings.queue_timeout,
+        request_deadline: settings.request_deadline,
+        body_idle_timeout: settings.body_idle_timeout,
+        response_idle_timeout: settings.response_idle_timeout,
     }
 }
 
@@ -1424,14 +1437,24 @@ fn group_memory(
 /// Largest request body in development (section 13.1, ADR 0008).
 const DEVELOPMENT_MAX_BODY_SIZE: u64 = 100 * 1024 * 1024;
 
-fn limits(args: &RunArgs) -> muru_edge::Limits {
+/// The run's limits: the defaults, with the project table's own limits
+/// on a request over them (section 4.6), and the flags over those.
+fn limits(args: &RunArgs, resolved: &Resolved) -> muru_edge::Limits {
     let defaults = muru_edge::Limits::default();
+    let served = served_limits(&resolved.served).over(&defaults);
     let mut limits = muru_edge::Limits {
-        max_body_size: args.max_body_size.unwrap_or(if args.allow_public {
-            defaults.max_body_size
-        } else {
-            DEVELOPMENT_MAX_BODY_SIZE
-        }),
+        max_body_size: args
+            .max_body_size
+            .or(resolved.served.max_body_size)
+            .unwrap_or(if args.allow_public {
+                defaults.max_body_size
+            } else {
+                DEVELOPMENT_MAX_BODY_SIZE
+            }),
+        queue_timeout: served.queue_timeout,
+        request_deadline: served.request_deadline,
+        body_idle_timeout: served.body_idle_timeout,
+        response_idle_timeout: served.response_idle_timeout,
         max_connections: args.max_connections.unwrap_or(defaults.max_connections),
         max_connections_per_client: args
             .max_connections_per_client
@@ -1644,6 +1667,9 @@ struct Resolved {
     max_lifetime: Option<Duration>,
     /// The host's timeouts from the table (section 7.6).
     timeouts: Option<muru_config::Timeouts>,
+    /// The table's own limits on a request (section 4.6): its
+    /// `max_body_size` and the request timeouts of its `timeouts`.
+    served: muru_config::RequestLimitSettings,
     /// Section 4.10: the default mount's redirect settings from the table.
     accel_redirect: bool,
     cgi_local_redirect: bool,
@@ -1859,7 +1885,25 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         });
     }
 
+    // Section 4.6: the table's own limits on a request, and those of
+    // its groups and mounts.
+
+    let served =
+        muru_config::check_served_limits(table.max_body_size.as_deref(), table.timeouts.as_ref())
+            .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    for (name, group) in &table.groups {
+        muru_config::check_served_limits(group.max_body_size.as_deref(), group.timeouts.as_ref())
+            .map_err(|error| anyhow::anyhow!("[tool.muru.groups.{name}] {error}"))?;
+    }
+
+    for (name, mount) in &table.mounts {
+        muru_config::check_request_limits(mount.max_body_size.as_deref(), None)
+            .map_err(|error| anyhow::anyhow!("[tool.muru.mounts.{name}] {error}"))?;
+    }
+
     Ok(Resolved {
+        served,
         entrypoint,
         python: table.python.clone(),
         build: table.build.clone(),
@@ -1920,12 +1964,14 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
     use muru_config::{App, Document, Listener, Release};
 
     let name = app_name(&resolved.entrypoint).replace('_', "-");
-    let limits = limits(args);
+    let limits = limits(args, resolved);
     let (http, https) = addresses(args, &resolved.serving);
     let mut listeners = vec![Listener {
         address: http.to_string(),
         tls: false,
         h2c: None,
+        limits: None,
+        proxy: None,
     }];
 
     if resolved.serving.tls() {
@@ -1933,10 +1979,16 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
             address: https.to_string(),
             tls: true,
             h2c: None,
+            limits: None,
+            proxy: None,
         });
     }
 
+    // The table's own limits on a request are written with the node's,
+    // in the [limits] table below.
+
     let release = Release {
+        max_body_size: None,
         grpc_web_origins: resolved.grpc_web_origins.clone(),
         kind: None,
         profile: None,
@@ -2068,6 +2120,17 @@ fn group_sockets_from(
     announced
         .iter()
         .map(|(name, sockets)| muru_edge::routing::GroupSockets {
+            limits: groups
+                .get(name)
+                .and_then(|group| {
+                    muru_config::check_served_limits(
+                        group.max_body_size.as_deref(),
+                        group.timeouts.as_ref(),
+                    )
+                    .ok()
+                })
+                .map(|settings| served_limits(&settings))
+                .unwrap_or_default(),
             name: name.clone(),
             paths: groups
                 .get(name)
@@ -2285,6 +2348,9 @@ fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
         .mounts
         .iter()
         .map(|(name, mount)| muru_edge::routing::MountPath {
+            limits: muru_config::check_request_limits(mount.max_body_size.as_deref(), None)
+                .map(|settings| served_limits(&settings))
+                .unwrap_or_default(),
             name: name.clone(),
             path: mount.path.clone(),
             internal: mount.internal.unwrap_or(false),
@@ -3097,7 +3163,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         development,
         occasions: args.easter_egg.unwrap_or_default(),
         access_log,
-        limits: limits(&args),
+        limits: limits(&args, &resolved),
         compression: if resolved.serving.compression {
             muru_edge::compression::Compression::default()
         } else {

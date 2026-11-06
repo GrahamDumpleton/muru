@@ -472,6 +472,9 @@ pub struct HostRow {
     pub tls: bool,
     /// Whether it is the default host.
     pub default: bool,
+    /// When maintenance mode began for the host, as a clock time, or
+    /// empty when it is off.
+    pub maintenance_since: String,
 }
 
 /// A route.

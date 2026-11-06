@@ -24,6 +24,109 @@ load balancers and clients handle better than slow successes. `deadline`
 bounds the slowest acceptable request; the access log shows `app=` time per
 request, so the right value is the slowest legitimate one plus margin.
 
+## Under the daemon
+
+The daemon's configuration file sets the timeouts for the node in its
+`[limits]` table, where the first five are `header_read_timeout`,
+`queue_timeout`, `request_deadline`, `body_idle_timeout` and
+`response_idle_timeout`:
+
+```toml
+[limits]
+request_deadline = "60s"
+queue_timeout = "5s"
+```
+
+A [virtual host](virtual-hosts.md#settings-for-a-hosts-routes) and a
+route each take a `timeouts` table with the last four of those, for the
+requests they serve. A key set on the route is used, else the host's, else the
+`[limits]` table's, else the default, unless [the application sets its
+own](#with-the-application):
+
+```toml
+[host.api]
+names = ["api.example.com"]
+timeouts = { request_deadline = "30s", queue_timeout = "2s" }
+
+[[route]]
+host = "api"
+app = "api"
+
+[[route]]
+host = "api"
+path = "/reports"
+app = "api"
+timeouts = { request_deadline = "120s" }
+```
+
+A request for `/reports/monthly` has 120 seconds and waits at most 2
+seconds for a worker; every other request for the host has 30 seconds.
+The limits are those of the route the client's request matched: an
+[internal redirect](internal-redirects.md) to another route keeps them.
+`header_read_timeout` is read before the request names its host, so it
+is set for the node, or for a
+[listener](connections.md#a-listeners-own-limits). `muructl config show --effective` lists each
+route's timeouts with where each came from.
+
+## With the application
+
+An application can ship the same four timeouts, and its largest request
+body, in the `[tool.muru]` table of its project, or a release's table
+in an applied file. They are for the requests that release serves:
+
+```toml
+[tool.muru]
+entrypoint = "shop.wsgi:application"
+max_body_size = "5MB"
+timeouts = { request_deadline = "20s" }
+
+[tool.muru.groups.reports]
+paths = ["/reports/*"]
+timeouts = { request_deadline = "300s", queue_timeout = "30s" }
+
+[tool.muru.mounts.uploads]
+path = "/uploads"
+entrypoint = "shop.uploads:application"
+max_body_size = "500MB"
+```
+
+| Where | Keys | For |
+| --- | --- | --- |
+| the release's table | `max_body_size`, and `queue_timeout`, `request_deadline`, `body_idle_timeout` and `response_idle_timeout` in `timeouts` | every request the release serves |
+| a [worker group](worker-groups.md) | the same | the requests the group's workers serve |
+| a [mount](mounts.md) | `max_body_size` | the requests the mount serves |
+
+A request's limit is the first of these that sets it:
+
+1. its route;
+2. the mount that serves it, then the worker group, then the release;
+3. its virtual host;
+4. the daemon's `[limits]` table;
+5. the default.
+
+Here a request under `/reports/` has 300 seconds wherever it is routed
+from, unless its route sets a deadline of its own, and a host's
+`request_deadline` applies only to applications that set none. So an
+application says what its own paths need, a host gives a site its
+defaults, and a route has the last word. `muructl config show
+--effective` lists what each release, group and mount sets beside the
+routes:
+
+```
+#   shop@r7: max_body_size = 5MB (the release)
+#   shop@r7 group reports: timeouts.request_deadline = 300s (the worker group)
+#   route shop /: timeouts.request_deadline = 20s (release shop@r7)
+```
+
+`muructl run` and `muructl serve` read the same keys from the project,
+beneath their own flags: `--max-body-size` and `--timeout deadline=30s`
+replace the table's values for the release, and a group's and a mount's
+own still apply to what they serve. `muructl deploy` takes them from the
+source's table, and they are part of the release, as its other settings
+are.
+
+## Past the deadline
+
 A request past its deadline keeps running in the worker after the client
 has been answered, unless a soft timeout interrupts it or a hard timeout
 replaces its worker. Both are off by default. The application can see
@@ -227,4 +330,7 @@ broken connection pool, see [restarting a worker](recycling.md#restarting-a-work
 
 The body size limit is a limit rather than a timeout, but lives beside
 them: `--max-body-size 100MB` (the development default; 10 MB with
-`--allow-public`), with 413 `body_too_large` when it is passed.
+`--allow-public`), with 413 `body_too_large` when it is passed. Under
+the daemon it is `max_body_size` in the `[limits]` table, on a virtual
+host and on a route, the route's replacing the host's and the host's
+the table's.

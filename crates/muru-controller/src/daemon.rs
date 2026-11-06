@@ -26,8 +26,8 @@ use crate::host::{HostProcess, HostSpec};
 use crate::locations::Locations;
 use crate::logs::Logs;
 use crate::model::{
-    Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutState, RolloutStep,
-    now_unix_ms, valid_name,
+    AccessLogSpec, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutState,
+    RolloutStep, now_unix_ms, valid_name,
 };
 use crate::rollouts::{Counters, Verdict, judge};
 use crate::scaling::{Decision, ScaleStatus, Scaler, Signals};
@@ -284,6 +284,16 @@ pub enum Command {
         /// Answered with when maintenance began, or none when it is off.
         done: oneshot::Sender<Result<Option<u64>, String>>,
     },
+    /// Section 4.12: serve the maintenance page for every route of a
+    /// virtual host, or serve the host as usual again.
+    SetHostMaintenance {
+        /// The virtual host.
+        host: String,
+        /// On or off.
+        on: bool,
+        /// Answered with when maintenance began, or none when it is off.
+        done: oneshot::Sender<Result<Option<u64>, String>>,
+    },
     /// Blue/green (section 9.2): move all of an application's traffic to a
     /// release now and drain the one that served.
     PromoteRelease {
@@ -519,6 +529,8 @@ pub struct Info {
     /// The addresses the edge serves, each with whether it carries TLS,
     /// as a reload may change them.
     pub listeners: std::sync::RwLock<Vec<(SocketAddr, bool)>>,
+    /// The node's limits (section 4.6), as a reload may change them.
+    pub limits: std::sync::RwLock<muru_edge::Limits>,
     /// When the daemon started, Unix milliseconds.
     pub started_unix_ms: u64,
     /// The edge process's pid, for status.
@@ -902,6 +914,9 @@ struct Daemon {
     /// The applications in maintenance mode (section 4.12), with when
     /// each was put there.
     maintenance: HashMap<String, u64>,
+    /// The virtual hosts in maintenance mode (section 4.12), with when
+    /// each was turned on.
+    host_maintenance: HashMap<String, u64>,
     /// Section 9.10: the overlays in the warm-up lead before a window,
     /// with the release each keeps running meanwhile.
     warm_ups: BTreeMap<String, Option<(String, String)>>,
@@ -921,6 +936,11 @@ struct Daemon {
     debug_exec: bool,
     /// The listeners' h2c policies, for every snapshot (section 6.13).
     h2c: Vec<pb::H2cPolicy>,
+    /// The listeners' own limits, for every snapshot (section 4.18).
+    listener_limits: Vec<pb::ListenerLimits>,
+    /// The listeners' own proxy settings, for every snapshot (section
+    /// 4.7).
+    listener_proxies: Vec<pb::ListenerProxy>,
     /// The `[limits]` table (section 4.6), for every snapshot.
     limits: muru_edge::Limits,
     /// Which records the access log writes, from the `[logs]` table
@@ -1121,6 +1141,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let info = Arc::new(Info {
         locations: locations.clone(),
         listeners: std::sync::RwLock::new(listeners.clone()),
+        limits: std::sync::RwLock::new(settings.limits.clone()),
         started_unix_ms: crate::model::now_unix_ms(),
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
         metrics,
@@ -1273,6 +1294,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         clients,
         enforcement: crate::clients::Enforcement::default(),
         maintenance: HashMap::new(),
+        host_maintenance: HashMap::new(),
         warm_ups: BTreeMap::new(),
         clock: (None, false),
         secrets: settings.secrets.clone(),
@@ -1281,6 +1303,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         service,
         debug_exec: settings.debug_exec,
         h2c: settings.h2c.clone(),
+        listener_limits: settings.listener_limits.clone(),
+        listener_proxies: settings.listener_proxies.clone(),
         limits: settings.limits.clone(),
         access_log: settings.access_log.clone(),
         access_overrides: Vec::new(),
@@ -1670,6 +1694,19 @@ fn service_identity(named: Option<&str>) -> anyhow::Result<Option<crate::host::I
     Ok(Some(identity))
 }
 
+/// A level's limits on a request (section 4.6) as the snapshot carries
+/// them, or none when the level says nothing.
+fn request_limits_message(limits: &muru_config::RequestLimitSettings) -> Option<pb::RequestLimits> {
+    muru_edge::RequestLimits {
+        max_body_size: limits.max_body_size,
+        queue_timeout: limits.queue_timeout,
+        request_deadline: limits.request_deadline,
+        body_idle_timeout: limits.body_idle_timeout,
+        response_idle_timeout: limits.response_idle_timeout,
+    }
+    .to_message()
+}
+
 /// Section 4.11: a route's upload settings for the edge, with their
 /// defaults in place. Apply has checked the keys, so a route that fails
 /// them here takes no uploads.
@@ -1985,6 +2022,84 @@ pub(crate) fn compression_message(
     muru_edge::compression::Compression::from_snapshot(&message).map(|policy| policy.to_message())
 }
 
+/// A virtual host's or a route's own `compression` table as the snapshot
+/// carries it, checked as the `[compression]` table is: the keys given,
+/// and nothing for the rest, which the level beneath supplies.
+pub(crate) fn compression_choice(
+    table: &muru_config::Compression,
+) -> Result<pb::CompressionChoice, String> {
+    let min_size = match &table.min_size {
+        Some(text) => {
+            match muru_config::parse_size(text).map_err(|error| format!("min_size: {error}"))? {
+                0 => return Err("min_size must be at least 1 byte".to_owned()),
+                size => size,
+            }
+        }
+        None => 0,
+    };
+
+    if table.encodings.as_ref().is_some_and(Vec::is_empty) {
+        return Err(
+            "encodings names no encoding; enabled = false turns compression off".to_owned(),
+        );
+    }
+
+    if table.types.as_ref().is_some_and(Vec::is_empty) {
+        return Err(
+            "types names no content type; enabled = false turns compression off".to_owned(),
+        );
+    }
+
+    let choice = pb::CompressionChoice {
+        enabled: table.enabled,
+        encodings: table.encodings.clone().unwrap_or_default(),
+        min_size,
+        types: table.types.clone().unwrap_or_default(),
+        level: table.level.clone().unwrap_or_default(),
+    };
+
+    muru_edge::compression::Compression::default().with(&choice)?;
+    Ok(choice)
+}
+
+/// A `request_headers` table (section 4.7) as the snapshot carries it.
+fn request_headers_message(table: &muru_config::RequestHeaders) -> pb::HeaderRules {
+    pb::HeaderRules {
+        remove: table.remove.clone(),
+        set: header_fields(&table.set),
+        add: Vec::new(),
+    }
+}
+
+/// A `response_headers` table (section 4.7) as the snapshot carries it,
+/// a header added more than once with a field for each value.
+fn response_headers_message(table: &muru_config::ResponseHeaders) -> pb::HeaderRules {
+    pb::HeaderRules {
+        remove: table.remove.clone(),
+        set: header_fields(&table.set),
+        add: table
+            .add
+            .iter()
+            .flat_map(|(name, values)| {
+                values.values().iter().map(|value| pb::HeaderField {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+            })
+            .collect(),
+    }
+}
+
+fn header_fields(headers: &BTreeMap<String, String>) -> Vec<pb::HeaderField> {
+    headers
+        .iter()
+        .map(|(name, value)| pb::HeaderField {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
 /// A host's certificate chain and key as PEM text, for the snapshot.
 fn read_pem_pair(certificate: &str, key: &str) -> anyhow::Result<(String, String)> {
     let chain =
@@ -2245,6 +2360,11 @@ impl Daemon {
             .unwrap_or_default()
             .into_iter()
             .map(|(name, host)| HostRow {
+                maintenance_since: self
+                    .host_maintenance
+                    .get(&name)
+                    .map(|since| clock_hms(*since))
+                    .unwrap_or_default(),
                 name,
                 names: host.names,
                 listeners: host.listeners,
@@ -2409,6 +2529,14 @@ impl Daemon {
             ),
             ("[limits]", settings.limits != self.limits),
             ("[[listener]] h2c", settings.h2c != self.h2c),
+            (
+                "[[listener]] limits",
+                settings.listener_limits != self.listener_limits,
+            ),
+            (
+                "[[listener]] proxy",
+                settings.listener_proxies != self.listener_proxies,
+            ),
             ("[logs] access_log", settings.access_log != self.access_log),
         ] {
             if changed {
@@ -2424,8 +2552,11 @@ impl Daemon {
         self.error_pages = settings.error_pages;
         self.error_override = settings.error_override;
         self.limits = settings.limits;
+        *self.info.limits.write().expect("limits poisoned") = self.limits.clone();
         self.access_log = settings.access_log;
         self.h2c = settings.h2c;
+        self.listener_limits = settings.listener_limits;
+        self.listener_proxies = settings.listener_proxies;
         self.client_rules = settings.client_rules;
         self.clients = clients;
 
@@ -2683,9 +2814,28 @@ impl Daemon {
 
     /// How long an edge is given to finish its connections when it is
     /// replaced: the request deadline, so a response in flight can
-    /// complete, and a little over.
+    /// complete, and a little over. A virtual host or a route may set a
+    /// deadline of its own (section 4.6), so it is the longest of them.
     fn drain_grace(&self) -> Duration {
-        self.limits.request_deadline + Duration::from_secs(5)
+        let hosts = self
+            .store
+            .hosts()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, host)| host.timeouts);
+        let routes = self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|route| route.timeouts);
+        let longest = hosts
+            .chain(routes)
+            .filter_map(|timeouts| timeouts.request_deadline)
+            .filter_map(|text| muru_config::parse_duration(&text).ok())
+            .fold(self.limits.request_deadline, Duration::max);
+
+        longest + Duration::from_secs(5)
     }
 
     /// Section 9.10: the routes and the applications in maintenance mode
@@ -3433,6 +3583,12 @@ impl Daemon {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        self.host_maintenance = self
+            .store
+            .host_maintenance()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
         let apps = match self.store.apps() {
             Ok(apps) => apps,
@@ -3747,6 +3903,9 @@ impl Daemon {
             }
             Command::SetMaintenance { app, on, done } => {
                 let _ = done.send(self.set_maintenance(&app, on).await);
+            }
+            Command::SetHostMaintenance { host, on, done } => {
+                let _ = done.send(self.set_host_maintenance(&host, on).await);
             }
             Command::OverrideAccessLog {
                 change,
@@ -4988,15 +5147,31 @@ impl Daemon {
         for (name, id) in routable {
             if let Some(running) = self.running.get(&(name.clone(), id.clone())) {
                 // Section 11.2: the application's own access log choice,
-                // laid over the node's.
+                // which the edge lays over its host's and the node's.
 
                 let access_log = self
                     .store
                     .app(name)
                     .ok()
                     .filter(|app| !app.access_log.is_empty())
-                    .map(|app| app.access_log.over(&self.access_log).to_message());
+                    .map(|app| app.access_log.choice().to_message());
+
+                // Section 4.6: the limits the release, its groups and its
+                // mounts set on the requests they serve.
+
+                let spec = self
+                    .store
+                    .release(name, id)
+                    .ok()
+                    .map(|release| release.spec);
+                let group_limits = |group: &str| {
+                    spec.as_ref()
+                        .and_then(|spec| spec.groups.iter().find(|own| own.name == group))
+                        .and_then(|own| own.limits.message())
+                };
+
                 apps.push(pb::AppWorkers {
+                    limits: spec.as_ref().and_then(|spec| spec.limits.message()),
                     app: name.clone(),
                     release: id.clone(),
                     serving: self.serving.get(name) == Some(id),
@@ -5028,6 +5203,7 @@ impl Daemon {
                         .groups
                         .iter()
                         .map(|group| pb::Group {
+                            limits: group_limits(&group.name),
                             name: group.name.clone(),
                             paths: group.paths.clone(),
                             client_classes: group.client_classes.clone(),
@@ -5049,6 +5225,7 @@ impl Daemon {
                                 .mounts
                                 .iter()
                                 .map(|mount| pb::Mount {
+                                    limits: mount.limits.message(),
                                     name: mount.name.clone(),
                                     path: mount.path.clone(),
                                     internal: mount.internal,
@@ -5150,8 +5327,47 @@ impl Daemon {
             let (certificate_pem, key_pem) =
                 self.certificates.get(&name).cloned().unwrap_or_default();
 
+            // Sections 4.6 and 11.2: the host's limits on a request and
+            // its access log choice, which were checked when applied.
+
+            let limits = muru_config::check_request_limits(
+                host.max_body_size.as_deref(),
+                host.timeouts.as_ref(),
+            )
+            .ok()
+            .and_then(|limits| request_limits_message(&limits));
+            let mut choice = AccessLogSpec::from_host(&host).choice();
+            choice.format = host
+                .access_log_format
+                .as_deref()
+                .and_then(muru_edge::access::Format::parse);
+            choice.file = host
+                .access_log_file
+                .as_ref()
+                .map(|file| Arc::from(self.locations.logs.path.join(file).as_path()));
+            let access_log = (!choice.is_empty()).then(|| choice.to_message());
+
+            // Section 4.12: the host's maintenance mode, with its
+            // exemptions. A host removed since it was turned on is no
+            // longer in it.
+
+            let maintenance = self
+                .host_maintenance
+                .contains_key(&name)
+                .then(|| maintenance_message(true, host.maintenance.as_ref()));
+
             hosts.push(pb::Host {
+                maintenance,
                 name,
+                limits,
+                access_log,
+                request_headers: host.request_headers.as_ref().map(request_headers_message),
+                response_headers: host.response_headers.as_ref().map(response_headers_message),
+                compression: host
+                    .compression
+                    .as_ref()
+                    .and_then(|table| compression_choice(table).ok()),
+                canonical_redirect: host.canonical_redirect,
                 names: host.names,
                 listeners: host.listeners,
                 certificate_pem,
@@ -5184,11 +5400,21 @@ impl Daemon {
             .into_iter()
             .map(|route| pb::Route {
                 upload: upload_message(&route),
-                max_body_size: route
-                    .max_body_size
-                    .as_deref()
-                    .and_then(|size| muru_config::parse_size(size).ok())
-                    .unwrap_or(0),
+                request_headers: route.request_headers.as_ref().map(request_headers_message),
+                response_headers: route
+                    .response_headers
+                    .as_ref()
+                    .map(response_headers_message),
+                compression: route
+                    .compression
+                    .as_ref()
+                    .and_then(|table| compression_choice(table).ok()),
+                limits: muru_config::check_request_limits(
+                    route.max_body_size.as_deref(),
+                    route.timeouts.as_ref(),
+                )
+                .ok()
+                .and_then(|limits| request_limits_message(&limits)),
                 traffic: self.route_traffic(&route, &included, &rollouts),
                 client_classes: route.classes().to_vec(),
                 host: route.host,
@@ -5274,6 +5500,8 @@ impl Daemon {
             rate_limits: self.clients.limits_message.clone(),
             default_traffic,
             h2c: self.h2c.clone(),
+            listener_limits: self.listener_limits.clone(),
+            listener_proxies: self.listener_proxies.clone(),
             limits: Some(self.limits.to_message()),
             access_log: Some(self.access_log.to_message()),
             access_log_overrides: self
@@ -7090,6 +7318,58 @@ impl Daemon {
         Ok(self.maintenance.get(app).copied())
     }
 
+    /// Section 4.12: put a virtual host into maintenance mode or take it
+    /// out, recorded so a daemon restart keeps it, announced as an event,
+    /// and pushed to the edge.
+    async fn set_host_maintenance(&mut self, host: &str, on: bool) -> Result<Option<u64>, String> {
+        let known = self
+            .store
+            .hosts()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|(name, _)| name == host);
+
+        if !known {
+            return Err(format!("no virtual host named {host}"));
+        }
+
+        let was = self.host_maintenance.get(host).copied();
+        let subject = format!("host {host}");
+
+        match (on, was) {
+            (true, Some(since)) => return Ok(Some(since)),
+            (false, None) => return Ok(None),
+            (true, None) => {
+                let since = crate::model::now_unix_ms();
+                self.store
+                    .set_host_maintenance(host, Some(since))
+                    .map_err(|error| error.to_string())?;
+                self.host_maintenance.insert(host.to_owned(), since);
+                self.events.emit(
+                    "maintenance.changed",
+                    &subject,
+                    "notice",
+                    "maintenance on: the edge serves the maintenance page for every route of the host",
+                );
+            }
+            (false, Some(_)) => {
+                self.store
+                    .set_host_maintenance(host, None)
+                    .map_err(|error| error.to_string())?;
+                self.host_maintenance.remove(host);
+                self.events.emit(
+                    "maintenance.changed",
+                    &subject,
+                    "notice",
+                    "maintenance off: the host serves again",
+                );
+            }
+        }
+
+        self.push_snapshot().await?;
+        Ok(self.host_maintenance.get(host).copied())
+    }
+
     /// Section 11.2: put a change to the access log in force, or put the
     /// changes back (every one, or those for one application), and send
     /// the edge the result; with neither, only say what is in force.
@@ -8016,6 +8296,23 @@ impl Daemon {
         if self.owns_log {
             candidates.push((self.locations.daemon_log(), false));
         }
+
+        // Section 11.2: the files virtual hosts name for their own
+        // records, which the edge writes and reopens as it does its own.
+
+        let mut own: Vec<String> = self
+            .store
+            .hosts()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, host)| host.access_log_file)
+            .collect();
+        own.sort();
+        own.dedup();
+        candidates.extend(
+            own.into_iter()
+                .map(|file| (self.locations.logs.path.join(file), false)),
+        );
 
         // Section 9.9: a managed server writes its log itself and cannot
         // be told to reopen it, so its log is rotated in place.

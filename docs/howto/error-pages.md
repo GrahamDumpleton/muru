@@ -169,6 +169,41 @@ $ muructl maintenance off shop
 muru: shop serves as usual again
 ```
 
+### A whole virtual host
+
+A site served by several applications, or by static and upstream routes
+as well, is taken down in one step by its [virtual
+host](virtual-hosts.md):
+
+```console
+$ muructl maintenance on --host shop
+muru: host shop is in maintenance: clients get 503 maintenance until `muructl maintenance off --host shop`
+```
+
+While it is on, the edge answers every request for the host with `503`
+and the reason `maintenance`, whatever the route would have served: an
+application, a static directory or an upstream, and a path the host has
+no route for. Other hosts are served as usual, the same applications
+behind them included. What is let through is the host's own table, with
+the keys a release's has:
+
+```toml
+[host.shop.maintenance]
+exempt_paths = ['/health']
+exempt_addresses = ['10.0.0.0/8']
+bypass_cookie = 'muru_bypass=letmein'
+retry_after = '5m'
+```
+
+The page is the one for `503:maintenance`, or `503`, of the route, the
+host or the node, else the built-in page. A request the host redirects
+to HTTPS or to its canonical name is redirected first. `muructl host
+list` marks the host `[maintenance]`, the event `maintenance.changed`
+records each switch, and the state survives a daemon restart.
+`muructl maintenance off --host shop` serves the host again. An
+application's own maintenance mode is separate: it still applies to that
+application's requests on a host that is not in maintenance.
+
 ## Checking the configuration
 
 `muructl apply` refuses a table it cannot use: a key that is not a

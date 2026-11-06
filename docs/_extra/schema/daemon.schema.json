@@ -553,7 +553,7 @@
     },
     "Compression": {
       "additionalProperties": false,
-      "description": "The `[compression]` table: how the edge compresses responses. Every key is optional.",
+      "description": "The `[compression]` table: how the edge compresses responses. Every key is optional. A virtual host and a route take the same table, where a key left out is the level beneath's.",
       "properties": {
         "enabled": {
           "default": true,
@@ -819,6 +819,11 @@
           "$ref": "#/$defs/GroupMatch",
           "description": "What the group asks of a request beside its path: the client classes, hosts and methods it takes, each list any of its entries; a group asking more comes before one asking less, and a group with lists and no `paths` takes every path."
         },
+        "max_body_size": {
+          "description": "The largest body of a request the group serves, for example 200MB, which the edge enforces.",
+          "type": "string",
+          "x-default": "the release's"
+        },
         "max_lifetime": {
           "description": "How long a worker of the group lives before it is replaced, for example 1h, with jitter.",
           "type": "string",
@@ -929,13 +934,59 @@
         }
       ]
     },
+    "HeaderValues": {
+      "anyOf": [
+        {
+          "description": "One value.",
+          "type": "string"
+        },
+        {
+          "description": "A value for each time the header is sent.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "One value of a header, or several for a header sent more than once."
+    },
     "Host": {
       "additionalProperties": false,
       "description": "A virtual host, the `[host.NAME]` table.",
       "properties": {
+        "access_log": {
+          "description": "Which of the host's requests the access log writes: `on`, `errors` or `off`, replacing the `[logs]` table's. An application's own replaces it.",
+          "type": "string",
+          "x-default": "`access_log` in `[logs]`"
+        },
+        "access_log_exclude": {
+          "description": "Paths whose requests the access log leaves out, besides those the `[logs]` table leaves out.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "access_log_file": {
+          "description": "A file in the daemon's log directory that takes the host's records in place of `access.log`, for example `shop.log`.",
+          "type": "string"
+        },
+        "access_log_format": {
+          "description": "How the host's records are written: `json` or `combined`.",
+          "type": "string",
+          "x-default": "`access_log_format` in `[logs]`"
+        },
         "canonical": {
           "description": "The name the host is known by, for `use_canonical_name`.",
           "type": "string"
+        },
+        "canonical_redirect": {
+          "default": false,
+          "description": "Redirect requests for the host's other names to the canonical name.",
+          "type": "boolean"
+        },
+        "compression": {
+          "$ref": "#/$defs/Compression",
+          "description": "How responses to the host's requests are compressed, each key replacing the daemon's `[compression]` value. A route's own replace them."
         },
         "default": {
           "default": false,
@@ -965,6 +1016,15 @@
           },
           "type": "array"
         },
+        "maintenance": {
+          "$ref": "#/$defs/Maintenance",
+          "description": "What the host's maintenance mode lets through, while `muructl maintenance on --host` has it on."
+        },
+        "max_body_size": {
+          "description": "The largest request body for the host's routes, for example 1MB, replacing the daemon's `[limits]` value. A route's own replaces it.",
+          "type": "string",
+          "x-default": "`max_body_size` in `[limits]`"
+        },
         "names": {
           "description": "The names it answers to: exact names, or `*.example.com` for one label. Compared case-insensitively, without a port or trailing dot.",
           "items": {
@@ -978,6 +1038,23 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "request_headers": {
+          "$ref": "#/$defs/RequestHeaders",
+          "description": "Headers removed from, and set on, the host's requests before anything is asked to serve them. A route's own are applied after them."
+        },
+        "response_headers": {
+          "$ref": "#/$defs/ResponseHeaders",
+          "description": "Headers removed from, set on and added to every response to the host's requests. A route's own are applied after them."
+        },
+        "slow": {
+          "description": "How slow a request is to be written under `access_log = \"errors\"`.",
+          "type": "string",
+          "x-default": "`slow` in `[logs]`"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/RequestTimeouts",
+          "description": "The timeouts of a request for the host's routes, each replacing the daemon's `[limits]` value. A route's own replace them."
         },
         "tls": {
           "$ref": "#/$defs/HostTls",
@@ -1153,6 +1230,14 @@
           "type": "array",
           "x-default": "every client"
         },
+        "limits": {
+          "$ref": "#/$defs/ListenerLimits",
+          "description": "The listener's own limits on its connections and on reading a request's head, each replacing the `[limits]` value for the connections it accepts."
+        },
+        "proxy": {
+          "$ref": "#/$defs/Proxy",
+          "description": "The listener's own trusted proxies and header types, in place of the whole `[proxy]` table for the connections it accepts. An empty table trusts nothing."
+        },
         "tls": {
           "default": false,
           "description": "Whether TLS is terminated on it, with the certificates of the virtual hosts it serves, chosen by SNI.",
@@ -1162,6 +1247,65 @@
       "required": [
         "address"
       ],
+      "type": "object"
+    },
+    "ListenerLimits": {
+      "additionalProperties": false,
+      "description": "A listener's `limits` table: the keys of `[limits]` that bound a connection and the reading of a request's head, each replacing the node's for the connections the listener accepts.",
+      "properties": {
+        "header_read_timeout": {
+          "description": "Time allowed for a complete request head.",
+          "type": "string",
+          "x-default": "`header_read_timeout` in `[limits]`"
+        },
+        "http2": {
+          "$ref": "#/$defs/Http2Limits",
+          "description": "HTTP/2 settings."
+        },
+        "keep_alive_timeout": {
+          "description": "Idle time before a keep-alive connection is closed.",
+          "type": "string",
+          "x-default": "`keep_alive_timeout` in `[limits]`"
+        },
+        "keep_alive_timeout_proxy": {
+          "description": "The same for connections from trusted proxies.",
+          "type": "string",
+          "x-default": "`keep_alive_timeout_proxy` in `[limits]`"
+        },
+        "max_connections": {
+          "description": "Open connections on the listener.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "`max_connections` in `[limits]`"
+        },
+        "max_connections_per_client": {
+          "description": "Open connections per client address; 0 disables it.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "`max_connections_per_client` in `[limits]`"
+        },
+        "max_header_bytes": {
+          "description": "Largest request head, for example 64KB.",
+          "type": "string",
+          "x-default": "`max_header_bytes` in `[limits]`"
+        },
+        "max_headers": {
+          "description": "Most headers in a request.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "`max_headers` in `[limits]`"
+        },
+        "max_requests_per_connection": {
+          "description": "Requests served on one connection before it is closed; 0 for no limit.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "`max_requests_per_connection` in `[limits]`"
+        }
+      },
       "type": "object"
     },
     "LogLevel": {
@@ -1220,6 +1364,11 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "access_log_format": {
+          "default": "json",
+          "description": "How the access log's records are written: `json` (the default), one object a line, or `combined`, the combined log format of Apache and nginx.",
+          "type": "string"
         },
         "compress": {
           "default": "zstd",
@@ -1421,6 +1570,11 @@
           "default": false,
           "description": "Reachable only through internal redirects: a client's request for its path is answered 404.",
           "type": "boolean"
+        },
+        "max_body_size": {
+          "description": "The largest body of a request the mount serves, for example 200MB, which the edge enforces.",
+          "type": "string",
+          "x-default": "the worker group's, else the release's"
         },
         "max_connections": {
           "description": "Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; each holds a request slot when absent.",
@@ -1923,6 +2077,11 @@
           "$ref": "#/$defs/Maintenance",
           "description": "What maintenance mode lets through."
         },
+        "max_body_size": {
+          "description": "The largest body of a request the release serves, for example 50MB, which the edge enforces.",
+          "type": "string",
+          "x-default": "the host's, else `max_body_size` in `[limits]`"
+        },
         "max_lifetime": {
           "description": "How long a worker lives before it is replaced, for example 1h, with jitter; off when absent.",
           "type": "string"
@@ -2021,7 +2180,7 @@
         },
         "timeouts": {
           "$ref": "#/$defs/Timeouts",
-          "description": "The timeouts the host enforces on its workers."
+          "description": "The timeouts the host enforces on its workers, and those of a request the release serves, which the edge enforces."
         }
       },
       "type": "object"
@@ -2040,6 +2199,82 @@
           "type": "string"
         }
       ]
+    },
+    "RequestHeaders": {
+      "additionalProperties": false,
+      "description": "What a virtual host or a route does to the headers of a request before anything is asked to serve it: the `request_headers` table. The names are removed first, then the headers set.",
+      "properties": {
+        "remove": {
+          "description": "Headers removed from the request, by name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "set": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Headers set on the request, by name, each replacing any the client sent.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "RequestTimeouts": {
+      "additionalProperties": false,
+      "description": "The timeouts of one request, the `timeouts` table of a virtual host or a route. Each key replaces the same key of the level beneath, down to the daemon's `[limits]`.",
+      "properties": {
+        "body_idle_timeout": {
+          "description": "Time a client may pause while sending a body.",
+          "type": "string",
+          "x-default": "`body_idle_timeout` in `[limits]`"
+        },
+        "queue_timeout": {
+          "description": "Time a request may wait for a worker.",
+          "type": "string",
+          "x-default": "`queue_timeout` in `[limits]`"
+        },
+        "request_deadline": {
+          "description": "Time a request may take to produce its response head.",
+          "type": "string",
+          "x-default": "`request_deadline` in `[limits]`"
+        },
+        "response_idle_timeout": {
+          "description": "Time a worker may pause mid-response.",
+          "type": "string",
+          "x-default": "`response_idle_timeout` in `[limits]`"
+        }
+      },
+      "type": "object"
+    },
+    "ResponseHeaders": {
+      "additionalProperties": false,
+      "description": "What a virtual host or a route does to the headers of a response: the `response_headers` table. The names are removed first, then the headers set, then those added.",
+      "properties": {
+        "add": {
+          "additionalProperties": {
+            "$ref": "#/$defs/HeaderValues"
+          },
+          "description": "Headers added to the response beside any it has, by name: a value, or a list of values for a header sent more than once.",
+          "type": "object"
+        },
+        "remove": {
+          "description": "Headers removed from the response, by name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "set": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Headers set on the response, by name, each replacing any the response has.",
+          "type": "object"
+        }
+      },
+      "type": "object"
     },
     "Route": {
       "additionalProperties": false,
@@ -2068,6 +2303,10 @@
           "default": "strict",
           "description": "`strict` (the default), which matches names as they are on disk, or `insensitive`.",
           "type": "string"
+        },
+        "compression": {
+          "$ref": "#/$defs/Compression",
+          "description": "How the route's responses are compressed, each key replacing the host's, or else the daemon's `[compression]` value."
         },
         "error_override": {
           "$ref": "#/$defs/ErrorOverride",
@@ -2118,9 +2357,9 @@
           "description": "The client classes the route takes; every request without it. Among routes with the same path, one naming the request's class comes first."
         },
         "max_body_size": {
-          "description": "The largest request body, for example 1GB, replacing the daemon's `[limits]` value for the route. On an upload route it bounds the body as received, files included.",
+          "description": "The largest request body, for example 1GB, replacing the host's, or else the daemon's `[limits]` value, for the route. On an upload route it bounds the body as received, files included.",
           "type": "string",
-          "x-default": "`max_body_size` in `[limits]`"
+          "x-default": "the host's `max_body_size`"
         },
         "max_file_size": {
           "description": "The largest uploaded file, for example 512MB; no limit without it.",
@@ -2167,6 +2406,14 @@
           "description": "Whether a directory asked for without a trailing slash is redirected to the slash form.",
           "type": "boolean"
         },
+        "request_headers": {
+          "$ref": "#/$defs/RequestHeaders",
+          "description": "Headers removed from, and set on, the route's requests before anything is asked to serve them, after the host's."
+        },
+        "response_headers": {
+          "$ref": "#/$defs/ResponseHeaders",
+          "description": "Headers removed from, set on and added to every response to the route's requests, after the host's."
+        },
         "spool_quota": {
           "default": "10GB",
           "description": "What the application's stored uploads may hold at once when a request on the route arrives.",
@@ -2175,6 +2422,10 @@
         "static": {
           "description": "The directory served by the edge, instead of an application.",
           "type": "string"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/RequestTimeouts",
+          "description": "The timeouts of the route's requests, each replacing the host's, or else the daemon's `[limits]` value."
         },
         "traffic": {
           "$ref": "#/$defs/Traffic",
@@ -2234,6 +2485,14 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "request_headers": {
+          "$ref": "#/$defs/RequestHeaders",
+          "description": "The headers removed from and set on the route's requests, in place of the route's `request_headers`."
+        },
+        "response_headers": {
+          "$ref": "#/$defs/ResponseHeaders",
+          "description": "The headers removed from, set on and added to the route's responses, in place of the route's `response_headers`."
         },
         "target": {
           "$ref": "#/$defs/RouteTarget",
@@ -2594,8 +2853,13 @@
     },
     "Timeouts": {
       "additionalProperties": false,
-      "description": "The `[timeouts]` table of a release or a `[tool.muru]` table: the timeouts the host enforces on its workers. The edge's own timeouts are the daemon's `[limits]`.",
+      "description": "The `[timeouts]` table of a release or a `[tool.muru]` table: the timeouts the host enforces on its workers, and the four the edge enforces on a request the release serves, which are otherwise the virtual host's or the daemon's `[limits]`.",
       "properties": {
+        "body_idle_timeout": {
+          "description": "Time a client may pause while sending a body to what is served here.",
+          "type": "string",
+          "x-default": "the host's, else `body_idle_timeout` in `[limits]`"
+        },
         "gil_stall_timeout": {
           "default": "30s",
           "description": "How long a worker may go with no thread running Python, or with no report to its host, before it is replaced as for the hard timeout.",
@@ -2614,6 +2878,21 @@
           "default": "10s",
           "description": "How long an ASGI worker's event loop may go without running before the worker is replaced as for the hard timeout.",
           "type": "string"
+        },
+        "queue_timeout": {
+          "description": "Time a request served here may wait for a worker, which the edge enforces; the virtual host's when absent, or else the daemon's `[limits]` value.",
+          "type": "string",
+          "x-default": "the host's, else `queue_timeout` in `[limits]`"
+        },
+        "request_deadline": {
+          "description": "Time a request served here may take to produce its response head.",
+          "type": "string",
+          "x-default": "the host's, else `request_deadline` in `[limits]`"
+        },
+        "response_idle_timeout": {
+          "description": "Time a worker here may pause mid-response.",
+          "type": "string",
+          "x-default": "the host's, else `response_idle_timeout` in `[limits]`"
         },
         "shutdown_timeout": {
           "default": "5s",

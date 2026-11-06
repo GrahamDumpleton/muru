@@ -41,13 +41,18 @@ def recycled(log: str) -> list[str]:
 
 
 def test_a_worker_over_the_hard_limit_is_replaced_at_once() -> None:
+    # The unique set size is measured, as for the soft limit below: the
+    # resident size falls on macOS as the system compresses pages the
+    # worker holds and does not touch, which can take a worker back under
+    # a limit while it still holds everything it allocated.
+
     server = support.start(
         "plain_wsgi:application",
         workers=1,
         threads=2,
         args=[
             "--memory",
-            "measure=rss",
+            "measure=uss",
             "--memory",
             "hard_limit=96MB",
             "--memory",
@@ -60,7 +65,7 @@ def test_a_worker_over_the_hard_limit_is_replaced_at_once() -> None:
         assert int(server.get("/grow?mb=160").body) >= 160 * MB
         wait_for(lambda: len(recycled(server.log())) >= 1, server=server)
         line = recycled(server.log())[0]
-        assert "over the hard limit of 96MB" in line and "rss" in line
+        assert "over the hard limit of 96MB" in line and "uss" in line
 
         # Section 11.7: the event says what the worker held most of.
 
@@ -78,7 +83,7 @@ def test_a_worker_over_the_soft_limit_reclaims_and_then_recycles() -> None:
         threads=2,
         args=[
             "--memory",
-            "measure=rss",
+            "measure=uss",
             "--memory",
             "soft_limit=96MB",
             "--memory",
