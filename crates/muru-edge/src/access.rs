@@ -29,7 +29,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -795,6 +795,9 @@ pub struct AccessLog {
     destination: Destination,
     /// Which records are written, swapped whole by `set_filters`.
     filters: RwLock<Filters>,
+    /// Whether the filters write any record in the combined format, kept
+    /// beside them so a request asks without taking their lock.
+    agent: AtomicBool,
     ring: Mutex<VecDeque<Record>>,
     minute: Mutex<[Bucket; MINUTE]>,
     metrics: Metrics,
@@ -1042,6 +1045,7 @@ impl AccessLog {
 
         Ok(Self {
             destination: config.destination,
+            agent: AtomicBool::new(config.filter.format == Format::Combined),
             filters: RwLock::new(Filters::node(config.filter)),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
             minute: Mutex::new([Bucket::default(); MINUTE]),
@@ -1069,24 +1073,23 @@ impl AccessLog {
     /// Put new filters in force: every record completed from now on is
     /// written by them.
     pub fn set_filters(&self, filters: Filters) {
+        self.agent.store(filters.wants_agent(), Ordering::Relaxed);
         *self.filters.write().expect("access log filters poisoned") = filters;
     }
 
     /// Change the filters in force in place, as one step, and return
     /// what `change` does.
     pub fn update_filters<T>(&self, change: impl FnOnce(&mut Filters) -> T) -> T {
-        change(&mut self.filters.write().expect("access log filters poisoned"))
+        let mut filters = self.filters.write().expect("access log filters poisoned");
+        let answer = change(&mut filters);
+        self.agent.store(filters.wants_agent(), Ordering::Relaxed);
+        answer
     }
 
     /// Whether a request's referrer and user agent are kept for its
     /// record: only while some record is written in the combined format.
     pub fn wants_agent(&self) -> bool {
-        matches!(self.destination, Destination::File(_))
-            && self
-                .filters
-                .read()
-                .expect("access log filters poisoned")
-                .wants_agent()
+        self.agent.load(Ordering::Relaxed) && matches!(self.destination, Destination::File(_))
     }
 
     /// The request metrics the records feed (section 11.1).
