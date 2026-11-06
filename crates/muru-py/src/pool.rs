@@ -91,6 +91,8 @@ pub struct RequestInfo {
     /// identifiers: an ASGI request holds one for each `sync_to_async`
     /// or `asyncio.to_thread` call it awaits.
     pub sync: Vec<u64>,
+    /// Those threads' native identifiers, for a reader from outside.
+    pub sync_native: Vec<u64>,
     /// The channel of an ASGI request, whose task the soft timeout cancels.
     pub channel: Option<Py<Channel>>,
     /// Wakes a bridge call the application thread is blocked in.
@@ -267,6 +269,11 @@ pub struct RequestSummary {
     pub thread: Option<u64>,
     /// That thread's native identifier.
     pub native: Option<u64>,
+    /// The threads running its synchronous code on a pool of the event
+    /// loop's (section 6.6), by Python identifier.
+    pub sync: Vec<u64>,
+    /// Those threads' native identifiers.
+    pub sync_native: Vec<u64>,
 }
 
 /// The runtime's thread names by Python identifier, as a dict.
@@ -564,6 +571,7 @@ impl Shared {
                     thread: None,
                     native: None,
                     sync: Vec::new(),
+                    sync_native: Vec::new(),
                     channel: None,
                     interrupt: Arc::clone(&interrupt),
                     timed_out: false,
@@ -873,6 +881,7 @@ impl Shared {
             .find(|info| info.request_id == request_id)
         {
             info.sync.push(thread);
+            info.sync_native.push(native_thread_id());
         }
     }
 
@@ -914,7 +923,11 @@ impl Shared {
             .find(|info| info.request_id == request_id)
             && let Some(index) = info.sync.iter().position(|held| *held == thread)
         {
+            // The two lists are filled and emptied together, so a
+            // thread has the same place in both.
+
             info.sync.swap_remove(index);
+            info.sync_native.swap_remove(index);
         }
     }
 
@@ -979,6 +992,8 @@ impl Shared {
                 elapsed_ms: now.saturating_duration_since(info.started).as_millis() as u64,
                 thread: info.thread,
                 native: info.native,
+                sync: info.sync.clone(),
+                sync_native: info.sync_native.clone(),
             })
             .collect()
     }

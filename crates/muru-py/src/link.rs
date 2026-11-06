@@ -692,7 +692,7 @@ fn bookkeeping_answer(id: i64, shared: &Shared) -> String {
         .into_iter()
         .map(|request| {
             format!(
-                "{{\"request_id\":{},\"method\":{},\"path\":{},\"elapsed_ms\":{},\"thread\":{},\"native\":{}}}",
+                "{{\"request_id\":{},\"method\":{},\"path\":{},\"elapsed_ms\":{},\"thread\":{},\"native\":{},\"sync_threads\":[{}],\"sync_native\":[{}]}}",
                 serde_json_string(&request.request_id),
                 serde_json_string(&request.method),
                 serde_json_string(&request.path),
@@ -702,7 +702,9 @@ fn bookkeeping_answer(id: i64, shared: &Shared) -> String {
                     .map_or_else(|| "null".to_owned(), |thread| thread.to_string()),
                 request
                     .native
-                    .map_or_else(|| "null".to_owned(), |native| native.to_string())
+                    .map_or_else(|| "null".to_owned(), |native| native.to_string()),
+                identifiers(&request.sync),
+                identifiers(&request.sync_native)
             )
         })
         .collect();
@@ -716,6 +718,15 @@ fn bookkeeping_answer(id: i64, shared: &Shared) -> String {
         requests.join(","),
         names.join(",")
     )
+}
+
+/// Thread identifiers as the members of a JSON array.
+fn identifiers(threads: &[u64]) -> String {
+    threads
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// A string as a JSON literal, escaped by hand so the runtime needs no

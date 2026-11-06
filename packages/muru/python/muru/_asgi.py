@@ -75,6 +75,19 @@ def heartbeat(loop: asyncio.AbstractEventLoop) -> None:
     loop.call_soon_threadsafe(beat)
 
 
+def _name_thread() -> None:
+    """Tell the runtime the calling thread's name.
+
+    A reader from outside the worker (section 11.7) sees a thread by its
+    identifier alone, and the runtime's bookkeeping is where it finds
+    the names.
+    """
+
+    from muru import _native
+
+    _native.name_thread(threading.current_thread().name)
+
+
 class SyncPool(ThreadPoolExecutor):
     """A pool the event loop runs synchronous code on (section 6.6).
 
@@ -86,7 +99,11 @@ class SyncPool(ThreadPoolExecutor):
     """
 
     def __init__(self, max_workers: int, thread_name_prefix: str, pool: int = POOL_LOOP) -> None:
-        super().__init__(max_workers=max_workers, thread_name_prefix=thread_name_prefix)
+        super().__init__(
+            max_workers=max_workers,
+            thread_name_prefix=thread_name_prefix,
+            initializer=_name_thread,
+        )
         self.pool = pool
 
     def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:

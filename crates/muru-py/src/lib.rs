@@ -291,6 +291,13 @@ fn sync_left(request_id: Option<&str>, pool: usize) {
     }
 }
 
+/// Record the calling thread's name with the runtime, which is how a
+/// reader from outside names a thread Python created (section 11.7).
+#[pyfunction]
+fn name_thread(name: &str) {
+    pool::name_this_thread(name);
+}
+
 /// Say how many threads a pool for synchronous code has (section 6.6),
 /// and how many are running a call when the runtime samples the pool
 /// instead of being told of each call. Returns whether a worker is
@@ -347,6 +354,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sync_entered, m)?)?;
     m.add_function(wrap_pyfunction!(sync_left, m)?)?;
     m.add_function(wrap_pyfunction!(sync_pool, m)?)?;
+    m.add_function(wrap_pyfunction!(name_thread, m)?)?;
     m.add_function(wrap_pyfunction!(gc::gc_callback, m)?)?;
     m.add_function(wrap_pyfunction!(gc::gc_stats, m)?)?;
     m.add_class::<wsgi::Input>()?;

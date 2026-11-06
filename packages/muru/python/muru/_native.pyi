@@ -82,6 +82,9 @@ def sync_entered(request_id: str | None = None, pool: int = 0) -> None:
 def sync_left(request_id: str | None = None, pool: int = 0) -> None:
     """Note that the calling thread of a pool for sync code finished its call."""
 
+def name_thread(name: str) -> None:
+    """Record the calling thread's name, for a reader from outside the worker."""
+
 def sync_pool(pool: int, threads: int, busy: int | None = None) -> bool:
     """Say how many threads a pool for sync code has, and how many are busy when sampled."""
 
