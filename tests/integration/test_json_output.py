@@ -105,6 +105,12 @@ def test_apply_names_a_release_that_failed_and_why(daemon: Daemon, tmp_path: Pat
     applied = daemon.muructl("apply", "-f", str(config), "--json", check=False)
     assert applied.returncode == 1
     report = json.loads(applied.stdout)
-    assert report["errors"] == []
+
+    # Issue #439: a release that does not start stops the apply, so
+    # nothing is applied, and the report says why.
+
+    assert not report.get("applied"), report
+    (error,) = report["errors"]
+    assert error.startswith("broken@r1 did not start: "), error
     (change,) = [change for change in report["changes"] if change["subject"] == "broken@r1"]
     assert change["outcome"].startswith("failed: ") and len(change["outcome"]) > len("failed: ")

@@ -27,6 +27,18 @@ daemon = daemon_fixture
 
 SHOP_SOURCE = os.path.realpath(SHOP)
 
+# A host for shop.test, the default, with one route to shop.
+
+ROUTED = """[host.shop]
+names = ["shop.test"]
+default = true
+
+[[route]]
+host = "shop"
+app = "shop"
+path = "/"
+"""
+
 
 def release(app: str, release_id: str, source: Path | str = SHOP, **settings: object) -> str:
     """One `[app.NAME.release.ID]` table, with this interpreter."""
@@ -217,17 +229,8 @@ def test_serving_stages_a_release_and_promotes_it(daemon: Daemon, tmp_path: Path
     # preview header, while requests run through the apply. Issue #449:
     # one that nothing names is recorded and left stopped.
 
-    routed = """[host.shop]
-names = ["shop.test"]
-default = true
-
-[[route]]
-host = "shop"
-app = "shop"
-path = "/"
-"""
     config = tmp_path / "shop.toml"
-    config.write_text(routed + release("shop", "r1"))
+    config.write_text(ROUTED + release("shop", "r1"))
     assert apply(daemon, config).returncode == 0
     answers: list[str] = []
     stop = threading.Event()
@@ -242,7 +245,7 @@ path = "/"
 
     try:
         config.write_text(
-            routed
+            ROUTED
             + "traffic = { split = { r1 = 100, r2 = 0 } }\n\n"
             + "[app.shop]\nserving = 'r1'\n\n"
             + release("shop", "r1")
@@ -282,7 +285,7 @@ path = "/"
     declared = (
         release("shop", "r1") + release("shop", "r2", threads=1) + release("shop", "r3", threads=2)
     )
-    config.write_text(routed + "\n[app.shop]\nserving = 'r2'\n\n" + declared)
+    config.write_text(ROUTED + "\n[app.shop]\nserving = 'r2'\n\n" + declared)
     planned = apply(daemon, config, "--dry-run")
     assert [line.split()[:2] for line in planned.stdout.splitlines()[1:3]] == [
         ["update-route", "route"],
@@ -297,12 +300,80 @@ path = "/"
 
     # Naming the stopped r3 starts and promotes it.
 
-    config.write_text(routed + "\n[app.shop]\nserving = 'r3'\n\n" + declared)
+    config.write_text(ROUTED + "\n[app.shop]\nserving = 'r3'\n\n" + declared)
     started = apply(daemon, config)
     assert "promote         shop@r3                  ready and serving" in started.stdout, (
         started.stdout
     )
     assert json.loads(daemon.request("/", host="shop.test").body)["release"] == "r3"
+
+
+def test_a_release_that_does_not_start_leaves_nothing_changed(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    # Issue #439: an apply starts the releases it adds before it writes
+    # anything that points at them. One that does not start stops it:
+    # the releases and the application it added go, and the host and
+    # route the same files declare are not written.
+
+    config = tmp_path / "shop.toml"
+    config.write_text(release("shop", "r1"))
+    assert apply(daemon, config).returncode == 0
+    config.write_text(
+        ROUTED
+        + release("other", "r1")
+        + release("shop", "r1")
+        + release("shop", "r2", threads=2)
+        + release("shop", "r3", entrypoint="shop.wsgi:missing")
+    )
+
+    refused = apply(daemon, config)
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    lines = refused.stdout.splitlines()
+    assert lines[0] == "muru: nothing applied:", refused.stdout
+    assert lines[1].startswith("  shop@r3 did not start: "), refused.stdout
+    outcomes = {line[18:42].strip(): line[43:] for line in lines[2:]}
+    assert outcomes["shop@r3"].startswith("failed: "), refused.stdout
+    del outcomes["shop@r3"]
+    assert set(outcomes.values()) == {"not applied"}, refused.stdout
+    assert {"other", "other@r1", "shop@r2", "host shop", "route shop /"} <= set(outcomes)
+
+    exported = tomllib.loads(daemon.muructl("config", "export").stdout)
+    assert list(exported["app"]) == ["shop"], exported
+    assert list(exported["app"]["shop"]["release"]) == ["r1"], exported
+    assert "host" not in exported and "route" not in exported, exported
+    assert daemon.releases() == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
+    assert json.loads(daemon.get("/").body)["release"] == "r1"
+    assert "config.apply_failed" in daemon.events()
+
+
+def test_a_route_and_a_promotion_reach_the_edge_in_one_snapshot(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    # Issue #439: the commit phase writes the route and the promotion
+    # `serving` asks for in one transaction, and the edge has both from
+    # one snapshot.
+
+    config = tmp_path / "shop.toml"
+    config.write_text(release("shop", "r1"))
+    assert apply(daemon, config).returncode == 0
+    config.write_text(release("shop", "r1") + release("shop", "r2", threads=2))
+    assert apply(daemon, config, "--hold").returncode == 0
+    daemon.wait_for_routing("shop")
+
+    before = daemon.snapshot_version()
+    config.write_text(
+        ROUTED
+        + "[app.shop]\nserving = 'r2'\n\n"
+        + release("shop", "r1")
+        + release("shop", "r2", threads=2)
+    )
+    applied = apply(daemon, config, "--retain", "0")
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert "promote         shop@r2                  ready and serving" in applied.stdout
+    assert daemon.snapshot_version() == before + 1
+    response = daemon.request("/", host="shop.test")
+    assert json.loads(response.body)["release"] == "r2"
 
 
 def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path: Path) -> None:

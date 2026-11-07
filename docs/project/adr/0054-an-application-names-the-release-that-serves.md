@@ -145,4 +145,6 @@ release an apply adds but the last in id order, so the plan's `serving
 until` detail went. Issue #448 refused promoting a rolled-back candidate,
 where the next apply had promoted it without its gates. Issue #449 left
 stopped an added release that nothing serves or names, where it had been
-started held.
+started held. ADR 0055 then carried out an apply in two phases, so that a
+promotion is written with the hosts and routes and reaches the edge in
+their snapshot (issue #439).

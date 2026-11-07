@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
-use crate::config::{self, Action, Added, Change, Plan};
+use crate::config::{self, Action, Added, Plan};
 use crate::daemon::{CertificateChanges, Command, Handle, RolloutAction};
 use crate::model::{
     Event, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutStep, now_unix_ms,
@@ -1618,74 +1618,60 @@ impl Admin for Service {
             return Ok(Response::new(report));
         }
 
-        // The plan is carried out in order, each change's outcome going
-        // into the report; a failure does not stop the rest.
+        // Section 10.10: the prepare phase records the releases the plan
+        // adds, which --no-wait returns after, and starts them; the commit
+        // phase then writes the rest in one transaction and gives the edge
+        // one snapshot of it.
 
-        let mut failures = 0;
+        let tls = document.host.values().any(|host| host.tls.is_some());
+        let mut prepared = Prepared::default();
 
-        for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
-            message.outcome = self.carry_out(change, &deploying).await;
-
-            if message.outcome.starts_with("failed") {
-                failures += 1;
-            }
+        if let Err(error) = self.record(&plan, &mut report, &mut prepared) {
+            self.undo(&mut report, prepared, error).await;
+            return Ok(Response::new(report));
         }
 
-        report.applied = true;
+        let starts = plan.changes.iter().any(|change| {
+            matches!(
+                change.action,
+                Action::Deploy {
+                    added: Added::Held | Added::Serving,
+                    ..
+                } | Action::Promote { .. }
+            )
+        });
 
-        // Hosts and routes reach the edge with the next snapshot. An apply
-        // that changes nothing still reads the TLS hosts' certificate
-        // files again (section 4.2), so applying the same file after a
-        // renewal is enough. A snapshot the edge does not take fails the
-        // apply, though each change was made.
+        if !deploying.wait && starts {
+            let mut early = report.clone();
+            early.applied = true;
 
-        if plan
-            .changes
-            .iter()
-            .any(|change| change.action.reconfigures())
-        {
-            if let Err(error) = self.reconfigure().await {
-                report.snapshot_error = error;
-                failures += 1;
-            }
-        } else if document.host.values().any(|host| host.tls.is_some()) {
-            match self.refresh_certificates().await {
-                Ok(changes) => {
-                    if let Some(error) = changes.refused {
-                        report.snapshot_error = format!(
-                            "the renewed certificates of {}: {error}",
-                            changes.renewed.join(", ")
-                        );
-                        failures += 1;
-                    } else if !changes.renewed.is_empty() {
-                        report.notes.push(format!(
-                            "certificates of {} renewed; the edge has them",
-                            changes.renewed.join(", ")
-                        ));
-                    }
-
-                    for (host, why) in changes.kept {
-                        report
-                            .warnings
-                            .push(format!("host {host} keeps its certificate: {why}"));
-                    }
+            for message in &mut early.changes {
+                if message.outcome.is_empty() {
+                    message.outcome = "pending".to_owned();
                 }
-                Err(error) => report.warnings.push(error),
             }
+
+            early.notes.push(
+                "the rest of the apply waits for its releases to start; a config.applied or \
+                 config.apply_failed event says how it ended"
+                    .to_owned(),
+            );
+
+            let service = Service {
+                handle: self.handle.clone(),
+            };
+
+            tokio::spawn(async move {
+                service
+                    .complete(&plan, &mut report, prepared, &deploying, tls)
+                    .await;
+            });
+
+            return Ok(Response::new(early));
         }
 
-        let summary = format!(
-            "{} changes applied, {} failed, {} releases unchanged",
-            plan.changes.len(),
-            failures,
-            plan.unchanged
-        );
-        self.handle.events.emit(
-            "config.applied",
-            "config",
-            if failures == 0 { "notice" } else { "warning" },
-            &summary,
-        );
+        self.complete(&plan, &mut report, prepared, &deploying, tls)
+            .await;
         Ok(Response::new(report))
     }
 
@@ -1793,6 +1779,21 @@ fn compression_note(table: Option<&muru_config::Compression>) -> String {
     }
 }
 
+/// What an apply's prepare phase did, for its undoing when the apply
+/// fails (section 10.10).
+#[derive(Default)]
+struct Prepared {
+    /// The applications it created.
+    apps: Vec<String>,
+    /// Each application the daemon had whose identity or priority it set,
+    /// as it was.
+    settings: Vec<crate::model::App>,
+    /// The releases it recorded.
+    releases: Vec<(String, String)>,
+    /// The releases the daemon had that it started.
+    started: Vec<(String, String)>,
+}
+
 /// How an apply deploys the releases it adds and promotes the ones
 /// `serving` names (section 10.4).
 struct Deploying {
@@ -1837,135 +1838,6 @@ impl Service {
         })
         .await
         .map_err(|error| Status::internal(error.to_string()))
-    }
-
-    /// Carry out one change of a plan and say how it went: an outcome
-    /// starting with "failed" is counted as a failure.
-    async fn carry_out(&self, change: &Change, deploying: &Deploying) -> String {
-        let store = &self.handle.store;
-
-        let outcome = match &change.action {
-            Action::CreateApp { app } => store
-                .ensure_app(app)
-                .map(|_| "created".to_owned())
-                .map_err(|error| error.to_string()),
-            Action::SetAppIdentity {
-                app,
-                user,
-                group,
-                umask,
-            } => store
-                .set_app_identity(app, user.as_deref(), group.as_deref(), umask.as_deref())
-                .map(|()| "set".to_owned())
-                .map_err(|error| error.to_string()),
-            Action::SetAppPriority { app, priority } => store
-                .set_app_priority(app, *priority)
-                .map(|()| "set".to_owned())
-                .map_err(|error| error.to_string()),
-            Action::SetAppAccessLog { app, access_log } => store
-                .set_app_access_log(app, access_log)
-                .map(|()| "set".to_owned())
-                .map_err(|error| error.to_string()),
-            Action::Deploy {
-                app,
-                id,
-                spec,
-                added: Added::Stopped,
-            } => self.record_declared(app, id, spec),
-            Action::Deploy {
-                app,
-                id,
-                spec,
-                added,
-            } => {
-                let hold = *added == Added::Held;
-                self.deploy_declared(app, id, spec, hold, deploying).await
-            }
-            Action::Promote { app, id } => self.promote_declared(app, id, deploying).await,
-            Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
-            Action::RemoveApp { app } => store
-                .delete_app(app)
-                .map(|()| "removed".to_owned())
-                .map_err(|error| error.to_string()),
-            Action::PutHost { name, host, new } => store
-                .put_host(name, host)
-                .map(|()| if *new { "created" } else { "updated" }.to_owned())
-                .map_err(|error| error.to_string()),
-            Action::RemoveHost { name } => store
-                .delete_host(name)
-                .map(|()| "removed".to_owned())
-                .map_err(|error| error.to_string()),
-            Action::PutRoute { route, new } => {
-                let before = store
-                    .routes()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|stored| stored.host == route.host && stored.key() == route.key())
-                    .and_then(|stored| stored.traffic);
-
-                // Section 9.4: a changed policy is an event of its own.
-
-                if before != route.traffic {
-                    self.handle.events.emit(
-                        "traffic_policy.changed",
-                        &format!("route {} {}", route.host, route.key()),
-                        "notice",
-                        &crate::config::describe_traffic(route.traffic.as_ref()),
-                    );
-                }
-
-                store
-                    .put_route(route)
-                    .map(|()| if *new { "created" } else { "updated" }.to_owned())
-                    .map_err(|error| error.to_string())
-            }
-            Action::RemoveRoute { host, path } => store
-                .delete_route(host, path)
-                .map(|()| "removed".to_owned())
-                .map_err(|error| error.to_string()),
-            Action::PutUpstream {
-                name,
-                upstream,
-                new,
-            } => store
-                .put_upstream(name, upstream)
-                .map(|()| if *new { "created" } else { "updated" }.to_owned())
-                .map_err(|error| error.to_string()),
-            Action::RemoveUpstream { name } => store
-                .delete_upstream(name)
-                .map(|()| "removed".to_owned())
-                .map_err(|error| error.to_string()),
-            Action::PutOverlay { name, overlay, new } => store
-                .put_overlay(name, overlay)
-                .map(|()| if *new { "created" } else { "updated" }.to_owned())
-                .map_err(|error| error.to_string()),
-            Action::RemoveOverlay { name } => store
-                .delete_overlay(name)
-                .map(|()| "removed".to_owned())
-                .map_err(|error| error.to_string()),
-            Action::PutClientClass {
-                class,
-                position,
-                new,
-            } => store
-                .put_client_class(class, *position)
-                .map(|()| if *new { "created" } else { "updated" }.to_owned())
-                .map_err(|error| error.to_string()),
-            Action::RemoveClientClass { name } => store
-                .delete_client_class(name)
-                .map(|()| "removed".to_owned())
-                .map_err(|error| error.to_string()),
-            Action::PutRateLimit { name, limit, new } => store
-                .put_rate_limit(name, limit)
-                .map(|()| if *new { "created" } else { "updated" }.to_owned())
-                .map_err(|error| error.to_string()),
-            Action::RemoveRateLimit { name } => store
-                .delete_rate_limit(name)
-                .map(|()| "removed".to_owned())
-                .map_err(|error| error.to_string()),
-        };
-
-        outcome.unwrap_or_else(|error| format!("failed: {error}"))
     }
 
     /// What the plan's deploys and promotions would do beyond starting
@@ -2014,117 +1886,402 @@ impl Service {
             .collect()
     }
 
-    /// Deploy a declared release and say how it went: recorded when the
-    /// apply does not wait, else its state, with whether it serves or is
-    /// held.
-    async fn deploy_declared(
+    /// The prepare phase's records (section 10.10): the applications the
+    /// plan creates, with the identity and priority their processes start
+    /// with, and the releases it adds, a stopped one as it stays. Fails
+    /// with the change that failed and why.
+    fn record(
+        &self,
+        plan: &Plan,
+        report: &mut pb::ConfigReport,
+        prepared: &mut Prepared,
+    ) -> Result<(), String> {
+        let store = &self.handle.store;
+
+        for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
+            // An application's identity and priority are kept as they
+            // were, to put back should the apply fail.
+
+            if let Action::SetAppIdentity { app, .. } | Action::SetAppPriority { app, .. } =
+                &change.action
+                && !prepared.apps.contains(app)
+                && !prepared.settings.iter().any(|kept| &kept.name == app)
+                && let Ok(kept) = store.app(app)
+            {
+                prepared.settings.push(kept);
+            }
+
+            let outcome = match &change.action {
+                Action::CreateApp { app } => store.ensure_app(app).map(|_| {
+                    prepared.apps.push(app.clone());
+                    "created".to_owned()
+                }),
+                Action::SetAppIdentity {
+                    app,
+                    user,
+                    group,
+                    umask,
+                } => store
+                    .set_app_identity(app, user.as_deref(), group.as_deref(), umask.as_deref())
+                    .map(|()| "set".to_owned()),
+                Action::SetAppPriority { app, priority } => store
+                    .set_app_priority(app, *priority)
+                    .map(|()| "set".to_owned()),
+                Action::Deploy {
+                    app,
+                    id,
+                    spec,
+                    added,
+                } => self.record_release(app, id, spec, *added).inspect(|_| {
+                    prepared.releases.push((app.clone(), id.clone()));
+                }),
+                _ => continue,
+            };
+
+            match outcome {
+                Ok(outcome) => message.outcome = outcome,
+                Err(error) => {
+                    message.outcome = format!("failed: {error}");
+                    return Err(format!("{}: {error}", change.subject()));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Record a release the plan adds: left stopped, for a rollout, a
+    /// promotion or a route split to start (section 10.4), or pending,
+    /// for the prepare phase to start.
+    fn record_release(
         &self,
         app: &str,
         id: &str,
         spec: &ReleaseSpec,
-        hold: bool,
-        deploying: &Deploying,
-    ) -> Result<String, String> {
-        let (created_tx, created_rx) = oneshot::channel();
-        let (done_tx, done_rx) = oneshot::channel();
-        self.handle
-            .commands
-            .send(Command::Deploy {
-                app: app.to_owned(),
-                spec: Box::new(spec.clone()),
-                id: Some(id.to_owned()),
-                retain: deploying.retain,
-                hold,
-                created: created_tx,
-                done: done_tx,
-            })
-            .await
-            .map_err(|_| STOPPING.to_owned())?;
-
-        let created = created_rx.await.map_err(|_| STOPPING.to_owned())??;
-
-        if !deploying.wait {
-            return Ok(format!("recorded ({})", created.state));
-        }
-
-        let release = done_rx.await.map_err(|_| STOPPING.to_owned())??;
-
-        // A release that failed says why, so the one answer an apply
-        // gives names the reason as `release show` and the events do.
-
-        if release.state == ReleaseState::Failed && !release.message.is_empty() {
-            return Ok(format!("failed: {}", release.message));
-        }
-
-        let serving = self
-            .handle
-            .store
-            .app(&release.app)
-            .ok()
-            .and_then(|app| app.current)
-            .as_deref()
-            == Some(release.id.as_str());
-
-        Ok(format!(
-            "{}{}",
-            release.state,
-            if serving {
-                " and serving"
-            } else if hold {
-                " and held: not serving"
-            } else {
-                ""
-            }
-        ))
-    }
-
-    /// Record a declared release that nothing serves or names, and leave
-    /// it stopped for a rollout, a promotion or a route split to start
-    /// (section 10.4).
-    fn record_declared(&self, app: &str, id: &str, spec: &ReleaseSpec) -> Result<String, String> {
+        added: Added,
+    ) -> Result<String, crate::store::StoreError> {
         let store = &self.handle.store;
-        store
-            .create_release(app, id, spec)
-            .map_err(|error| error.to_string())?;
-        store
-            .set_release_state(app, id, ReleaseState::Stopped, "declared and not started")
-            .map_err(|error| error.to_string())?;
+        store.create_release(app, id, spec)?;
+        let source = spec.source.display();
+
+        if added == Added::Stopped {
+            store.set_release_state(app, id, ReleaseState::Stopped, "declared and not started")?;
+            self.handle.events.emit(
+                "release.created",
+                &format!("{app}@{id}"),
+                "info",
+                &format!("from {source}, left stopped"),
+            );
+            return Ok("recorded and stopped".to_owned());
+        }
+
         self.handle.events.emit(
             "release.created",
             &format!("{app}@{id}"),
             "info",
-            &format!("from {}, left stopped", spec.source.display()),
+            &format!("from {source}"),
         );
-        Ok("recorded and stopped".to_owned())
+        Ok(format!("recorded ({})", ReleaseState::Pending))
     }
 
-    /// Promote a release the daemon has, as `serving` names it, and say
-    /// how it went: promoting when the apply does not wait, else that it
-    /// serves.
-    async fn promote_declared(
+    /// The rest of an apply once its releases are recorded: the prepare
+    /// phase starts them, the commit phase writes the rest and gives the
+    /// edge one snapshot, and the releases and applications `--prune`
+    /// removes go last. A release that does not start, or a commit that
+    /// cannot be written, undoes the prepare phase.
+    async fn complete(
         &self,
-        app: &str,
-        id: &str,
+        plan: &Plan,
+        report: &mut pb::ConfigReport,
+        mut prepared: Prepared,
         deploying: &Deploying,
-    ) -> Result<String, String> {
+        tls: bool,
+    ) {
+        if let Err(error) = self.start_releases(plan, report, &mut prepared).await {
+            self.undo(report, prepared, error).await;
+            return;
+        }
+
+        if let Err(error) = self.commit(plan, report, deploying, tls).await {
+            self.undo(report, prepared, error).await;
+            return;
+        }
+
+        report.applied = true;
+        let mut failures = 0;
+
+        for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
+            let outcome = match &change.action {
+                Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
+                Action::RemoveApp { app } => self
+                    .handle
+                    .store
+                    .delete_app(app)
+                    .map(|()| "removed".to_owned())
+                    .map_err(|error| error.to_string()),
+                _ => continue,
+            };
+
+            message.outcome = outcome.unwrap_or_else(|error| format!("failed: {error}"));
+        }
+
+        for message in &report.changes {
+            if message.outcome.starts_with("failed") {
+                failures += 1;
+            }
+        }
+
+        if !report.snapshot_error.is_empty() {
+            failures += 1;
+        }
+
+        let summary = format!(
+            "{} changes applied, {} failed, {} releases unchanged",
+            plan.changes.len(),
+            failures,
+            plan.unchanged
+        );
+        self.handle.events.emit(
+            "config.applied",
+            "config",
+            if failures == 0 { "notice" } else { "warning" },
+            &summary,
+        );
+    }
+
+    /// Start the releases the plan adds, held, and the releases it
+    /// promotes that do not run, each in turn; the first that does not
+    /// start stops the apply, with why.
+    async fn start_releases(
+        &self,
+        plan: &Plan,
+        report: &mut pb::ConfigReport,
+        prepared: &mut Prepared,
+    ) -> Result<(), String> {
+        for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
+            let (app, id) = match &change.action {
+                Action::Deploy {
+                    app,
+                    id,
+                    added: Added::Held | Added::Serving,
+                    ..
+                }
+                | Action::Promote { app, id } => (app, id),
+                _ => continue,
+            };
+
+            let (done_tx, done_rx) = oneshot::channel();
+            self.handle
+                .commands
+                .send(Command::StartHeld {
+                    app: app.clone(),
+                    id: id.clone(),
+                    done: done_tx,
+                })
+                .await
+                .map_err(|_| STOPPING.to_owned())?;
+            let started = done_rx.await.map_err(|_| STOPPING.to_owned())?;
+            let release = self.handle.store.release(app, id);
+
+            match started {
+                Ok(started) => {
+                    if started && matches!(change.action, Action::Promote { .. }) {
+                        prepared.started.push((app.clone(), id.clone()));
+                    }
+
+                    if change.action.serves().is_none() {
+                        let state = release.map_or(ReleaseState::Ready, |release| release.state);
+                        message.outcome = format!("{state} and held: not serving");
+                    }
+                }
+                Err(error) => {
+                    // A release that failed says why, as `release show`
+                    // and the events do.
+
+                    let why = match release {
+                        Ok(release)
+                            if release.state == ReleaseState::Failed
+                                && !release.message.is_empty() =>
+                        {
+                            release.message
+                        }
+                        _ => error,
+                    };
+
+                    message.outcome = format!("failed: {why}");
+                    return Err(format!("{} did not start: {why}", change.subject()));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The commit phase (section 10.10): the daemon writes the plan's
+    /// hosts, routes, upstreams, overlays, client classes, rate limits,
+    /// access logs and promotions in one transaction and pushes one
+    /// snapshot. A plan without any reads the TLS hosts' certificate
+    /// files again (section 4.2), so applying the same file after a
+    /// renewal is enough. A snapshot the edge does not take fails the
+    /// apply, though the changes were made.
+    async fn commit(
+        &self,
+        plan: &Plan,
+        report: &mut pb::ConfigReport,
+        deploying: &Deploying,
+        tls: bool,
+    ) -> Result<(), String> {
+        let commits = plan.changes.iter().any(|change| {
+            change.action.phase() == config::Phase::Commit || change.action.serves().is_some()
+        });
+
+        if !commits {
+            if tls {
+                self.renew_certificates(report).await;
+            }
+
+            return Ok(());
+        }
+
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
-            .send(Command::PromoteRelease {
-                app: app.to_owned(),
-                id: id.to_owned(),
+            .send(Command::CommitApply {
+                changes: plan.changes.clone(),
                 retain: deploying.retain,
                 done: done_tx,
             })
             .await
             .map_err(|_| STOPPING.to_owned())?;
+        let committed = done_rx
+            .await
+            .map_err(|_| STOPPING.to_owned())?
+            .map_err(|error| format!("nothing was written: {error}"))?;
 
-        if !deploying.wait {
-            return Ok("promoting".to_owned());
+        for ((change, message), outcome) in plan
+            .changes
+            .iter()
+            .zip(report.changes.iter_mut())
+            .zip(committed.outcomes)
+        {
+            let Some(outcome) = outcome else {
+                continue;
+            };
+
+            message.outcome = match change.action.serves() {
+                Some((app, id)) => {
+                    let state = self
+                        .handle
+                        .store
+                        .release(app, id)
+                        .map_or(ReleaseState::Ready, |release| release.state);
+                    format!("{state} and serving")
+                }
+                None => outcome,
+            };
         }
 
-        let release = done_rx.await.map_err(|_| STOPPING.to_owned())??;
-        Ok(format!("{} and serving", release.state))
+        if let Some(error) = committed.snapshot_error {
+            report.snapshot_error = error;
+        }
+
+        Ok(())
+    }
+
+    /// Read the TLS hosts' certificate files again and give the edge what
+    /// was renewed, for an apply that changes nothing else.
+    async fn renew_certificates(&self, report: &mut pb::ConfigReport) {
+        match self.refresh_certificates().await {
+            Ok(changes) => {
+                if let Some(error) = changes.refused {
+                    report.snapshot_error = format!(
+                        "the renewed certificates of {}: {error}",
+                        changes.renewed.join(", ")
+                    );
+                } else if !changes.renewed.is_empty() {
+                    report.notes.push(format!(
+                        "certificates of {} renewed; the edge has them",
+                        changes.renewed.join(", ")
+                    ));
+                }
+
+                for (host, why) in changes.kept {
+                    report
+                        .warnings
+                        .push(format!("host {host} keeps its certificate: {why}"));
+                }
+            }
+            Err(error) => report.warnings.push(error),
+        }
+    }
+
+    /// Undo an apply's prepare phase, which stopped at `error` (section
+    /// 10.10): the releases it started that the daemon had are drained,
+    /// the releases it recorded are removed, the identities and
+    /// priorities it set are put back, and the applications it created
+    /// are removed. The report says nothing was applied, and why.
+    async fn undo(&self, report: &mut pb::ConfigReport, prepared: Prepared, error: String) {
+        let store = &self.handle.store;
+
+        for (app, id) in &prepared.started {
+            let (done_tx, done_rx) = oneshot::channel();
+
+            if self
+                .handle
+                .commands
+                .send(Command::Drain {
+                    app: app.clone(),
+                    id: id.clone(),
+                    done: done_tx,
+                })
+                .await
+                .is_ok()
+            {
+                let _ = done_rx.await;
+            }
+        }
+
+        for (app, id) in prepared.releases.iter().rev() {
+            if let Err(why) = self.remove_release(app, id).await {
+                tracing::warn!(%why, "removing {app}@{id} after a failed apply failed");
+            }
+        }
+
+        for kept in &prepared.settings {
+            let restored = store
+                .set_app_identity(
+                    &kept.name,
+                    kept.user.as_deref(),
+                    kept.group.as_deref(),
+                    kept.umask.as_deref(),
+                )
+                .and_then(|()| store.set_app_priority(&kept.name, kept.priority));
+
+            if let Err(why) = restored {
+                tracing::warn!(%why, "restoring {} after a failed apply failed", kept.name);
+            }
+        }
+
+        for app in prepared.apps.iter().rev() {
+            if let Err(why) = store.delete_app(app) {
+                tracing::warn!(%why, "removing {app} after a failed apply failed");
+            }
+        }
+
+        for message in &mut report.changes {
+            if !message.outcome.starts_with("failed") {
+                message.outcome = "not applied".to_owned();
+            }
+        }
+
+        report.applied = false;
+        self.handle.events.emit(
+            "config.apply_failed",
+            "config",
+            "error",
+            &format!("nothing applied: {error}"),
+        );
+        report.errors.push(error);
     }
 
     /// Drain a release if it runs, then drop its record.
@@ -2186,17 +2343,6 @@ impl Service {
             .map_err(|_| STOPPING.to_owned())?;
 
         done_rx.await.map_err(|_| STOPPING.to_owned())
-    }
-
-    async fn reconfigure(&self) -> Result<(), String> {
-        let (done_tx, done_rx) = oneshot::channel();
-        self.handle
-            .commands
-            .send(Command::Reconfigure { done: done_tx })
-            .await
-            .map_err(|_| STOPPING.to_owned())?;
-
-        done_rx.await.map_err(|_| STOPPING.to_owned())?
     }
 }
 
