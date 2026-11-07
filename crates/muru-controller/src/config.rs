@@ -2131,7 +2131,8 @@ pub fn describe_traffic(traffic: Option<&muru_config::Traffic>) -> String {
 }
 
 /// With prune, routes, hosts, releases and applications in desired state
-/// that the document does not declare go, in that order.
+/// that the document does not declare go, in that order. A release or an
+/// application a route the document keeps still names is refused.
 fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     for route in store.routes().unwrap_or_default() {
         let declared = document
@@ -2218,6 +2219,23 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
             let kept = declared.is_some_and(|table| table.release.contains_key(&release.id));
 
             if !kept {
+                // A route the files keep must not lose a release its
+                // traffic names.
+
+                let named = (app.name.clone(), release.id.clone());
+
+                for route in document
+                    .route
+                    .iter()
+                    .filter(|route| traffic_releases(route).contains(&named))
+                {
+                    plan.errors.push(format!(
+                        "route {} {}: traffic names {}@{}, which the files do not declare, so \
+                         --prune would remove it; declare it, or take it out of the route's traffic",
+                        route.host, route.path, app.name, release.id
+                    ));
+                }
+
                 plan.changes.push(Change {
                     action: Action::RemoveRelease {
                         app: app.name.clone(),
@@ -2229,6 +2247,24 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         }
 
         if declared.is_none() {
+            // Nor an application it sends requests to.
+
+            let routed = |route: &&RouteTable| {
+                route.app == app.name
+                    || route
+                        .fallback
+                        .as_ref()
+                        .is_some_and(|fallback| fallback.app.as_deref() == Some(app.name.as_str()))
+            };
+
+            for route in document.route.iter().filter(routed) {
+                plan.errors.push(format!(
+                    "route {} {}: names application {}, which the files do not declare, so \
+                     --prune would remove it; declare it, or take the route out",
+                    route.host, route.path, app.name
+                ));
+            }
+
             plan.changes.push(Change {
                 action: Action::RemoveApp {
                     app: app.name.clone(),
@@ -6743,6 +6779,69 @@ mod tests {
                 ("deploy", "shop@r1".to_owned(), true),
                 ("deploy", "shop@r2".to_owned(), false),
             ]
+        );
+    }
+
+    #[test]
+    fn prune_keeps_what_a_kept_route_names() {
+        let source = source_dir();
+        let store = store_with_two(&source);
+        store.ensure_app("blog").unwrap();
+        let routes = Document::parse(
+            "[host.shop]\nnames = ['shop.test']\n\
+             [[route]]\nhost = 'shop'\napp = 'shop'\npath = '/'\n\
+             traffic = { split = { r1 = 100, r2 = 0 } }\n",
+        )
+        .unwrap();
+        let with = |ids: &[&str], extra: &str| {
+            let mut document = shop_releases(&source, ids, "serving = 'r1'");
+            document.merge(routes.clone()).unwrap();
+            document.merge(Document::parse(extra).unwrap()).unwrap();
+            document
+        };
+
+        // Issue #442: the kept route's split names r2, which the files
+        // leave out.
+
+        let refused = plan_with(&store, &with(&["r1"], ""), true, false);
+        assert_eq!(
+            refused.errors,
+            vec![
+                "route shop /: traffic names shop@r2, which the files do not declare, so --prune \
+                 would remove it; declare it, or take it out of the route's traffic"
+            ]
+        );
+        assert!(
+            plan_with(&store, &with(&["r1"], ""), false, false)
+                .errors
+                .is_empty()
+        );
+        let declared = plan_with(&store, &with(&["r1", "r2"], ""), true, false);
+        assert!(declared.errors.is_empty(), "{:?}", declared.errors);
+
+        // A kept route to an application the files leave out is refused
+        // as well.
+
+        let blog = "[[route]]\nhost = 'shop'\napp = 'blog'\npath = '/blog'\n";
+        let orphaned = plan_with(&store, &with(&["r1", "r2"], blog), true, false);
+        assert_eq!(orphaned.errors.len(), 1, "{:?}", orphaned.errors);
+        assert!(
+            orphaned.errors[0].starts_with("route shop /blog: names application blog"),
+            "{}",
+            orphaned.errors[0]
+        );
+
+        // The export writes the releases its routes name, so it prunes
+        // back without a change.
+
+        store.put_host("shop", &routes.host["shop"]).unwrap();
+        store.put_route(&routes.route[0]).unwrap();
+        store.delete_app("blog").unwrap();
+        let exported = export(&store, None, false).unwrap();
+        let back = plan_with(&store, &exported, true, false);
+        assert!(
+            back.errors.is_empty() && back.changes.is_empty(),
+            "{back:?}"
         );
     }
 

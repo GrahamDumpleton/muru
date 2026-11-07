@@ -324,7 +324,8 @@ warm. `--prune` also removes the routes, hosts, releases and
 applications the files do not contain, in that order: a running release
 drains and stops first. The release that serves each application after
 the apply must be declared, or the apply is refused, since `--prune`
-would remove it. `--json` writes the report as JSON. The exit code is 0
+would remove it, and so must every release a route the files keep names
+in its traffic, and every application such a route sends requests to. `--json` writes the report as JSON. The exit code is 0
 when there is nothing to do or everything applied, 2 for a dry run with
 changes planned, and 1 for errors, for a change that failed, and for a
 snapshot the edge did not take, which the report names: the changes
