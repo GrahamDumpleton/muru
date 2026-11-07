@@ -33,7 +33,9 @@ muru: release shop@r2 is ready and serving
 All of the application's traffic moves to the release at once, and the
 release that served drains and is kept warm, as after a deploy. This is
 the deploy's own strategy, available separately so a held release can be
-checked first.
+checked first. While a canary of the application is under way, a
+promotion, from the command, the dashboard or the API, is refused until
+`muructl rollout promote` or `muructl rollout abort` ends the canary.
 
 ## Canary
 

@@ -3925,7 +3925,19 @@ impl Daemon {
                 retain,
                 done,
             } => {
-                let _ = done.send(self.promote_release(&app, &id, retain).await);
+                // Section 9.3: a promotion by hand waits for the rollout
+                // under way to end; the rollout's own promotion does not
+                // come this way.
+
+                let rollout = self.store.active_rollout(&app).ok().flatten();
+
+                let outcome = match crate::rollouts::promotion_refused(rollout.as_ref(), &app, &id)
+                {
+                    Some(why) => Err(why),
+                    None => self.promote_release(&app, &id, retain).await,
+                };
+
+                let _ = done.send(outcome);
             }
             Command::SetScale {
                 app,
