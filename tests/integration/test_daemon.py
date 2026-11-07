@@ -45,8 +45,14 @@ def test_deploy_serves_and_records_the_release(daemon: Daemon) -> None:
     # A worker's own events come from its host, which the daemon hears
     # only once it has attached to it, so one may arrive after the
     # release's; the release's events are in order among themselves.
+    # release.state_changed notes how the runtime library was found, a
+    # fetch from PyPI among them, which depends on the machine.
 
-    releases = [kind for kind in daemon.events() if not kind.startswith("worker.")]
+    releases = [
+        kind
+        for kind in daemon.events()
+        if not kind.startswith("worker.") and kind != "release.state_changed"
+    ]
     assert releases[-3:] == ["release.created", "release.ready", "traffic.switched"]
 
 
