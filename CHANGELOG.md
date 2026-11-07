@@ -9,6 +9,225 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a19 (2026-11-07)
+
+### Added
+
+- A virtual host and a route each take a `compression` table with the keys
+  of the daemon's `[compression]` table. A key the route sets is used,
+  else its host's, else the daemon's, so one site or one path can turn
+  compression off, name its own content types or compress harder. ([#152](https://github.com/muruhq/muru/issues/152))
+- A `[[listener]]` entry takes a `limits` table for the connections it
+  accepts: `max_connections`, `max_connections_per_client`, the keep-alive
+  timeouts, `max_requests_per_connection`, `http2.max_concurrent_streams`,
+  and the limits on a request's head, `max_header_bytes`, `max_headers`
+  and `header_read_timeout`. A key it leaves out is the `[limits]`
+  table's, and `muructl daemon reload` applies a change. ([#155](https://github.com/muruhq/muru/issues/155))
+- A virtual host sets limits for all of its routes: `max_body_size` and a
+  `timeouts` table with `queue_timeout`, `request_deadline`,
+  `body_idle_timeout` and `response_idle_timeout`. A route takes the same
+  `timeouts` table, and each key is the route's, else the host's, else the
+  daemon's `[limits]`. A host also chooses which of its requests the
+  access log writes, with `access_log`, `slow` and `access_log_exclude`,
+  and `canonical_redirect` sends requests for its other names to its
+  `canonical` name. `muructl config show --effective` lists each route's
+  limits with the level each came from. ([#171](https://github.com/muruhq/muru/issues/171))
+- The wait for a thread of requests handed from ASGI to WSGI is measured:
+  `muru_handoff_queue_wait_seconds` for each worker, the 95th percentile
+  as `handoff wait p95` in `muructl scale status` and the dashboard's
+  scaling table, and a diagnosis that names the wait once it reaches
+  100 ms. ([#277](https://github.com/muruhq/muru/issues/277))
+- Declared commands and `muructl exec` run for the project in the current
+  directory when no application is named: `muructl command run migrate`,
+  `muructl command list` and `muructl exec -- COMMAND`. With a `muructl
+  run` of the project up, or `muructl serve` in the container, the command
+  runs through it and its output joins that process's. With nothing
+  serving, `muructl` runs the command itself and exits with its status,
+  which is how a Kubernetes Job, an init container or a Helm hook runs a
+  migration. `--chdir`, `--config`, `--python` and `--runtime-dir` find
+  the project, its settings, the interpreter and the runtime library as
+  `muructl serve` does. A named application still runs its release's
+  command under the daemon. ([#292](https://github.com/muruhq/muru/issues/292))
+- A `[[listener]]` entry takes a `proxy` table with the keys of `[proxy]`,
+  used in place of it for the connections that listener accepts. A node
+  can trust a load balancer's headers on an internal listener and nothing
+  on a public one, and `muructl daemon reload` applies a change. ([#316](https://github.com/muruhq/muru/issues/316))
+- A virtual host and a route each take a `request_headers` table, with
+  `remove` and `set`, and a `response_headers` table, with `remove`, `set`
+  and `add`. Request rules are applied before an application, an upstream
+  or an authentication handler sees the request. Response rules are
+  applied to every response, the edge's own error pages included, so
+  security headers can be set for a whole site in one place. An overlay
+  can replace a route's tables. ([#325](https://github.com/muruhq/muru/issues/325))
+- `muructl debug status` shows an ASGI worker's pool for synchronous code
+  as SYNC, the threads running a `sync_to_async` or `asyncio.to_thread`
+  call of its `sync_threads`, with SYNC-OLDEST, and `muructl debug stacks`
+  names the request on each of its threads. The busy threads are exported
+  as `muru_worker_sync_threads_busy` beside `muru_worker_sync_threads`,
+  and the dashboard's workers table shows the same. ([#380](https://github.com/muruhq/muru/issues/380))
+- `muructl maintenance on --host NAME` puts a virtual host in maintenance
+  mode: the edge answers 503 `maintenance` for every route of the host,
+  static and upstream routes included, until `muructl maintenance off
+  --host NAME`. The host's `maintenance` table names the paths, addresses
+  and bypass cookie let through, as a release's does. ([#402](https://github.com/muruhq/muru/issues/402))
+- The daemon's access log can be written in the combined log format of
+  Apache and nginx, with `access_log_format = "combined"` in `[logs]` or
+  on a virtual host. A virtual host's `access_log_file` names a file in
+  the log directory that takes its records in place of `access.log`,
+  rotated with it. Every JSON record names its virtual host as
+  `virtual_host`, and `muructl logs --access --host NAME` shows one
+  host's records. ([#403](https://github.com/muruhq/muru/issues/403))
+- An application ships the limits its requests need. A release's table,
+  and so `[tool.muru]`, takes `max_body_size` and the request timeouts
+  `queue_timeout`, `request_deadline`, `body_idle_timeout` and
+  `response_idle_timeout` in `timeouts`. A worker group takes the same for
+  the requests it serves, and a mount takes `max_body_size`. They stand
+  over a virtual host's and the daemon's limits, and a route's own stand
+  over them. `muructl run` and `muructl serve` read them beneath their
+  flags. ([#404](https://github.com/muruhq/muru/issues/404))
+- Added `muructl render APP [SOURCE]`, which writes the release a command
+  line describes as a file in the daemon's format, for `muructl apply` or
+  a record kept in version control. It takes the settings `muructl deploy`
+  takes for a release and needs no daemon. A setting left at its default
+  is not written, and `--full` writes every setting with a comment saying
+  where it came from.
+
+  - `muructl apply` takes `--hold`, `--no-wait`, `--retain` and
+    `--retain-workers`, which act on every release the apply adds as they
+    do on a deploy. Its plan and its report say `held` of each release
+    started that way.
+  - `muructl deploy --dry-run` reports what a deploy would do and changes
+    nothing: the id the release would take, each setting with the layer
+    it would come from, what becomes of the release that serves, and what
+    would refuse the deploy.
+  - `muructl run --print-config` names the interpreter the run would use.
+
+  ([#417](https://github.com/muruhq/muru/issues/417))
+
+### Changed
+
+- A worker that serves both WSGI and ASGI now counts each request against
+  the side that runs it: WSGI requests against `threads` and ASGI requests
+  and open WebSockets against `concurrency`, whichever the release's own
+  entrypoint is. An ASGI mount beside a WSGI application no longer shares
+  its thread slots, and a WSGI mount beside an ASGI application waits at
+  the edge for a thread. A mount's `concurrency` and `max_connections` no
+  longer need `interface = "asgi"`. `muru_slots_busy` and
+  `muru_slots_total` carry a `side` label, `threads` or `loop`, which
+  replaces `muru_async_slots_busy`, and `muru_capacity_utilisation` and
+  the autoscaler follow the busier side. ([#362](https://github.com/muruhq/muru/issues/362))
+- The dashboards show a worker's and a release's busy slots of its slots
+  by side, in a Threads and a Loop column, each shown when a worker has
+  that side, where one figure added the two together. ([#395](https://github.com/muruhq/muru/issues/395))
+- `sync_threads` now bounds the synchronous code Starlette and FastAPI
+  run for `def` endpoints: Muru sets anyio's thread limit to it, where
+  anyio's own 40 applied. `muructl debug status` counts anyio's threads
+  and asgiref's shared thread for thread-sensitive calls in SYNC, which
+  shows the fullest pool, and `muru_worker_sync_threads_busy` and
+  `muru_worker_sync_threads` carry a `pool` label: `loop`, `anyio` or
+  `asgiref`. ([#396](https://github.com/muruhq/muru/issues/396))
+- The callbacks of `muru.asgi.websocket.Handler` run on the event loop's
+  pool for synchronous code, sized by `sync_threads`, in a WSGI worker as
+  they did in an ASGI one. They took the application threads, which the
+  edge counts WSGI requests against, so a slow callback could leave a
+  WSGI request waiting inside the worker. `muructl debug status` counts
+  the threads running callbacks under SYNC. ([#397](https://github.com/muruhq/muru/issues/397))
+- `muructl run`, `muructl serve`, `muructl check` and `muructl deploy` say
+  so when a project has both a `muru.toml` and a `[tool.muru]` table in its
+  `pyproject.toml`: the `muru.toml` is used and the table is not read. The
+  configuration reference now states that the two are never merged. ([#409](https://github.com/muruhq/muru/issues/409))
+- The flags and variables that name a configuration file now say whose
+  file they mean.
+
+  - `muructl serve --config FILE`, and `MURU_SERVE_CONFIG`, name a project
+    settings file read in place of the `pyproject.toml` or `muru.toml`
+    beside the code, in the form of a `muru.toml` with serve's settings
+    under `[serve]`. The file of serve's keys at its top level is no
+    longer read.
+  - `--config`, `--state-dir`, `--log-dir` and `--cache-dir` are taken
+    only by the daemon's own commands: the `muructl daemon` commands,
+    `muructl up`, `muructl mcp serve --up` and `muructl secret`. Every
+    other command takes `--socket`, `--run-dir` and `--system`.
+  - `MURU_CONFIG` is now `MURU_DAEMON_CONFIG`. A daemon started with the
+    old variable set refuses to start and names the new one.
+  - `muructl run --print-config` prints the settings the run would use,
+    each with where it came from, in the shape of the project's file, and
+    `muructl serve --print-config` prints serve's the same way. `muructl
+    run --print-config` no longer writes a file in the daemon's format,
+    which `muructl render` now does from the settings a deploy takes.
+
+  ([#416](https://github.com/muruhq/muru/issues/416))
+
+### Fixed
+
+- The autoscaler sizes a release whose interface is detected as ASGI by
+  its event loop's concurrency, where it was sized by its threads until a
+  worker was ready, which could scale a slow-starting application out
+  further than its queue needed. ([#377](https://github.com/muruhq/muru/issues/377))
+- A release whose application is imported in each worker, or made by a
+  factory there, is now listed with the interface its workers detected,
+  and its autoscaler is sized by it, where the interface stayed as
+  configured. ([#394](https://github.com/muruhq/muru/issues/394))
+- On Linux, where a worker's stacks are read from outside, `muructl debug
+  stacks` and `muructl debug profile` now name the worker's event loop
+  thread, a gRPC mount's threads and the threads an application starts by
+  the names Python gives them, cut to 15 bytes where the runtime does not
+  know the whole name. They were shown as `thread-N`. ([#405](https://github.com/muruhq/muru/issues/405))
+- A file in the daemon's format kept beside a project's code is now named
+  `muru.daemon.toml` in the guides, the agent skill and the MCP server's
+  description. They called it `muru.toml`, which there is the project's
+  settings file, so the example in the coding agents guide could not be
+  applied. A `muru.toml` refused for a key of the daemon's format now says
+  that it was read as the project's settings and names `muru.daemon.toml`. ([#408](https://github.com/muruhq/muru/issues/408))
+- A release's table in a file given to `muructl apply` now gives the
+  release its `handoff`, `build.source_builds` and `build.compile_bytecode`
+  before the source's own settings, as its other keys do. The table's
+  values were ignored and the source's used. A declared release refused
+  because its build or bytecode settings differ from the recorded
+  release's now names each key that differs, where the list of
+  differences was empty. ([#421](https://github.com/muruhq/muru/issues/421))
+- A relative `cwd` of a managed server's release in an applied file is now
+  taken from the file's directory, as a release's `source` is. It was sent
+  to the daemon as written. ([#422](https://github.com/muruhq/muru/issues/422))
+- `muructl command run`, when nothing serves the project, now waits after
+  Ctrl-C or SIGTERM for the command to end, giving it the ten seconds to
+  stop that a timeout gives, and says that it was stopped and why. It
+  exited at once, so the command was killed without that time and anything
+  it had started could be left running. A second signal kills the command
+  at once. ([#426](https://github.com/muruhq/muru/issues/426))
+- A command running through `muructl run`, `muructl serve` or the daemon
+  is now stopped when that shuts down, as at its timeout: it gets SIGTERM,
+  and SIGKILL at the end of its ten seconds or of the shutdown's budget,
+  and the `muructl command run` or `muructl exec` that started it says it
+  was stopped and why. It was killed without SIGTERM, anything it had
+  started was left running, and its caller failed with a protocol error. ([#428](https://github.com/muruhq/muru/issues/428))
+- `muructl command run` and `muructl exec`, when nothing serves the
+  project, now stop the command when their terminal is closed, as they do
+  on Ctrl-C or SIGTERM: they wait for the command to end and exit with
+  129. They died at once on SIGHUP and left the command running. ([#429](https://github.com/muruhq/muru/issues/429))
+- A command stopped at its timeout, or because its caller went away, now
+  has its whole session killed at the end of the ten seconds it is given.
+  Only the command's own process was killed, and only when it was still
+  running, so a process it had started that ignored SIGTERM was left
+  running, and kept the run from ending while it held the command's
+  output open. ([#430](https://github.com/muruhq/muru/issues/430))
+- `muructl command run` and `muructl exec` now say how a command stopped at
+  its timeout ended, and exit with 1, when the command exits with 0 once
+  stopped. They printed nothing and exited 0, as if it had succeeded, and
+  the MCP server's `run_command` tool reported it as a success. The last
+  line of `--json` output now carries `ok`, which is true only for a
+  command that exited with 0 and was not stopped. ([#431](https://github.com/muruhq/muru/issues/431))
+- `muructl command run` and `muructl exec`, when nothing serves the
+  project, now stop the command and wait for it to end when their output
+  can no longer be written, as when piped to `head`, and then exit with
+  the error. They exited at once, so the command was killed without the
+  ten seconds a stopped command is given, and anything it had started was
+  left running. ([#433](https://github.com/muruhq/muru/issues/433))
+- A second Ctrl-C or SIGTERM to a development `muructl run` that is
+  shutting down now kills the commands still running through it at once,
+  and the run exits. It waited out each command's ten seconds to stop. ([#434](https://github.com/muruhq/muru/issues/434))
+
+
 ## 0.1.0a18 (2026-11-05)
 
 ### Added
