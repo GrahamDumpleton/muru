@@ -129,4 +129,6 @@ and changing it changes no release.
 
 Specification sections 9.2, 10.4 and 19.1. Issues #417 and #420; the
 apply's order and atomicity are issue #439. ADR 0052 rejected a hold key
-on a release's table.
+on a release's table. Issue #447 later held, without the key, every
+release an apply adds but the last in id order, so the plan's `serving
+until` detail went.

@@ -581,10 +581,10 @@ fn plan_app(
 
     deploys.sort_by_key(|(id, _)| release_order(id));
 
-    // Section 10.4: the release that serves. Without `serving`, each
-    // release the apply adds serves in turn, so the last in id order
-    // serves in the end, and `--hold` holds them all; with it, the
-    // others are held and a release the daemon has is promoted.
+    // Section 10.4: the release that serves, which `serving` names, else
+    // the last in id order the apply adds, unless `--hold` holds them all.
+    // The other releases the apply adds are held, and a release the
+    // daemon has that `serving` names is promoted.
 
     let current = stored.and_then(|stored| stored.current);
     let added: Vec<String> = deploys.iter().map(|(id, _)| id.clone()).collect();
@@ -622,35 +622,13 @@ fn plan_app(
         ));
     }
 
-    let deploys: Vec<(String, ReleaseSpec, bool)> = deploys
-        .into_iter()
-        .map(|(id, spec)| {
-            let hold = app
-                .serving
-                .as_ref()
-                .map_or(applying.hold, |serving| *serving != id);
-            (id, spec, hold)
-        })
-        .collect();
-
-    let last = deploys
-        .iter()
-        .rev()
-        .find(|(_, _, hold)| !hold)
-        .map(|(id, _, _)| id.clone());
-
-    for (id, spec, hold) in deploys {
-        let detail = if hold {
-            format!("held: {}", describe(&spec))
-        } else if last.as_ref() == Some(&id) {
-            format!("serving: {}", describe(&spec))
-        } else {
-            format!(
-                "serving until {name}@{} replaces it: {}",
-                last.as_deref().unwrap_or_default(),
-                describe(&spec)
-            )
-        };
+    for (id, spec) in deploys {
+        let hold = applying.hold || serving.as_ref() != Some(&id);
+        let detail = format!(
+            "{}: {}",
+            if hold { "held" } else { "serving" },
+            describe(&spec)
+        );
 
         plan.changes.push(Change {
             detail,
@@ -6496,23 +6474,19 @@ mod tests {
         );
         assert_eq!(staged.unchanged, 1);
 
-        // Without the key each release added serves in turn, the last in
-        // id order in the end, and --hold holds them all.
+        // Without the key the last release added in id order serves and
+        // the others are held (issue #447), and --hold holds them all.
 
         let document = shop_releases(&source, &["r1", "r3", "r2"], "");
         let added = plan_with(&store, &document, false, false);
         assert_eq!(
             steps(&added),
             vec![
-                ("deploy", "shop@r2".to_owned(), false),
+                ("deploy", "shop@r2".to_owned(), true),
                 ("deploy", "shop@r3".to_owned(), false),
             ]
         );
-        assert!(
-            added.changes[0]
-                .detail
-                .starts_with("serving until shop@r3 replaces it: ")
-        );
+        assert!(added.changes[0].detail.starts_with("held: "));
         assert!(added.changes[1].detail.starts_with("serving: "));
         let held = plan_with(&store, &document, false, true);
         assert!(

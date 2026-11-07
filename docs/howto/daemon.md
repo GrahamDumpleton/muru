@@ -274,20 +274,19 @@ changes a default.
 ### What an apply does
 
 An apply creates the applications the files name, deploys each declared
-release the daemon does not have (in id order, so the last declared
-release of an application is the one that serves, unless the
-application's [`serving` key](#which-release-serves) names another),
-creates or updates the hosts and routes, and leaves anything already
-recorded as declared alone. Id order puts ids of the form `rN` first, by
-number, so `r10` comes after `r9`, and every other id after them, by
-name: files declaring `r9` and `2026-11-06` serve `2026-11-06`.
-Releases are immutable: a declared release whose settings differ from
-the recorded ones is an error, and the file is applied only when it has
-no errors at all. Unknown
-keys, invalid names, a missing source directory and a source without an
-entrypoint are errors too. `[[listener]]` entries and the `[limits]`
-table belong in the daemon's own configuration file; in an applied file
-they are reported as warnings and not applied.
+release the daemon does not have (the last of an application's in id
+order to serve, and the others held, unless the application's
+[`serving` key](#which-release-serves) names another), creates or
+updates the hosts and routes, and leaves anything already recorded as
+declared alone. Id order puts ids of the form `rN` first, by number, so
+`r10` comes after `r9`, and every other id after them, by name: files
+adding `r9` and `2026-11-06` serve `2026-11-06`. Releases are
+immutable: a declared release whose settings differ from the recorded
+ones is an error, and the file is applied only when it has no errors at
+all. Unknown keys, invalid names, a missing source directory and a
+source without an entrypoint are errors too. `[[listener]]` entries and
+the `[limits]` table belong in the daemon's own configuration file; in
+an applied file they are reported as warnings and not applied.
 
 Four flags say how the releases an apply adds are deployed, as they do
 on `muructl deploy`:
@@ -343,8 +342,8 @@ releases its routes' splits and client classes name, so applying the
 file back to the daemon it came from changes nothing and, applied to
 another node, it starts those releases held; `--all-releases` writes
 every release, `--app NAME` one application, and `--json` the same
-document as JSON. A
-[rollout](rollouts.md) under way is not part of the file; with
+document as JSON. A [rollout](rollouts.md) under way is not part of the
+file; with
 `--resolve-rollouts` it is written as where it stands, the candidate
 declared beside the serving release and the application's routes
 splitting traffic between them at the candidate's current share.
@@ -408,11 +407,10 @@ muru: shop@r1 stays warm for 1800s with 1 worker to a group, when shop@r2 takes 
 ```
 
 The key names a declared release or one the daemon already has; naming
-neither is an error. Without the key, each release the apply adds
-serves in turn, so the last of them in id order serves in the end, and
-a deploy the plan shows says `serving until` the one that replaces it.
-`--hold` with a key that would move traffic is an error, since the flag
-leaves traffic where it is.
+neither is an error. Without the key, the last release the apply adds,
+in id order, serves, and the others it adds are held. `--hold` with a
+key that would move traffic is an error, since the flag leaves traffic
+where it is.
 
 While a [rollout](rollouts.md) is under way, the rollout moves the
 traffic. The key may name its baseline or its candidate, and the apply
