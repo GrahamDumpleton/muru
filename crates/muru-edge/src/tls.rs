@@ -162,18 +162,17 @@ impl Resolver {
             .default
             .is_none()
     }
-}
 
-impl std::fmt::Debug for Resolver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Resolver")
-    }
-}
-
-impl ResolvesServerCert for Resolver {
-    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+    /// The certificate for the name a client asked for: an exact name,
+    /// else the longest wildcard, else the default. A client that names
+    /// no host, as every client does when it connects by IP address, is
+    /// given the default.
+    fn choose(&self, server_name: Option<&str>) -> Option<Arc<CertifiedKey>> {
         let table = self.table.read().expect("certificate table poisoned");
-        let name = client_hello.server_name().map(crate::routing::normalise)?;
+
+        let Some(name) = server_name.map(crate::routing::normalise) else {
+            return table.default.clone();
+        };
 
         if let Some(key) = table.exact.get(&name) {
             return Some(Arc::clone(key));
@@ -188,6 +187,18 @@ impl ResolvesServerCert for Resolver {
         }
 
         table.default.clone()
+    }
+}
+
+impl std::fmt::Debug for Resolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Resolver")
+    }
+}
+
+impl ResolvesServerCert for Resolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.choose(client_hello.server_name())
     }
 }
 
@@ -313,6 +324,27 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(table.default.as_ref().unwrap(), &other));
         assert_eq!(table.wildcards[0].0, ".shop.example.com");
+        drop(table);
+
+        // Names choose their host's certificate; a name no host claims and
+        // no name at all (a connection by IP address) get the default.
+
+        let chosen = |name: Option<&str>| resolver.choose(name).expect("a certificate");
+        assert!(Arc::ptr_eq(&chosen(Some("Shop.Example.COM.")), &shop));
+        assert!(Arc::ptr_eq(&chosen(Some("eu.shop.example.com")), &shop));
+        assert!(Arc::ptr_eq(&chosen(Some("a.eu.shop.example.com")), &other));
+        assert!(Arc::ptr_eq(&chosen(Some("unknown.example.com")), &other));
+        assert!(Arc::ptr_eq(&chosen(None), &other));
+
+        // Without a host marked default, the first host's is offered.
+
+        resolver.replace(vec![HostCertificate {
+            names: vec!["shop.example.com".to_owned()],
+            key: Arc::clone(&shop),
+            default: false,
+        }]);
+        assert!(Arc::ptr_eq(&chosen(None), &shop));
+        assert!(Resolver::default().choose(None).is_none());
     }
 
     #[test]

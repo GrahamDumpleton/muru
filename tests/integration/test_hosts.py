@@ -10,6 +10,7 @@ back.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import shutil
 import subprocess
@@ -27,14 +28,28 @@ APPS = support.ROOT / "tests" / "fixtures" / "apps"
 OPENSSL = shutil.which("openssl")
 
 
+def is_address(name: str) -> bool:
+    """Whether `name` is an IP address rather than a host name."""
+
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return False
+
+    return True
+
+
 def certificate(directory: Path, name: str, *names: str) -> tuple[Path, Path]:
-    """A self-signed certificate for `names`, written as PEM files."""
+    """A self-signed certificate for `names` (host names or IP addresses), as PEM files."""
 
     if OPENSSL is None:
         support.unavailable("openssl is not installed")
     cert = directory / f"{name}.pem"
     key = directory / f"{name}-key.pem"
-    alternatives = ",".join(f"DNS:{candidate}" for candidate in names)
+    alternatives = ",".join(
+        f"IP:{candidate}" if is_address(candidate) else f"DNS:{candidate}" for candidate in names
+    )
+
     subprocess.run(
         [
             OPENSSL,
@@ -219,7 +234,7 @@ app = "shop"
 def test_tls_listener_picks_the_certificate_by_name_and_redirects_when_asked(
     daemon: Daemon, tmp_path: Path
 ) -> None:
-    cert, key = certificate(tmp_path, "echo", "echo.test", "*.echo.test")
+    cert, key = certificate(tmp_path, "echo", "echo.test", "*.echo.test", "127.0.0.1")
     config = hosts_file(tmp_path, cert, key)
     assert apply(daemon, config).returncode == 0
     secure = daemon.https_port
@@ -231,6 +246,14 @@ def test_tls_listener_picks_the_certificate_by_name_and_redirects_when_asked(
     assert environ["SERVER_PORT"] == str(secure)
     wildcard = daemon.request("/info", host="eu.echo.test", port=secure, cafile=cert)
     assert wildcard.status == 200
+
+    # A connection by IP address sends no name, and is given the default
+    # certificate, here the only one loaded.
+
+    by_address = daemon.request(
+        "/info", host="echo.test", port=secure, cafile=cert, server_hostname="127.0.0.1"
+    )
+    assert environ_of(by_address)["muru.tls"]["server_name"] == ""
 
     # The shop host has no certificate; the only one loaded is offered,
     # and the client refuses it for the wrong name.

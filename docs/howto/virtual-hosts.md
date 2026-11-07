@@ -100,6 +100,12 @@ host with a certificate claims, is given the default host's certificate,
 or the first host's. A host without a `tls` table still answers on a TLS
 listener under another host's certificate when the client accepts it.
 
+A client connecting by IP address, as to `https://192.0.2.10/`, asks for
+no name, so it is given that certificate, which it accepts only when the
+certificate lists the address. Its request's host is then the address,
+so a host must list the address in its `names`, or be the default, for
+the request not to be refused with 421.
+
 A replaced certificate file is picked up by `muructl daemon reload` (or
 SIGHUP), by an apply of a file that declares the host, changed or not,
 and by anything else that sends the edge a snapshot, such as a deploy.
