@@ -47,6 +47,7 @@ An application's table and its releases.
 | `priority` | integer | `0` | Which applications' scale-ups the node's budget admits first, the highest first. |
 | `release` | table of tables, {ref}`[app.NAME.release.ID] <config-daemon-app-name-release-id>` |  | Releases by identifier. |
 | `schedule` | array of tables, {ref}`[[app.NAME.schedule]] <config-daemon-app-name-schedule>` |  | Scheduled capacity. |
+| `serving` | string | the last release in id order an apply adds, else the one that serves | The release that serves the application's traffic, a declared one or one the daemon has. The other releases an apply adds are started held, and naming a release the daemon has promotes it. |
 | `slow` | string | the `[logs]` table's | How slow one of the application's requests is to be written under `access_log = "errors"`. |
 | `umask` | string | the daemon's own umask | The file creation mask, in octal, for example 027. |
 | `user` | string | the daemon's own user | The user the application's hosts and workers run as, when the daemon runs as root. |

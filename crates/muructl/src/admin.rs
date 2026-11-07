@@ -5497,13 +5497,14 @@ pub struct ApplyArgs {
     #[arg(long)]
     prune: bool,
 
-    /// Deploy releases of applications an overlay freezes;
+    /// Deploy or promote releases of applications an overlay freezes;
     /// recorded as an event.
     #[arg(long)]
     override_freeze: bool,
 
     /// Start the releases the apply adds but leave traffic where it is,
-    /// for a preview with the Muru-Preview header or a rollout.
+    /// for a preview with the Muru-Preview header or a rollout; refused
+    /// when an application's serving key would move its traffic.
     #[arg(long)]
     hold: bool,
 

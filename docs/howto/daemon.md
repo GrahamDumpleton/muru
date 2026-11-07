@@ -275,11 +275,12 @@ changes a default.
 
 An apply creates the applications the files name, deploys each declared
 release the daemon does not have (in id order, so the last declared
-release of an application is the one that serves), creates or updates
-the hosts and routes, and leaves anything already recorded as declared
-alone. Releases are immutable: a
-declared release whose settings differ from the recorded ones is an
-error, and the file is applied only when it has no errors at all. Unknown
+release of an application is the one that serves, unless the
+application's [`serving` key](#which-release-serves) names another),
+creates or updates the hosts and routes, and leaves anything already
+recorded as declared alone. Releases are immutable: a declared release
+whose settings differ from the recorded ones is an error, and the file
+is applied only when it has no errors at all. Unknown
 keys, invalid names, a missing source directory and a source without an
 entrypoint are errors too. `[[listener]]` entries and the `[limits]`
 table belong in the daemon's own configuration file; in an applied file
@@ -301,9 +302,9 @@ muructl rollout bluegreen shop@2026-11-06
 ```
 
 A held release takes no traffic and is reached with the `Muru-Preview`
-header, until a [rollout](rollouts.md) moves traffic to it. `--hold`
-holds every release the apply adds, in every application, and the plan
-and the report say `held` of each:
+header, until a [rollout](rollouts.md) or a promotion moves traffic to
+it. `--hold` holds every release the apply adds, in every application,
+and the plan and the report say `held` of each:
 
 ```console
 $ muructl apply -f config/ --hold --dry-run
@@ -314,24 +315,26 @@ muru: plan (nothing changed)
 
 An application whose first release is held serves nothing until a
 rollout. To hold the releases of one application and not another's,
-apply their files separately: without `--prune` an apply leaves alone
-what its files do not mention.
+give it a `serving` key naming the release that serves now, which holds
+the others without the flag.
 
 `--dry-run` prints the plan and changes nothing. For each release that
 would take over from one that serves, it says how long that one stays
-warm. `--prune` also removes
-the routes, hosts, releases and applications the files do not contain,
-in that order: a running release drains and stops first. `--json` writes
-the report as JSON. The
-exit code is 0 when there is nothing to do or everything applied, 2 for
-a dry run with changes planned, and 1 for errors.
+warm. `--prune` also removes the routes, hosts, releases and
+applications the files do not contain, in that order: a running release
+drains and stops first. The release that serves each application after
+the apply must be declared, or the apply is refused, since `--prune`
+would remove it. `--json` writes the report as JSON. The exit code is 0
+when there is nothing to do or everything applied, 2 for a dry run with
+changes planned, and 1 for errors.
 
 `muructl config export` writes desired state as a file of this form, with
 a header naming the daemon's version, the node, the time and the state
 version. It writes the release that serves each application, every key
-spelled out, so applying the file back to the daemon it came from changes
-nothing; `--all-releases` writes every release, `--app NAME` one
-application, and `--json` the same document as JSON. A
+spelled out, and the application's `serving` key naming it, so applying
+the file back to the daemon it came from changes nothing;
+`--all-releases` writes every release, `--app NAME` one application, and
+`--json` the same document as JSON. A
 [rollout](rollouts.md) under way is not part of the file; with
 `--resolve-rollouts` it is written as where it stands, the candidate
 declared beside the serving release and the application's routes
@@ -359,6 +362,57 @@ $ muructl config show shop --effective
 #   shop@r3: sync_threads = 8 (default)
 ...
 ```
+
+### Which release serves
+
+An application's `serving` key names the release that serves its
+traffic. Declaring a new release beside it stages that release:
+
+```toml
+[app.shop]
+serving = "r1"
+
+[app.shop.release.r1]
+source = "/srv/shop/r1"
+
+[app.shop.release.r2]
+source = "/srv/shop/r2"
+```
+
+Applied while r1 serves, this starts r2 held. It does not take the
+application's traffic: it serves only the share a route's split gives
+it, and requests that name it with the `Muru-Preview` header, so a split
+of 0, or none, sends it nothing else.
+Changing the key to `serving = "r2"` and applying the files again
+promotes r2: all of the application's traffic moves to it, and r1
+drains and stays warm as `--retain` and `--retain-workers` say. The
+promotion comes after the apply has written the hosts and routes, so a
+split in the same files that still names r1 keeps it running. The plan
+says what happens to each release:
+
+```console
+$ muructl apply -f config/ --dry-run
+muru: plan (nothing changed)
+  promote         shop@r2                  serving in place of shop@r1
+  2 objects as declared
+muru: shop@r1 stays warm for 1800s with 1 worker to a group, when shop@r2 takes its place
+```
+
+The key names a declared release or one the daemon already has; naming
+neither is an error. Without the key, each release the apply adds
+serves in turn, so the last of them in id order serves in the end, and
+a deploy the plan shows says `serving until` the one that replaces it.
+`--hold` with a key that would move traffic is an error, since the flag
+leaves traffic where it is.
+
+While a [rollout](rollouts.md) is under way, the rollout moves the
+traffic. The key may name its baseline or its candidate, and the apply
+promotes nothing. Naming the baseline also warns that once the rollout
+promotes the candidate, applying the same files again promotes the
+baseline back: change the key to the candidate before the rollout ends
+to keep its outcome. Naming any other release is an error until the
+rollout ends, or `muructl rollout promote` or `muructl rollout abort`
+ends it.
 
 ## Building the environment on the node
 

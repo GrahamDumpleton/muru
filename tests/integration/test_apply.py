@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -208,6 +209,80 @@ def test_how_the_releases_an_apply_adds_are_deployed(daemon: Daemon, tmp_path: P
     assert early.stdout.splitlines()[1].split()[:3] == ["deploy", "shop@r3", "recorded"]
     daemon.muructl("release", "wait", "shop@r3")
     assert daemon.releases("shop")[0]["release"] == "shop@r3"
+
+
+def test_serving_stages_a_release_and_promotes_it(daemon: Daemon, tmp_path: Path) -> None:
+    # Issue #420: a release declared beside the one serves, with a split
+    # giving it 0%, is started held and takes no request without the
+    # preview header, while requests run through the apply.
+
+    routed = """[host.shop]
+names = ["shop.test"]
+default = true
+
+[[route]]
+host = "shop"
+app = "shop"
+path = "/"
+"""
+    config = tmp_path / "shop.toml"
+    config.write_text(routed + release("shop", "r1"))
+    assert apply(daemon, config).returncode == 0
+    answers: list[str] = []
+    stop = threading.Event()
+
+    def ask() -> None:
+        while not stop.is_set():
+            response = daemon.request("/", host="shop.test")
+            answers.append(json.loads(response.body)["release"] if response.status == 200 else "")
+
+    asking = threading.Thread(target=ask)
+    asking.start()
+
+    try:
+        config.write_text(
+            routed
+            + "traffic = { split = { r1 = 100, r2 = 0 } }\n\n"
+            + "[app.shop]\nserving = 'r1'\n\n"
+            + release("shop", "r1")
+            + release("shop", "r2", threads=1)
+        )
+        staged = apply(daemon, config)
+        time.sleep(0.5)
+    finally:
+        stop.set()
+        asking.join()
+
+    assert staged.returncode == 0, staged.stdout + staged.stderr
+    assert "ready and held: not serving" in staged.stdout
+    assert answers and set(answers) == {"r1"}, answers
+    preview = daemon.request("/", host="shop.test", headers={"Muru-Preview": "r2"})
+    assert json.loads(preview.body)["release"] == "r2"
+    assert daemon.releases("shop") == [
+        {"release": "shop@r2", "state": "ready", "serving": ""},
+        {"release": "shop@r1", "state": "ready", "serving": "yes"},
+    ]
+
+    # Naming r2 promotes it, after the routes are written, and the
+    # export says which release serves.
+
+    config.write_text(
+        routed
+        + "\n[app.shop]\nserving = 'r2'\n\n"
+        + release("shop", "r1")
+        + release("shop", "r2", threads=1)
+    )
+    planned = apply(daemon, config, "--dry-run")
+    assert [line.split()[:2] for line in planned.stdout.splitlines()[1:3]] == [
+        ["update-route", "route"],
+        ["promote", "shop@r2"],
+    ], planned.stdout
+    promoted = apply(daemon, config)
+    assert promoted.returncode == 0, promoted.stdout + promoted.stderr
+    assert "promote         shop@r2                  ready and serving" in promoted.stdout
+    assert json.loads(daemon.request("/", host="shop.test").body)["release"] == "r2"
+    exported = tomllib.loads(daemon.muructl("config", "export").stdout)
+    assert exported["app"]["shop"]["serving"] == "r2"
 
 
 def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path: Path) -> None:

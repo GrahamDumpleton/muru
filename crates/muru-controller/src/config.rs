@@ -59,7 +59,8 @@ pub enum Action {
         /// The choice, empty for the `[logs]` table's.
         access_log: crate::model::AccessLogSpec,
     },
-    /// Create a release with this spec and move traffic to it.
+    /// Create a release with this spec and, unless it is held, move
+    /// traffic to it.
     Deploy {
         /// The application.
         app: String,
@@ -67,6 +68,18 @@ pub enum Action {
         id: String,
         /// The resolved spec, boxed to keep the actions small.
         spec: Box<ReleaseSpec>,
+        /// Start it and leave traffic where it is: `--hold`, or another
+        /// release is the one `serving` names.
+        hold: bool,
+    },
+    /// Move all of the application's traffic to a release the daemon has
+    /// and drain the one that served, as `serving` names it (section
+    /// 9.2).
+    Promote {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
     },
     /// Drain the release if it runs, then drop its record (prune).
     RemoveRelease {
@@ -176,6 +189,7 @@ impl Action {
             Action::SetAppPriority { .. } => "set-priority",
             Action::SetAppAccessLog { .. } => "set-access-log",
             Action::Deploy { .. } => "deploy",
+            Action::Promote { .. } => "promote",
             Action::RemoveRelease { .. } => "remove-release",
             Action::RemoveApp { .. } => "remove-app",
             Action::PutHost { new: true, .. } => "create-host",
@@ -239,7 +253,9 @@ impl Change {
             | Action::SetAppIdentity { app, .. }
             | Action::SetAppPriority { app, .. }
             | Action::SetAppAccessLog { app, .. } => app.clone(),
-            Action::Deploy { app, id, .. } | Action::RemoveRelease { app, id } => {
+            Action::Deploy { app, id, .. }
+            | Action::Promote { app, id }
+            | Action::RemoveRelease { app, id } => {
                 format!("{app}@{id}")
             }
             Action::PutHost { name, .. } | Action::RemoveHost { name } => format!("host {name}"),
@@ -274,14 +290,16 @@ pub struct Plan {
 }
 
 /// Compare a document with desired state. Creates and deploys come
-/// first, application by application with releases in id order, so the
-/// last declared release of an application is the one that serves; hosts
-/// and routes follow; with `prune`, removals of what the document does
-/// not contain come last.
+/// first, application by application with releases in id order; hosts
+/// and routes follow, then the promotions `serving` asks for, so a split
+/// the same files write protects the releases it names; with `prune`,
+/// removals of what the document does not contain come last. With
+/// `hold`, every release the document adds is started held.
 pub fn plan(
     store: &Store,
     document: &Document,
     prune: bool,
+    hold: bool,
     defined: &Defined,
     provisioning: &crate::provision::Provisioning,
 ) -> Plan {
@@ -353,8 +371,18 @@ pub fn plan(
     plan_clients(store, document, defined, prune, &mut plan);
     let defined = &defined.with_applied(store, document, prune);
 
+    let mut promotions = Vec::new();
+
     for (name, app) in &document.app {
-        plan_app(store, name, app, &mut plan, provisioning);
+        let applying = Applying { prune, hold };
+        promotions.extend(plan_app(
+            store,
+            name,
+            app,
+            applying,
+            &mut plan,
+            provisioning,
+        ));
 
         // Section 4.14: a worker group's classes are the daemon's.
 
@@ -378,6 +406,7 @@ pub fn plan(
     plan_upstreams(store, document, &mut plan);
     plan_routes(store, document, defined, &mut plan);
     plan_overlays(store, document, defined, prune, &mut plan);
+    plan.changes.extend(promotions);
     plan_budget(document, defined, &mut plan);
 
     if prune {
@@ -387,19 +416,29 @@ pub fn plan(
     plan
 }
 
-/// The changes one application's table implies.
+/// How an apply runs: whether it prunes, and whether it holds every
+/// release it adds.
+#[derive(Debug, Clone, Copy)]
+struct Applying {
+    prune: bool,
+    hold: bool,
+}
+
+/// The changes one application's table implies, and the promotion its
+/// `serving` asks for, which the plan carries out after the routes.
 fn plan_app(
     store: &Store,
     name: &str,
     app: &AppTable,
+    applying: Applying,
     plan: &mut Plan,
     provisioning: &crate::provision::Provisioning,
-) {
+) -> Option<Change> {
     if !valid_name(name) {
         plan.errors.push(format!(
             "{name:?} is not a valid application name: lowercase letters, digits and hyphens, up to 63 characters"
         ));
-        return;
+        return None;
     }
 
     let stored = store.app(name).ok();
@@ -422,13 +461,13 @@ fn plan_app(
         plan.errors.push(format!(
             "{name}: umask must be octal digits such as 027, not {umask:?}"
         ));
-        return;
+        return None;
     }
 
     if app.group.is_some() && app.user.is_none() {
         plan.errors
             .push(format!("{name}: a group needs a user as well"));
-        return;
+        return None;
     }
 
     let same = stored.as_ref().is_some_and(|stored| {
@@ -536,22 +575,165 @@ fn plan_app(
                 "{name}@{id} already exists with different settings ({}); releases are immutable, so declare a new release id",
                 differences(&spec, &recorded.spec).join(", ")
             )),
-            Err(_) => deploys.push(Change {
-                detail: describe(&spec),
-                action: Action::Deploy {
-                    app: name.to_owned(),
-                    id: id.clone(),
-                    spec: Box::new(spec),
-                },
-            }),
+            Err(_) => deploys.push((id.clone(), spec)),
         }
     }
 
-    deploys.sort_by_key(|change| match &change.action {
-        Action::Deploy { id, .. } => release_order(id),
-        _ => release_order(""),
-    });
-    plan.changes.extend(deploys);
+    deploys.sort_by_key(|(id, _)| release_order(id));
+
+    // Section 10.4: the release that serves. Without `serving`, each
+    // release the apply adds serves in turn, so the last in id order
+    // serves in the end, and `--hold` holds them all; with it, the
+    // others are held and a release the daemon has is promoted.
+
+    let current = stored.and_then(|stored| stored.current);
+    let added: Vec<String> = deploys.iter().map(|(id, _)| id.clone()).collect();
+
+    let (serving, moves) = match &app.serving {
+        None if applying.hold => (current.clone(), false),
+        None => (
+            added.last().cloned().or_else(|| current.clone()),
+            !added.is_empty(),
+        ),
+        Some(serving) => {
+            match check_serving(store, name, app, serving, current.as_deref(), applying.hold) {
+                Ok((moves, warning)) => {
+                    plan.warnings.extend(warning);
+                    (Some(serving.clone()), moves)
+                }
+                Err(error) => {
+                    plan.errors.push(format!("{name}: {error}"));
+                    return None;
+                }
+            }
+        }
+    };
+
+    // Section 10.4: `--prune` removes what the files do not declare, so
+    // the release that serves must be one of theirs.
+
+    if applying.prune
+        && let Some(serving) = &serving
+        && !app.release.contains_key(serving)
+    {
+        plan.errors.push(format!(
+            "{name}@{serving} serves and the files do not declare it, so --prune would remove it; \
+             declare it, or name a declared release with serving"
+        ));
+    }
+
+    let deploys: Vec<(String, ReleaseSpec, bool)> = deploys
+        .into_iter()
+        .map(|(id, spec)| {
+            let hold = app
+                .serving
+                .as_ref()
+                .map_or(applying.hold, |serving| *serving != id);
+            (id, spec, hold)
+        })
+        .collect();
+
+    let last = deploys
+        .iter()
+        .rev()
+        .find(|(_, _, hold)| !hold)
+        .map(|(id, _, _)| id.clone());
+
+    for (id, spec, hold) in deploys {
+        let detail = if hold {
+            format!("held: {}", describe(&spec))
+        } else if last.as_ref() == Some(&id) {
+            format!("serving: {}", describe(&spec))
+        } else {
+            format!(
+                "serving until {name}@{} replaces it: {}",
+                last.as_deref().unwrap_or_default(),
+                describe(&spec)
+            )
+        };
+
+        plan.changes.push(Change {
+            detail,
+            action: Action::Deploy {
+                app: name.to_owned(),
+                id,
+                spec: Box::new(spec),
+                hold,
+            },
+        });
+    }
+
+    // A release the daemon has is promoted once the routes are written.
+
+    let serving = serving.filter(|serving| moves && !added.contains(serving))?;
+
+    Some(Change {
+        detail: match &current {
+            Some(current) => format!("serving in place of {name}@{current}"),
+            None => "serving".to_owned(),
+        },
+        action: Action::Promote {
+            app: name.to_owned(),
+            id: serving,
+        },
+    })
+}
+
+/// Section 10.4: check the release an application's `serving` names
+/// against the application's table and what the daemon has, and say
+/// whether it moves the application's traffic, with a warning when the
+/// files would undo a rollout under way once it ends. A rollout under
+/// way moves the traffic itself, so `serving` may name its baseline or
+/// its candidate and nothing else.
+fn check_serving(
+    store: &Store,
+    name: &str,
+    app: &AppTable,
+    serving: &str,
+    current: Option<&str>,
+    hold: bool,
+) -> Result<(bool, Option<String>), String> {
+    if !app.release.contains_key(serving) && store.release(name, serving).is_err() {
+        return Err(format!(
+            "serving names {serving}, which is neither declared nor a release the daemon has"
+        ));
+    }
+
+    if let Ok(Some(rollout)) = store.active_rollout(name) {
+        let candidate = &rollout.candidate;
+
+        if serving == candidate {
+            return Ok((false, None));
+        }
+
+        if serving == rollout.baseline {
+            return Ok((
+                false,
+                Some(format!(
+                    "{name}: a rollout of {name}@{candidate} is under way, and once it promotes \
+                     {candidate}, applying these files again promotes {serving} back; name \
+                     {candidate} with serving to keep the rollout's outcome"
+                )),
+            ));
+        }
+
+        return Err(format!(
+            "serving names {serving}, but a rollout of {name}@{candidate} is under way; let it \
+             finish, or end it with `muructl rollout promote {name}` or `muructl rollout abort \
+             {name}`, before naming another release"
+        ));
+    }
+
+    let moves = current != Some(serving);
+
+    if moves && hold {
+        return Err(format!(
+            "serving names {serving}, which would take the application's traffic, and --hold \
+             leaves traffic where it is; give one or the other"
+        ));
+    }
+
+    Ok((moves, None))
 }
 
 /// What the daemon's file sets that applied files are checked against:
@@ -777,7 +959,7 @@ fn plan_budget(document: &Document, defined: &Defined, plan: &mut Plan) {
     }
 
     for change in &plan.changes {
-        if let Action::Deploy { app, id, spec } = &change.action
+        if let Action::Deploy { app, id, spec, .. } = &change.action
             && let Err(why) = view.release_fits(app, spec, view.retained)
         {
             plan.warnings
@@ -2058,8 +2240,8 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
 }
 
 /// Desired state as a document: each application with the release that
-/// serves it, or with every release, and the hosts and routes. Applying
-/// it back changes nothing.
+/// serves it, which its `serving` names, or with every release, and the
+/// hosts and routes. Applying it back changes nothing.
 pub fn export(
     store: &Store,
     app: Option<&str>,
@@ -2076,6 +2258,7 @@ pub fn export(
         let mut releases = store.releases(Some(&app.name))?;
         releases.sort_by_key(|release| release_order(&release.id));
         let mut table = AppTable {
+            serving: app.current.clone(),
             user: app.user.clone(),
             group: app.group.clone(),
             umask: app.umask.clone(),
@@ -5896,6 +6079,7 @@ mod tests {
             &store,
             &Document::parse(&text).unwrap(),
             true,
+            false,
             &Defined::default(),
             &crate::provision::Provisioning::off(),
         );
@@ -5918,6 +6102,7 @@ mod tests {
                 &store,
                 document,
                 true,
+                false,
                 &Defined::default(),
                 &crate::provision::Provisioning::off(),
             )
@@ -6043,6 +6228,7 @@ mod tests {
             &store,
             &Document::parse(&text).unwrap(),
             false,
+            false,
             &Defined::default(),
             &crate::provision::Provisioning::off(),
         );
@@ -6127,6 +6313,7 @@ mod tests {
                 &store,
                 &Document::parse(text).unwrap(),
                 false,
+                false,
                 &Defined::default(),
                 &crate::provision::Provisioning::off(),
             )
@@ -6153,6 +6340,365 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&source).unwrap();
+    }
+
+    /// Shop with r1 serving, as `store_with_shop` leaves it, and r2
+    /// recorded beside it, ready and not serving.
+    fn store_with_two(source: &Path) -> Store {
+        let store = store_with_shop(source);
+        let spec = store.release("shop", "r1").unwrap().spec;
+        store.create_release("shop", "r2", &spec).unwrap();
+        store
+            .set_release_state("shop", "r2", ReleaseState::Ready, "")
+            .unwrap();
+        store
+    }
+
+    /// A document declaring shop's releases with these ids, as the store
+    /// records them, under an application table with these keys.
+    fn shop_releases(source: &Path, ids: &[&str], keys: &str) -> Document {
+        let mut text = format!("[app.shop]\n{keys}\n");
+
+        for id in ids {
+            text.push_str(&format!(
+                "[app.shop.release.{id}]\nsource = '{}'\nentrypoint = 'shop.wsgi:application'\n\
+                 python = '/usr/bin/python3'\n",
+                source.display()
+            ));
+        }
+
+        Document::parse(&text).unwrap()
+    }
+
+    fn plan_with(store: &Store, document: &Document, prune: bool, hold: bool) -> Plan {
+        plan(
+            store,
+            document,
+            prune,
+            hold,
+            &Defined::default(),
+            &crate::provision::Provisioning::off(),
+        )
+    }
+
+    /// Each change's action and subject, with whether a deploy is held.
+    fn steps(plan: &Plan) -> Vec<(&'static str, String, bool)> {
+        plan.changes
+            .iter()
+            .map(|change| {
+                let held = matches!(change.action, Action::Deploy { hold: true, .. });
+                (change.action.name(), change.subject(), held)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn serving_holds_the_other_releases_an_apply_adds() {
+        let source = source_dir();
+        let store = store_with_shop(&source);
+
+        // Issue #420: r2 declared beside r1, with r1 still serving, is
+        // started held, and the plan says so.
+
+        let staged = plan_with(
+            &store,
+            &shop_releases(&source, &["r1", "r2"], "serving = 'r1'"),
+            false,
+            false,
+        );
+        assert!(staged.errors.is_empty(), "{:?}", staged.errors);
+        assert_eq!(steps(&staged), vec![("deploy", "shop@r2".to_owned(), true)]);
+        assert!(
+            staged.changes[0].detail.starts_with("held: "),
+            "{}",
+            staged.changes[0].detail
+        );
+        assert_eq!(staged.unchanged, 1);
+
+        // Without the key each release added serves in turn, the last in
+        // id order in the end, and --hold holds them all.
+
+        let document = shop_releases(&source, &["r1", "r3", "r2"], "");
+        let added = plan_with(&store, &document, false, false);
+        assert_eq!(
+            steps(&added),
+            vec![
+                ("deploy", "shop@r2".to_owned(), false),
+                ("deploy", "shop@r3".to_owned(), false),
+            ]
+        );
+        assert!(
+            added.changes[0]
+                .detail
+                .starts_with("serving until shop@r3 replaces it: ")
+        );
+        assert!(added.changes[1].detail.starts_with("serving: "));
+        let held = plan_with(&store, &document, false, true);
+        assert!(
+            steps(&held).iter().all(|(_, _, held)| *held),
+            "{:?}",
+            steps(&held)
+        );
+
+        // Naming a release the apply adds deploys it to serve, the others
+        // held, whatever their order.
+
+        let named = plan_with(
+            &store,
+            &shop_releases(&source, &["r1", "r2", "r3"], "serving = 'r2'"),
+            false,
+            false,
+        );
+        assert_eq!(
+            steps(&named),
+            vec![
+                ("deploy", "shop@r2".to_owned(), false),
+                ("deploy", "shop@r3".to_owned(), true),
+            ]
+        );
+        assert!(named.changes[0].detail.starts_with("serving: "));
+    }
+
+    #[test]
+    fn serving_a_release_the_daemon_has_promotes_it_after_the_routes() {
+        let source = source_dir();
+        let store = store_with_two(&source);
+        let mut document = shop_releases(&source, &["r1", "r2"], "serving = 'r2'");
+        let routed = Document::parse(
+            "[host.shop]\nnames = ['shop.test']\n[[route]]\nhost = 'shop'\napp = 'shop'\npath = '/'\n",
+        )
+        .unwrap();
+        document.merge(routed).unwrap();
+
+        let promoted = plan_with(&store, &document, false, false);
+        assert!(promoted.errors.is_empty(), "{:?}", promoted.errors);
+        assert_eq!(
+            steps(&promoted),
+            vec![
+                ("create-host", "host shop".to_owned(), false),
+                ("create-route", "route shop /".to_owned(), false),
+                ("promote", "shop@r2".to_owned(), false),
+            ]
+        );
+        assert_eq!(promoted.changes[2].detail, "serving in place of shop@r1");
+        assert!(!promoted.changes[2].action.reconfigures());
+
+        // A release the daemon has need not be declared without --prune;
+        // naming the one that serves changes nothing.
+
+        let undeclared = plan_with(
+            &store,
+            &shop_releases(&source, &["r1"], "serving = 'r2'"),
+            false,
+            false,
+        );
+        assert_eq!(
+            steps(&undeclared),
+            vec![("promote", "shop@r2".to_owned(), false)]
+        );
+        let same = plan_with(
+            &store,
+            &shop_releases(&source, &["r1", "r2"], "serving = 'r1'"),
+            false,
+            false,
+        );
+        assert!(
+            same.errors.is_empty() && same.changes.is_empty(),
+            "{same:?}"
+        );
+
+        // --hold leaves traffic where it is, which a promotion does not.
+
+        let held = plan_with(
+            &store,
+            &shop_releases(&source, &["r1", "r2"], "serving = 'r2'"),
+            false,
+            true,
+        );
+        assert_eq!(held.errors.len(), 1, "{:?}", held.errors);
+        assert!(
+            held.errors[0].contains("--hold leaves traffic where it is"),
+            "{}",
+            held.errors[0]
+        );
+    }
+
+    #[test]
+    fn serving_must_name_a_declared_release_or_one_the_daemon_has() {
+        let source = source_dir();
+        let store = store_with_shop(&source);
+
+        let refused = plan_with(
+            &store,
+            &shop_releases(&source, &["r1", "r2"], "serving = 'r9'"),
+            false,
+            false,
+        );
+        assert_eq!(
+            refused.errors,
+            vec!["shop: serving names r9, which is neither declared nor a release the daemon has"]
+        );
+    }
+
+    #[test]
+    fn a_rollout_under_way_leaves_serving_to_its_baseline_or_candidate() {
+        let source = source_dir();
+        let store = store_with_two(&source);
+        store
+            .put_rollout(&crate::model::Rollout {
+                app: "shop".to_owned(),
+                id: "1".to_owned(),
+                candidate: "r2".to_owned(),
+                baseline: "r1".to_owned(),
+                steps: Vec::new(),
+                gates: crate::model::RolloutGates {
+                    max_error_rate: 0.01,
+                    max_p95_ms: None,
+                    max_p99_ms: None,
+                    max_worker_faults: 0,
+                    max_queue_wait_p95_ms: None,
+                    probes: Vec::new(),
+                    min_requests: 10,
+                },
+                approve_each_step: false,
+                state: crate::model::RolloutState::Running,
+                step: 0,
+                step_started_unix_ms: 0,
+                message: String::new(),
+                created_unix_ms: 0,
+                updated_unix_ms: 0,
+            })
+            .unwrap();
+
+        // The candidate: the rollout moves traffic to it, and a release
+        // the apply adds is held.
+
+        let candidate = plan_with(
+            &store,
+            &shop_releases(&source, &["r1", "r2", "r3"], "serving = 'r2'"),
+            false,
+            false,
+        );
+        assert!(
+            candidate.errors.is_empty() && candidate.warnings.is_empty(),
+            "{candidate:?}"
+        );
+        assert_eq!(
+            steps(&candidate),
+            vec![("deploy", "shop@r3".to_owned(), true)]
+        );
+
+        // The baseline: nothing changes now, with a warning that the
+        // files would undo the rollout once it promotes.
+
+        let baseline = plan_with(
+            &store,
+            &shop_releases(&source, &["r1", "r2"], "serving = 'r1'"),
+            false,
+            false,
+        );
+        assert!(
+            baseline.errors.is_empty() && baseline.changes.is_empty(),
+            "{baseline:?}"
+        );
+        assert_eq!(baseline.warnings.len(), 1, "{:?}", baseline.warnings);
+        assert!(
+            baseline.warnings[0].contains("promotes r1 back"),
+            "{}",
+            baseline.warnings[0]
+        );
+
+        // Any other release is refused.
+
+        let other = plan_with(
+            &store,
+            &shop_releases(&source, &["r1", "r2", "r3"], "serving = 'r3'"),
+            false,
+            false,
+        );
+        assert_eq!(other.errors.len(), 1, "{:?}", other.errors);
+        assert!(
+            other.errors[0].contains("a rollout of shop@r2 is under way")
+                && other.errors[0].contains("muructl rollout abort shop"),
+            "{}",
+            other.errors[0]
+        );
+    }
+
+    #[test]
+    fn prune_needs_the_release_that_serves_declared() {
+        let source = source_dir();
+        let store = store_with_two(&source);
+
+        // r1 serves, by the key or as the release that serves now, and
+        // the files leave it out.
+
+        for keys in ["serving = 'r1'", ""] {
+            let document = shop_releases(&source, &["r2"], keys);
+            let refused = plan_with(&store, &document, true, false);
+            assert_eq!(refused.errors.len(), 1, "{keys}: {:?}", refused.errors);
+            assert!(
+                refused.errors[0].starts_with("shop@r1 serves and the files do not declare it"),
+                "{}",
+                refused.errors[0]
+            );
+            assert!(plan_with(&store, &document, false, false).errors.is_empty());
+        }
+
+        // Naming the declared release promotes it before r1 is removed.
+
+        let moved = plan_with(
+            &store,
+            &shop_releases(&source, &["r2"], "serving = 'r2'"),
+            true,
+            false,
+        );
+        assert!(moved.errors.is_empty(), "{:?}", moved.errors);
+        assert_eq!(
+            steps(&moved),
+            vec![
+                ("promote", "shop@r2".to_owned(), false),
+                ("remove-release", "shop@r1".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_export_names_the_release_that_serves() {
+        let source = source_dir();
+        let store = store_with_two(&source);
+        store
+            .set_app_releases("shop", Some("r2"), Some("r1"))
+            .unwrap();
+
+        let serving = export(&store, None, false).unwrap();
+        assert_eq!(serving.app["shop"].serving.as_deref(), Some("r2"));
+        assert_eq!(
+            serving.app["shop"].release.keys().collect::<Vec<_>>(),
+            ["r2"]
+        );
+        let text = export(&store, None, true).unwrap().to_toml().unwrap();
+        assert!(text.contains("serving = \"r2\""), "{text}");
+
+        // Applied back, every release exported changes nothing; applied
+        // to a node without them, r2 serves and r1 is held.
+
+        let every = Document::parse(&text).unwrap();
+        let back = plan_with(&store, &every, true, false);
+        assert!(
+            back.errors.is_empty() && back.changes.is_empty(),
+            "{back:?}"
+        );
+        assert_eq!(back.unchanged, 2);
+        let elsewhere = plan_with(&Store::in_memory().unwrap(), &every, false, false);
+        assert_eq!(
+            steps(&elsewhere),
+            vec![
+                ("create-app", "shop".to_owned(), false),
+                ("deploy", "shop@r1".to_owned(), true),
+                ("deploy", "shop@r2".to_owned(), false),
+            ]
+        );
     }
 
     #[test]
@@ -6199,6 +6745,7 @@ mod tests {
             &store,
             &Document::parse(&text).unwrap(),
             false,
+            false,
             &file,
             &crate::provision::Provisioning::off(),
         );
@@ -6215,6 +6762,7 @@ mod tests {
                 &store,
                 &Document::parse(&again).unwrap(),
                 false,
+                false,
                 &file,
                 &crate::provision::Provisioning::off(),
             )
@@ -6229,6 +6777,7 @@ mod tests {
             &store,
             &Document::parse(&class("extra")).unwrap(),
             false,
+            false,
             &file,
             &crate::provision::Provisioning::off(),
         );
@@ -6239,6 +6788,7 @@ mod tests {
             &store,
             &Document::parse(&reordered).unwrap(),
             true,
+            false,
             &file,
             &crate::provision::Provisioning::off(),
         );
@@ -6255,6 +6805,7 @@ mod tests {
         let errors = plan(
             &store,
             &Document::parse(&refused).unwrap(),
+            false,
             false,
             &file,
             &crate::provision::Provisioning::off(),
@@ -6292,6 +6843,7 @@ mod tests {
             &store,
             &Document::parse(&routes("")).unwrap(),
             false,
+            false,
             &defined,
             &crate::provision::Provisioning::off(),
         );
@@ -6310,6 +6862,7 @@ mod tests {
         let refused = super::plan(
             &store,
             &Document::parse(&text).unwrap(),
+            false,
             false,
             &defined,
             &crate::provision::Provisioning::off(),
@@ -6334,6 +6887,7 @@ mod tests {
             &store,
             &Document::default(),
             true,
+            false,
             &Defined::default(),
             &crate::provision::Provisioning::off(),
         );
@@ -6363,6 +6917,7 @@ mod tests {
         let plan = plan(
             &store,
             &Document::parse(text).unwrap(),
+            false,
             false,
             &Defined::default(),
             &crate::provision::Provisioning::off(),

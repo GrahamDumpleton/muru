@@ -1296,6 +1296,7 @@ impl Admin for Service {
             .send(Command::PromoteRelease {
                 app: request.app,
                 id: request.release,
+                retain: crate::daemon::Retention::default(),
                 done: done_tx,
             })
             .await
@@ -1554,6 +1555,7 @@ impl Admin for Service {
             &self.handle.store,
             &document,
             request.prune,
+            request.hold,
             &defined,
             &self.handle.info.provisioning,
         );
@@ -1561,14 +1563,18 @@ impl Admin for Service {
         let mut overridden = BTreeMap::new();
 
         for change in &plan.changes {
-            if let Action::Deploy { app, id, .. } = &change.action
-                && let Some(by) = frozen.get(app)
-            {
+            let (app, id, what) = match &change.action {
+                Action::Deploy { app, id, .. } => (app, id, "deploy"),
+                Action::Promote { app, id } => (app, id, "promote"),
+                _ => continue,
+            };
+
+            if let Some(by) = frozen.get(app) {
                 if request.override_freeze {
-                    overridden.insert(app.clone(), (id.clone(), by.join(", ")));
+                    overridden.insert(app.clone(), (id.clone(), what, by.join(", ")));
                 } else {
                     plan.errors.push(format!(
-                        "{app}@{id}: deploys of {app} are frozen by overlay {}; give --override-freeze to deploy anyway",
+                        "{app}@{id}: deploys of {app} are frozen by overlay {}; give --override-freeze to {what} anyway",
                         by.join(", ")
                     ));
                 }
@@ -1577,12 +1583,11 @@ impl Admin for Service {
 
         let mut report = report_message(&plan);
 
-        // Section 10.4: how the releases the apply adds are deployed,
-        // which the plan says of each one it holds, and of each release
-        // one of them takes over from.
+        // Section 10.4: how the releases the apply adds are deployed, and
+        // what becomes of each release one of them, or a promotion, takes
+        // over from. The plan says which it holds.
 
         let deploying = Deploying {
-            hold: request.hold,
             wait: !request.no_wait,
             retain: crate::daemon::Retention {
                 lasts: request
@@ -1598,21 +1603,13 @@ impl Admin for Service {
             report.notes.extend(self.deploy_notes(&plan, &deploying));
         }
 
-        if deploying.hold {
-            for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
-                if matches!(change.action, Action::Deploy { .. }) {
-                    message.detail = format!("held: {}", message.detail);
-                }
-            }
-        }
-
         if !request.dry_run && plan.errors.is_empty() {
-            for (app, (id, by)) in &overridden {
+            for (app, (id, what, by)) in &overridden {
                 self.handle.events.emit(
                     "deploy.freeze_overridden",
                     app,
                     "warning",
-                    &format!("apply deploys {app}@{id} despite the freeze set by overlay {by}"),
+                    &format!("apply {what}s {app}@{id} despite the freeze set by overlay {by}"),
                 );
             }
         }
@@ -1710,6 +1707,7 @@ impl Admin for Service {
             &self.handle.store,
             &document,
             true,
+            false,
             &defined,
             &self.handle.info.provisioning,
         );
@@ -1791,10 +1789,9 @@ fn compression_note(table: Option<&muru_config::Compression>) -> String {
     }
 }
 
-/// How an apply deploys the releases it adds (section 10.4).
+/// How an apply deploys the releases it adds and promotes the ones
+/// `serving` names (section 10.4).
 struct Deploying {
-    /// Start them and leave traffic where it is.
-    hold: bool,
     /// Wait for each to serve or fail.
     wait: bool,
     /// How long a release one of them replaces stays warm, and with how
@@ -1865,9 +1862,13 @@ impl Service {
                 .set_app_access_log(app, access_log)
                 .map(|()| "set".to_owned())
                 .map_err(|error| error.to_string()),
-            Action::Deploy { app, id, spec } => {
-                self.deploy_declared(app, id, spec, deploying).await
-            }
+            Action::Deploy {
+                app,
+                id,
+                spec,
+                hold,
+            } => self.deploy_declared(app, id, spec, *hold, deploying).await,
+            Action::Promote { app, id } => self.promote_declared(app, id, deploying).await,
             Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
             Action::RemoveApp { app } => store
                 .delete_app(app)
@@ -1954,20 +1955,26 @@ impl Service {
         outcome.unwrap_or_else(|error| format!("failed: {error}"))
     }
 
-    /// What the plan's deploys would do beyond starting their releases,
-    /// for the report: nothing when a release is held, since traffic
-    /// stays where it is, and otherwise what becomes of the release
-    /// each application's last deploy takes over from.
+    /// What the plan's deploys and promotions would do beyond starting
+    /// their releases, for the report: nothing for a held release, since
+    /// traffic stays where it is, and otherwise what becomes of the
+    /// release each application's last deploy or promotion takes over
+    /// from.
     fn deploy_notes(&self, plan: &Plan, deploying: &Deploying) -> Vec<String> {
-        if deploying.hold {
-            return Vec::new();
-        }
-
         let mut last: BTreeMap<&str, &str> = BTreeMap::new();
 
         for change in &plan.changes {
-            if let Action::Deploy { app, id, .. } = &change.action {
-                last.insert(app, id);
+            match &change.action {
+                Action::Deploy {
+                    app,
+                    id,
+                    hold: false,
+                    ..
+                }
+                | Action::Promote { app, id } => {
+                    last.insert(app, id);
+                }
+                _ => {}
             }
         }
 
@@ -2002,6 +2009,7 @@ impl Service {
         app: &str,
         id: &str,
         spec: &ReleaseSpec,
+        hold: bool,
         deploying: &Deploying,
     ) -> Result<String, String> {
         let (created_tx, created_rx) = oneshot::channel();
@@ -2013,7 +2021,7 @@ impl Service {
                 spec: Box::new(spec.clone()),
                 id: Some(id.to_owned()),
                 retain: deploying.retain,
-                hold: deploying.hold,
+                hold,
                 created: created_tx,
                 done: done_tx,
             })
@@ -2049,12 +2057,41 @@ impl Service {
             release.state,
             if serving {
                 " and serving"
-            } else if deploying.hold {
+            } else if hold {
                 " and held: not serving"
             } else {
                 ""
             }
         ))
+    }
+
+    /// Promote a release the daemon has, as `serving` names it, and say
+    /// how it went: promoting when the apply does not wait, else that it
+    /// serves.
+    async fn promote_declared(
+        &self,
+        app: &str,
+        id: &str,
+        deploying: &Deploying,
+    ) -> Result<String, String> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::PromoteRelease {
+                app: app.to_owned(),
+                id: id.to_owned(),
+                retain: deploying.retain,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| STOPPING.to_owned())?;
+
+        if !deploying.wait {
+            return Ok("promoting".to_owned());
+        }
+
+        let release = done_rx.await.map_err(|_| STOPPING.to_owned())??;
+        Ok(format!("{} and serving", release.state))
     }
 
     /// Drain a release if it runs, then drop its record.
