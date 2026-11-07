@@ -275,10 +275,10 @@ changes a default.
 
 An apply creates the applications the files name, deploys each declared
 release the daemon does not have (the last of an application's in id
-order to serve, and the others held, unless the application's
-[`serving` key](#which-release-serves) names another), creates or
-updates the hosts and routes, and leaves anything already recorded as
-declared alone. Id order puts ids of the form `rN` first, by number, so
+order to serve, unless the application's [`serving`
+key](#which-release-serves) names another, and the others held when a
+route names them, else left stopped), creates or updates the hosts and
+routes, and leaves anything already recorded as declared alone. Id order puts ids of the form `rN` first, by number, so
 `r10` comes after `r9`, and every other id after them, by name: files
 adding `r9` and `2026-11-06` serve `2026-11-06`. Releases are
 immutable: a declared release whose settings differ from the recorded
@@ -317,8 +317,9 @@ muru: plan (nothing changed)
 
 An application whose first release is held serves nothing until a
 rollout. To hold the releases of one application and not another's,
-give it a `serving` key naming the release that serves now, which holds
-the others without the flag.
+give it a `serving` key naming the release that serves now, which keeps
+the others out of traffic without the flag: held where a route names
+them, else stopped.
 
 `--dry-run` prints the plan and changes nothing. For each release that
 would take over from one that serves, it says how long that one stays
@@ -386,16 +387,24 @@ source = "/srv/shop/r1"
 source = "/srv/shop/r2"
 ```
 
-Applied while r1 serves, this starts r2 held. It does not take the
-application's traffic: it serves only the share a route's split gives
-it, and requests that name it with the `Muru-Preview` header, so a split
-of 0, or none, sends it nothing else.
+Applied while r1 serves, this records r2 and leaves it stopped, since
+nothing serves it or names it. A route whose traffic split or client
+classes in the same files name r2, even at 0%, starts it held instead:
+it does not take the application's traffic, and serves only that share
+and requests that name it with the `Muru-Preview` header. So does an
+[overlay](overlays.md) in the same files that pins r2, splits to it or
+waits for it with `release_ready`, so that the overlay can activate. A
+stopped release is started by a rollout, a promotion or a split that
+names it later; a preview alone does not start it. `--hold` starts
+every release the apply adds held.
+
 Changing the key to `serving = "r2"` and applying the files again
-promotes r2: all of the application's traffic moves to it, and r1
-drains and stays warm as `--retain` and `--retain-workers` say. The
-promotion comes after the apply has written the hosts and routes, so a
-split in the same files that still names r1 keeps it running. The plan
-says what happens to each release:
+promotes r2, starting it if it is stopped: all of the application's
+traffic moves to it, and r1 drains and stays warm as `--retain` and
+`--retain-workers` say. The promotion comes after the apply has written
+the hosts and routes, so a split in the same files that still names r1
+keeps it running. The plan says what happens to each release, `serving`,
+`held` or `stopped` for one it adds:
 
 ```console
 $ muructl apply -f config/ --dry-run
@@ -407,9 +416,9 @@ muru: shop@r1 stays warm for 1800s with 1 worker to a group, when shop@r2 takes 
 
 The key names a declared release or one the daemon already has; naming
 neither is an error. Without the key, the last release the apply adds,
-in id order, serves, and the others it adds are held. `--hold` with a
-key that would move traffic is an error, since the flag leaves traffic
-where it is.
+in id order, serves, and the others it adds are held or left stopped
+as above. `--hold` with a key that would move traffic is an error,
+since the flag leaves traffic where it is.
 
 While a [rollout](rollouts.md) is under way, the rollout moves the
 traffic. The key may name its baseline or its candidate, and the apply

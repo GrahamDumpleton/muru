@@ -127,6 +127,15 @@ and changing it changes no release.
 - Bad: files without the key still let the release an apply adds serve
   before a split in the same files is written.
 
+- Good: an added release that neither serves nor is named by a route's
+  traffic or an overlay in the same files is recorded and left stopped,
+  so staging a release costs nothing until a rollout, a promotion or a
+  split starts it (issue #449). `--hold` still starts every one held.
+
+- Bad: a stopped release cannot be previewed until something starts it,
+  since the `Muru-Preview` header reaches only a release that runs: a
+  route split giving it 0% starts it held for previews.
+
 ## More information
 
 Specification sections 9.2, 10.4 and 19.1. Issues #417 and #420; the
@@ -134,4 +143,6 @@ apply's order and atomicity are issue #439. ADR 0052 rejected a hold key
 on a release's table. Issue #447 later held, without the key, every
 release an apply adds but the last in id order, so the plan's `serving
 until` detail went. Issue #448 refused promoting a rolled-back candidate,
-where the next apply had promoted it without its gates.
+where the next apply had promoted it without its gates. Issue #449 left
+stopped an added release that nothing serves or names, where it had been
+started held.

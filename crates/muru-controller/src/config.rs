@@ -59,8 +59,8 @@ pub enum Action {
         /// The choice, empty for the `[logs]` table's.
         access_log: crate::model::AccessLogSpec,
     },
-    /// Create a release with this spec and, unless it is held, move
-    /// traffic to it.
+    /// Create a release with this spec and, as `added` says, move
+    /// traffic to it, start it held, or leave it stopped.
     Deploy {
         /// The application.
         app: String,
@@ -68,9 +68,8 @@ pub enum Action {
         id: String,
         /// The resolved spec, boxed to keep the actions small.
         spec: Box<ReleaseSpec>,
-        /// Start it and leave traffic where it is: `--hold`, or another
-        /// release is the one `serving` names.
-        hold: bool,
+        /// What becomes of it.
+        added: Added,
     },
     /// Move all of the application's traffic to a release the daemon has
     /// and drain the one that served, as `serving` names it (section
@@ -178,6 +177,31 @@ pub enum Action {
         /// The limit's name.
         name: String,
     },
+}
+
+/// What becomes of a release an apply adds (section 10.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Added {
+    /// It takes the application's traffic: `serving` names it, or it is
+    /// the last added in id order.
+    Serving,
+    /// Started with traffic left where it is: `--hold`, or a route's
+    /// traffic or an overlay in the same files names it.
+    Held,
+    /// Recorded and not started, for a later rollout, promotion or route
+    /// split to start.
+    Stopped,
+}
+
+impl Added {
+    /// The word the plan shows.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Added::Serving => "serving",
+            Added::Held => "held",
+            Added::Stopped => "stopped",
+        }
+    }
 }
 
 impl Action {
@@ -372,6 +396,22 @@ pub fn plan(
     let defined = &defined.with_applied(store, document, prune);
 
     let mut promotions = Vec::new();
+    let route_apps: BTreeMap<String, String> = document
+        .route
+        .iter()
+        .filter_map(|route| route.name.clone().map(|name| (name, route.app.clone())))
+        .collect();
+    let named: BTreeSet<(String, String)> = document
+        .route
+        .iter()
+        .flat_map(traffic_releases)
+        .chain(
+            document
+                .overlay
+                .values()
+                .flat_map(|overlay| overlay_releases(overlay, &route_apps)),
+        )
+        .collect();
 
     for (name, app) in &document.app {
         let applying = Applying { prune, hold };
@@ -380,6 +420,7 @@ pub fn plan(
             name,
             app,
             applying,
+            &named,
             &mut plan,
             provisioning,
         ));
@@ -426,11 +467,14 @@ struct Applying {
 
 /// The changes one application's table implies, and the promotion its
 /// `serving` asks for, which the plan carries out after the routes.
+/// `named` holds the releases the document's routes' traffic and its
+/// overlays name.
 fn plan_app(
     store: &Store,
     name: &str,
     app: &AppTable,
     applying: Applying,
+    named: &BTreeSet<(String, String)>,
     plan: &mut Plan,
     provisioning: &crate::provision::Provisioning,
 ) -> Option<Change> {
@@ -622,21 +666,29 @@ fn plan_app(
         ));
     }
 
+    // A release that neither serves nor is named by a route's traffic or
+    // an overlay is recorded and left stopped, for a rollout, a promotion
+    // or a split to start; `--hold` starts every one held, as it does a
+    // deploy.
+
     for (id, spec) in deploys {
-        let hold = applying.hold || serving.as_ref() != Some(&id);
-        let detail = format!(
-            "{}: {}",
-            if hold { "held" } else { "serving" },
-            describe(&spec)
-        );
+        let added = if applying.hold {
+            Added::Held
+        } else if serving.as_ref() == Some(&id) {
+            Added::Serving
+        } else if named.contains(&(name.to_owned(), id.clone())) {
+            Added::Held
+        } else {
+            Added::Stopped
+        };
 
         plan.changes.push(Change {
-            detail,
+            detail: format!("{}: {}", added.as_str(), describe(&spec)),
             action: Action::Deploy {
                 app: name.to_owned(),
                 id,
                 spec: Box::new(spec),
-                hold,
+                added,
             },
         });
     }
@@ -956,7 +1008,14 @@ fn plan_budget(document: &Document, defined: &Defined, plan: &mut Plan) {
     }
 
     for change in &plan.changes {
-        if let Action::Deploy { app, id, spec, .. } = &change.action
+        if let Action::Deploy {
+            app,
+            id,
+            spec,
+            added,
+            ..
+        } = &change.action
+            && *added != Added::Stopped
             && let Err(why) = view.release_fits(app, spec, view.retained)
         {
             plan.warnings
@@ -2296,6 +2355,56 @@ pub fn traffic_releases(route: &RouteTable) -> Vec<(String, String)> {
         .filter(|id| !id.starts_with(muru_edge::routing::UPSTREAM_PREFIX))
         .map(|id| (app.to_owned(), id.clone()))
         .collect()
+}
+
+/// The releases an overlay names, as (app, release): the pins and splits
+/// it gives its routes and their client classes' routes, of each route's
+/// application, and its `release_ready` precondition (section 9.10).
+/// `route_apps` maps a route's name to its application.
+pub fn overlay_releases(
+    overlay: &Overlay,
+    route_apps: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut named = Vec::new();
+
+    for (route, changes) in &overlay.routes {
+        let Some(app) = route_apps.get(route).filter(|app| !app.is_empty()) else {
+            continue;
+        };
+
+        let mut pending = vec![changes];
+
+        while let Some(changes) = pending.pop() {
+            if let Some(traffic) = &changes.traffic {
+                let split = traffic.split.iter().flat_map(|split| split.keys());
+                named.extend(
+                    traffic
+                        .pin
+                        .iter()
+                        .chain(split)
+                        .filter(|id| !id.starts_with(muru_edge::routing::UPSTREAM_PREFIX))
+                        .map(|id| (app.clone(), id.clone())),
+                );
+            }
+
+            pending.extend(
+                changes
+                    .client_routes
+                    .iter()
+                    .flat_map(|routes| routes.values()),
+            );
+        }
+    }
+
+    if let Some(ready) = overlay
+        .preconditions
+        .as_ref()
+        .and_then(|preconditions| preconditions.release_ready.as_deref())
+    {
+        named.extend(precondition_release(ready, overlay, route_apps));
+    }
+
+    named
 }
 
 /// Desired state as a document: each application with the release that
@@ -6452,24 +6561,29 @@ mod tests {
         )
     }
 
-    /// Each change's action and subject, with whether a deploy is held.
-    fn steps(plan: &Plan) -> Vec<(&'static str, String, bool)> {
+    /// Each change's action and subject, with what becomes of a release
+    /// a deploy adds: serving, held or stopped.
+    fn steps(plan: &Plan) -> Vec<(&'static str, String, &'static str)> {
         plan.changes
             .iter()
             .map(|change| {
-                let held = matches!(change.action, Action::Deploy { hold: true, .. });
-                (change.action.name(), change.subject(), held)
+                let added = match change.action {
+                    Action::Deploy { added, .. } => added.as_str(),
+                    _ => "",
+                };
+
+                (change.action.name(), change.subject(), added)
             })
             .collect()
     }
 
     #[test]
-    fn serving_holds_the_other_releases_an_apply_adds() {
+    fn serving_holds_or_stops_the_other_releases_an_apply_adds() {
         let source = source_dir();
         let store = store_with_shop(&source);
 
-        // Issue #420: r2 declared beside r1, with r1 still serving, is
-        // started held, and the plan says so.
+        // Issue #449: r2 declared beside r1, with r1 still serving and no
+        // route naming it, is recorded and left stopped.
 
         let staged = plan_with(
             &store,
@@ -6478,37 +6592,78 @@ mod tests {
             false,
         );
         assert!(staged.errors.is_empty(), "{:?}", staged.errors);
-        assert_eq!(steps(&staged), vec![("deploy", "shop@r2".to_owned(), true)]);
+        assert_eq!(
+            steps(&staged),
+            vec![("deploy", "shop@r2".to_owned(), "stopped")]
+        );
         assert!(
-            staged.changes[0].detail.starts_with("held: "),
+            staged.changes[0].detail.starts_with("stopped: "),
             "{}",
             staged.changes[0].detail
         );
         assert_eq!(staged.unchanged, 1);
 
-        // Without the key the last release added in id order serves and
-        // the others are held (issue #447), and --hold holds them all.
+        // Issue #420: a split in the same files that gives it 0% starts it
+        // held, to serve its share and previews.
+
+        let mut split = shop_releases(&source, &["r1", "r2"], "serving = 'r1'");
+        let routed = Document::parse(
+            "[host.shop]\nnames = ['shop.test']\n[[route]]\nhost = 'shop'\napp = 'shop'\n\
+             path = '/'\ntraffic = { split = { r1 = 100, r2 = 0 } }\n",
+        )
+        .unwrap();
+        split.merge(routed).unwrap();
+        let held = plan_with(&store, &split, false, false);
+        assert!(held.errors.is_empty(), "{:?}", held.errors);
+        let deploys: Vec<_> = steps(&held)
+            .into_iter()
+            .filter(|(action, _, _)| *action == "deploy")
+            .collect();
+        assert_eq!(deploys, vec![("deploy", "shop@r2".to_owned(), "held")]);
+
+        // So does an overlay in the same files that pins it, which needs
+        // it ready to activate.
+
+        let mut pinned = shop_releases(&source, &["r1", "r2"], "serving = 'r1'");
+        let overlaid = Document::parse(
+            "[host.shop]\nnames = ['shop.test']\n[[route]]\nname = 'root'\nhost = 'shop'\n\
+             app = 'shop'\npath = '/'\n[overlay.cutover]\nroutes.root.traffic = { pin = 'r2' }\n\
+             preconditions = { release_ready = 'r2' }\n",
+        )
+        .unwrap();
+        pinned.merge(overlaid).unwrap();
+        let held = plan_with(&store, &pinned, false, false);
+        assert!(held.errors.is_empty(), "{:?}", held.errors);
+        let deploys: Vec<_> = steps(&held)
+            .into_iter()
+            .filter(|(action, _, _)| *action == "deploy")
+            .collect();
+        assert_eq!(deploys, vec![("deploy", "shop@r2".to_owned(), "held")]);
+
+        // Without the key the last release added in id order serves
+        // (issue #447), and --hold starts every one held.
 
         let document = shop_releases(&source, &["r1", "r3", "r2"], "");
         let added = plan_with(&store, &document, false, false);
         assert_eq!(
             steps(&added),
             vec![
-                ("deploy", "shop@r2".to_owned(), true),
-                ("deploy", "shop@r3".to_owned(), false),
+                ("deploy", "shop@r2".to_owned(), "stopped"),
+                ("deploy", "shop@r3".to_owned(), "serving"),
             ]
         );
-        assert!(added.changes[0].detail.starts_with("held: "));
         assert!(added.changes[1].detail.starts_with("serving: "));
-        let held = plan_with(&store, &document, false, true);
+        let all_held = plan_with(&store, &document, false, true);
         assert!(
-            steps(&held).iter().all(|(_, _, held)| *held),
+            steps(&all_held)
+                .iter()
+                .all(|(_, _, added)| *added == "held"),
             "{:?}",
-            steps(&held)
+            steps(&all_held)
         );
 
-        // Naming a release the apply adds deploys it to serve, the others
-        // held, whatever their order.
+        // Naming a release the apply adds deploys it to serve, whatever
+        // the order.
 
         let named = plan_with(
             &store,
@@ -6519,11 +6674,10 @@ mod tests {
         assert_eq!(
             steps(&named),
             vec![
-                ("deploy", "shop@r2".to_owned(), false),
-                ("deploy", "shop@r3".to_owned(), true),
+                ("deploy", "shop@r2".to_owned(), "serving"),
+                ("deploy", "shop@r3".to_owned(), "stopped"),
             ]
         );
-        assert!(named.changes[0].detail.starts_with("serving: "));
     }
 
     #[test]
@@ -6542,9 +6696,9 @@ mod tests {
         assert_eq!(
             steps(&promoted),
             vec![
-                ("create-host", "host shop".to_owned(), false),
-                ("create-route", "route shop /".to_owned(), false),
-                ("promote", "shop@r2".to_owned(), false),
+                ("create-host", "host shop".to_owned(), ""),
+                ("create-route", "route shop /".to_owned(), ""),
+                ("promote", "shop@r2".to_owned(), ""),
             ]
         );
         assert_eq!(promoted.changes[2].detail, "serving in place of shop@r1");
@@ -6561,7 +6715,7 @@ mod tests {
         );
         assert_eq!(
             steps(&undeclared),
-            vec![("promote", "shop@r2".to_owned(), false)]
+            vec![("promote", "shop@r2".to_owned(), "")]
         );
         let same = plan_with(
             &store,
@@ -6684,10 +6838,7 @@ mod tests {
             .unwrap();
         let allowed = plan_with(&store, &document, false, false);
         assert!(allowed.errors.is_empty(), "{:?}", allowed.errors);
-        assert_eq!(
-            steps(&allowed),
-            vec![("promote", "shop@r2".to_owned(), false)]
-        );
+        assert_eq!(steps(&allowed), vec![("promote", "shop@r2".to_owned(), "")]);
     }
 
     #[test]
@@ -6704,7 +6855,7 @@ mod tests {
             .unwrap();
 
         // The candidate: the rollout moves traffic to it, and a release
-        // the apply adds is held.
+        // the apply adds is left stopped.
 
         let candidate = plan_with(
             &store,
@@ -6718,7 +6869,7 @@ mod tests {
         );
         assert_eq!(
             steps(&candidate),
-            vec![("deploy", "shop@r3".to_owned(), true)]
+            vec![("deploy", "shop@r3".to_owned(), "stopped")]
         );
 
         // The baseline: nothing changes now, with a warning that the
@@ -6790,8 +6941,8 @@ mod tests {
         assert_eq!(
             steps(&moved),
             vec![
-                ("promote", "shop@r2".to_owned(), false),
-                ("remove-release", "shop@r1".to_owned(), false),
+                ("promote", "shop@r2".to_owned(), ""),
+                ("remove-release", "shop@r1".to_owned(), ""),
             ]
         );
     }
@@ -6827,8 +6978,8 @@ mod tests {
         assert_eq!(
             steps(&elsewhere),
             vec![
-                ("create-app", "shop".to_owned(), false),
-                ("deploy", "shop@r2".to_owned(), false),
+                ("create-app", "shop".to_owned(), ""),
+                ("deploy", "shop@r2".to_owned(), "serving"),
             ]
         );
     }
@@ -6949,9 +7100,9 @@ mod tests {
         assert_eq!(
             deploys,
             vec![
-                ("deploy", "shop@r1".to_owned(), false),
-                ("deploy", "shop@r2".to_owned(), true),
-                ("deploy", "shop@r3".to_owned(), true),
+                ("deploy", "shop@r1".to_owned(), "serving"),
+                ("deploy", "shop@r2".to_owned(), "held"),
+                ("deploy", "shop@r3".to_owned(), "held"),
             ]
         );
     }

@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
-use crate::config::{self, Action, Change, Plan};
+use crate::config::{self, Action, Added, Change, Plan};
 use crate::daemon::{CertificateChanges, Command, Handle, RolloutAction};
 use crate::model::{
     Event, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutStep, now_unix_ms,
@@ -1870,8 +1870,17 @@ impl Service {
                 app,
                 id,
                 spec,
-                hold,
-            } => self.deploy_declared(app, id, spec, *hold, deploying).await,
+                added: Added::Stopped,
+            } => self.record_declared(app, id, spec),
+            Action::Deploy {
+                app,
+                id,
+                spec,
+                added,
+            } => {
+                let hold = *added == Added::Held;
+                self.deploy_declared(app, id, spec, hold, deploying).await
+            }
             Action::Promote { app, id } => self.promote_declared(app, id, deploying).await,
             Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
             Action::RemoveApp { app } => store
@@ -1972,7 +1981,7 @@ impl Service {
                 Action::Deploy {
                     app,
                     id,
-                    hold: false,
+                    added: Added::Serving,
                     ..
                 }
                 | Action::Promote { app, id } => {
@@ -2067,6 +2076,26 @@ impl Service {
                 ""
             }
         ))
+    }
+
+    /// Record a declared release that nothing serves or names, and leave
+    /// it stopped for a rollout, a promotion or a route split to start
+    /// (section 10.4).
+    fn record_declared(&self, app: &str, id: &str, spec: &ReleaseSpec) -> Result<String, String> {
+        let store = &self.handle.store;
+        store
+            .create_release(app, id, spec)
+            .map_err(|error| error.to_string())?;
+        store
+            .set_release_state(app, id, ReleaseState::Stopped, "declared and not started")
+            .map_err(|error| error.to_string())?;
+        self.handle.events.emit(
+            "release.created",
+            &format!("{app}@{id}"),
+            "info",
+            &format!("from {}, left stopped", spec.source.display()),
+        );
+        Ok("recorded and stopped".to_owned())
     }
 
     /// Promote a release the daemon has, as `serving` names it, and say
