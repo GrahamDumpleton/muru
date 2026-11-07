@@ -351,10 +351,14 @@ impl EdgeControl for Control {
             })?;
             certificates.push(muru_edge::tls::HostCertificate {
                 names: host.names.clone(),
+                listeners: host.listeners.clone(),
                 key,
                 default: host.default,
             });
         }
+
+        let certificates = muru_edge::tls::Certificates::new(certificates)
+            .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
 
         // Section 5.1: a worker that did not answer is left out of its
         // pool and reported to the daemon, rather than refusing the

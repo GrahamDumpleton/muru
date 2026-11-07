@@ -150,7 +150,12 @@ fn platform_fits(tag: &str, probe: &Probe) -> bool {
         return false;
     }
 
-    match (major, minor, Version::parse(&probe.libc_version)) {
+    // A libc version with no minor part, which is how platform.libc_ver()
+    // reports musl from Python 3.14, says too little to judge the wheel by.
+
+    let have = Version::parse(&probe.libc_version).filter(|_| probe.libc_version.contains('.'));
+
+    match (major, minor, have) {
         (Some(major), Some(minor), Some(have)) => (have.major(), have.minor()) >= (major, minor),
         _ => true,
     }
@@ -722,6 +727,24 @@ mod tests {
                 &probe("linux", "x86_64", "musl", "1.2.4")
             ),
             Some("muru-0.1.0a12-cp313-cp313-musllinux_1_2_x86_64.whl")
+        );
+        assert_eq!(
+            select_wheel(
+                names.clone(),
+                "0.1.0a12",
+                &probe("linux", "x86_64", "musl", "1")
+            ),
+            Some("muru-0.1.0a12-cp313-cp313-musllinux_1_2_x86_64.whl"),
+            "a musl version with no minor part cannot rule the wheel out"
+        );
+        assert_eq!(
+            select_wheel(
+                names.clone(),
+                "0.1.0a12",
+                &probe("linux", "x86_64", "musl", "1.1.24")
+            ),
+            None,
+            "an old musl cannot run a musllinux_1_2 wheel"
         );
         assert_eq!(
             select_wheel(
