@@ -5948,12 +5948,20 @@ fn print_report(report: &pb::ConfigReport, dry_run: bool) {
     for warning in &report.warnings {
         println!("muru: warning: {warning}");
     }
+
+    if !report.snapshot_error.is_empty() {
+        println!(
+            "muru: the changes were made, but the edge did not take the new snapshot: {}",
+            report.snapshot_error
+        );
+    }
 }
 
 /// Section 10.4: 0 for no changes, 2 for changes planned, 1 for errors;
-/// after an apply, 1 when any change failed.
+/// after an apply, 1 when any change failed or the edge did not take the
+/// new snapshot.
 fn exit_code(report: &pb::ConfigReport, planning: bool) -> i32 {
-    if !report.errors.is_empty() {
+    if !report.errors.is_empty() || !report.snapshot_error.is_empty() {
         return 1;
     }
 
@@ -7070,5 +7078,29 @@ up 1 1700000000000
         assert_eq!(samples[0]["labels"]["path"], "a\"b\\c\nd");
         assert_eq!(samples[0]["labels"]["x"], "1");
         assert_eq!(samples[0]["value"], "NaN");
+    }
+
+    #[test]
+    fn an_apply_the_edge_did_not_take_exits_1() {
+        let applied = super::pb::ConfigReport {
+            applied: true,
+            changes: vec![super::pb::ConfigChange {
+                action: "update-route".to_owned(),
+                subject: "route shop /".to_owned(),
+                detail: String::new(),
+                outcome: "updated".to_owned(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(super::exit_code(&applied, false), 0);
+
+        // Issue #441: every change was made, and the edge refused the
+        // snapshot that carries them.
+
+        let refused = super::pb::ConfigReport {
+            snapshot_error: "the edge refused the snapshot: no".to_owned(),
+            ..applied
+        };
+        assert_eq!(super::exit_code(&refused, false), 1);
     }
 }

@@ -115,6 +115,9 @@ pub struct CertificateChanges {
     /// Hosts kept on the certificate they had, with why the files were
     /// refused.
     pub kept: Vec<(String, String)>,
+    /// Why the edge did not take the renewed certificates, when it did
+    /// not.
+    pub refused: Option<String>,
 }
 
 /// An upgrade the daemon is about to carry out (section 13.4).
@@ -3969,12 +3972,13 @@ impl Daemon {
                 let _ = done.send(self.push_snapshot().await);
             }
             Command::RefreshCertificates { done } => {
-                let changes = self.refresh_certificates(true);
+                let mut changes = self.refresh_certificates(true);
 
                 if !changes.renewed.is_empty()
                     && let Err(error) = self.push_snapshot().await
                 {
                     tracing::warn!(%error, "pushing the renewed certificates failed");
+                    changes.refused = Some(error);
                 }
 
                 let _ = done.send(changes);

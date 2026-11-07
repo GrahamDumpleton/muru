@@ -765,6 +765,7 @@ message ConfigReport {
   uint32 unchanged = 4;             // releases already as declared
   bool applied = 5;                 // the changes were carried out
   repeated string notes = 6;        // what else the apply did: certificates renewed
+  string snapshot_error = 7;        // after an apply: why the edge did not take the new snapshot, which fails the apply
 }
 
 message ConfigChange {

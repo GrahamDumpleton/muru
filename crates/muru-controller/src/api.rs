@@ -1636,7 +1636,8 @@ impl Admin for Service {
         // Hosts and routes reach the edge with the next snapshot. An apply
         // that changes nothing still reads the TLS hosts' certificate
         // files again (section 4.2), so applying the same file after a
-        // renewal is enough.
+        // renewal is enough. A snapshot the edge does not take fails the
+        // apply, though each change was made.
 
         if plan
             .changes
@@ -1644,15 +1645,19 @@ impl Admin for Service {
             .any(|change| change.action.reconfigures())
         {
             if let Err(error) = self.reconfigure().await {
-                report
-                    .warnings
-                    .push(format!("the edge did not take the new snapshot: {error}"));
+                report.snapshot_error = error;
                 failures += 1;
             }
         } else if document.host.values().any(|host| host.tls.is_some()) {
             match self.refresh_certificates().await {
                 Ok(changes) => {
-                    if !changes.renewed.is_empty() {
+                    if let Some(error) = changes.refused {
+                        report.snapshot_error = format!(
+                            "the renewed certificates of {}: {error}",
+                            changes.renewed.join(", ")
+                        );
+                        failures += 1;
+                    } else if !changes.renewed.is_empty() {
                         report.notes.push(format!(
                             "certificates of {} renewed; the edge has them",
                             changes.renewed.join(", ")
@@ -2195,6 +2200,7 @@ fn report_message(plan: &Plan) -> pb::ConfigReport {
         unchanged: plan.unchanged,
         applied: false,
         notes: Vec::new(),
+        snapshot_error: String::new(),
     }
 }
 

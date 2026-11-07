@@ -326,7 +326,10 @@ drains and stops first. The release that serves each application after
 the apply must be declared, or the apply is refused, since `--prune`
 would remove it. `--json` writes the report as JSON. The exit code is 0
 when there is nothing to do or everything applied, 2 for a dry run with
-changes planned, and 1 for errors.
+changes planned, and 1 for errors, for a change that failed, and for a
+snapshot the edge did not take, which the report names: the changes
+were made, and the edge serves what it had until a later snapshot
+reaches it.
 
 `muructl config export` writes desired state as a file of this form, with
 a header naming the daemon's version, the node, the time and the state
