@@ -212,6 +212,23 @@ impl Store {
         work(&connection)
     }
 
+    /// Make `work`'s writes in one transaction: all of them, or, when it
+    /// fails, none (section 10.10). The store is locked throughout, so
+    /// `work` must not read or write through the store itself, events
+    /// included.
+    pub fn transaction<T, E: From<StoreError>>(
+        &self,
+        work: impl FnOnce(&Writes) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection.transaction().map_err(StoreError::from)?;
+        let done = work(&Writes {
+            connection: &transaction,
+        })?;
+        transaction.commit().map_err(StoreError::from)?;
+        Ok(done)
+    }
+
     /// Every application, by name.
     pub fn apps(&self) -> Result<Vec<App>, StoreError> {
         self.with(|connection| {
@@ -289,28 +306,7 @@ impl Store {
         name: &str,
         access_log: &crate::model::AccessLogSpec,
     ) -> Result<(), StoreError> {
-        let encoded = if access_log.is_empty() {
-            None
-        } else {
-            Some(
-                toml::to_string(access_log)
-                    .map_err(|error| StoreError::Decode(error.to_string()))?,
-            )
-        };
-
-        self.with(|connection| {
-            let changed = connection.execute(
-                "UPDATE apps SET access_log = ?2, resource_version = resource_version + 1 \
-                 WHERE name = ?1",
-                params![name, encoded],
-            )?;
-
-            if changed == 0 {
-                return Err(StoreError::NotFound(format!("application {name}")));
-            }
-
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.set_app_access_log(name, access_log))
     }
 
     /// Create an application if it does not exist, and return it.
@@ -332,14 +328,7 @@ impl Store {
         current: Option<&str>,
         previous: Option<&str>,
     ) -> Result<(), StoreError> {
-        self.with(|connection| {
-            connection.execute(
-                "UPDATE apps SET current_release = ?2, previous_release = ?3, \
-                 resource_version = resource_version + 1 WHERE name = ?1",
-                params![name, current, previous],
-            )?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.set_app_releases(name, current, previous))
     }
 
     /// Releases of one application, or of every application, newest first.
@@ -520,27 +509,12 @@ impl Store {
 
     /// Create or replace a virtual host.
     pub fn put_host(&self, name: &str, host: &VirtualHost) -> Result<(), StoreError> {
-        let encoded =
-            toml::to_string(host).map_err(|error| StoreError::Decode(error.to_string()))?;
-        self.with(|connection| {
-            connection.execute(
-                "INSERT INTO hosts (name, spec) VALUES (?1, ?2) \
-                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
-                 resource_version = resource_version + 1",
-                params![name, encoded],
-            )?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.put_host(name, host))
     }
 
     /// Remove a virtual host and its routes.
     pub fn delete_host(&self, name: &str) -> Result<(), StoreError> {
-        self.with(|connection| {
-            connection.execute("DELETE FROM routes WHERE host = ?1", [name])?;
-            connection.execute("DELETE FROM host_maintenance WHERE host = ?1", [name])?;
-            connection.execute("DELETE FROM hosts WHERE name = ?1", [name])?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.delete_host(name))
     }
 
     /// Every HTTP upstream, by name (section 4.13).
@@ -564,25 +538,12 @@ impl Store {
 
     /// Create or replace an HTTP upstream.
     pub fn put_upstream(&self, name: &str, upstream: &Upstream) -> Result<(), StoreError> {
-        let encoded =
-            toml::to_string(upstream).map_err(|error| StoreError::Decode(error.to_string()))?;
-        self.with(|connection| {
-            connection.execute(
-                "INSERT INTO upstreams (name, spec) VALUES (?1, ?2) \
-                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
-                 resource_version = resource_version + 1",
-                params![name, encoded],
-            )?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.put_upstream(name, upstream))
     }
 
     /// Remove an HTTP upstream.
     pub fn delete_upstream(&self, name: &str) -> Result<(), StoreError> {
-        self.with(|connection| {
-            connection.execute("DELETE FROM upstreams WHERE name = ?1", [name])?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.delete_upstream(name))
     }
 
     /// The client classes of applied files with their positions, in the
@@ -608,25 +569,12 @@ impl Store {
     /// Create or replace a client class, its rule tried at `position`
     /// among the applied ones.
     pub fn put_client_class(&self, class: &ClientClass, position: i64) -> Result<(), StoreError> {
-        let encoded =
-            toml::to_string(class).map_err(|error| StoreError::Decode(error.to_string()))?;
-        self.with(|connection| {
-            connection.execute(
-                "INSERT INTO client_classes (name, position, spec) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(name) DO UPDATE SET position = excluded.position, \
-                 spec = excluded.spec, resource_version = resource_version + 1",
-                params![class.name, position, encoded],
-            )?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.put_client_class(class, position))
     }
 
     /// Remove a client class.
     pub fn delete_client_class(&self, name: &str) -> Result<(), StoreError> {
-        self.with(|connection| {
-            connection.execute("DELETE FROM client_classes WHERE name = ?1", [name])?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.delete_client_class(name))
     }
 
     /// The rate limits of applied files, by name (section 4.15).
@@ -650,25 +598,12 @@ impl Store {
 
     /// Create or replace a rate limit.
     pub fn put_rate_limit(&self, name: &str, limit: &RateLimit) -> Result<(), StoreError> {
-        let encoded =
-            toml::to_string(limit).map_err(|error| StoreError::Decode(error.to_string()))?;
-        self.with(|connection| {
-            connection.execute(
-                "INSERT INTO rate_limits (name, spec) VALUES (?1, ?2) \
-                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
-                 resource_version = resource_version + 1",
-                params![name, encoded],
-            )?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.put_rate_limit(name, limit))
     }
 
     /// Remove a rate limit.
     pub fn delete_rate_limit(&self, name: &str) -> Result<(), StoreError> {
-        self.with(|connection| {
-            connection.execute("DELETE FROM rate_limits WHERE name = ?1", [name])?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.delete_rate_limit(name))
     }
 
     /// Every overlay declared, by name (section 9.10).
@@ -692,26 +627,12 @@ impl Store {
 
     /// Create or replace an overlay's declaration.
     pub fn put_overlay(&self, name: &str, overlay: &Overlay) -> Result<(), StoreError> {
-        let encoded =
-            toml::to_string(overlay).map_err(|error| StoreError::Decode(error.to_string()))?;
-        self.with(|connection| {
-            connection.execute(
-                "INSERT INTO overlays (name, spec) VALUES (?1, ?2) \
-                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
-                 resource_version = resource_version + 1",
-                params![name, encoded],
-            )?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.put_overlay(name, overlay))
     }
 
     /// Remove an overlay's declaration and its state.
     pub fn delete_overlay(&self, name: &str) -> Result<(), StoreError> {
-        self.with(|connection| {
-            connection.execute("DELETE FROM overlays WHERE name = ?1", [name])?;
-            connection.execute("DELETE FROM overlay_state WHERE name = ?1", [name])?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.delete_overlay(name))
     }
 
     /// Every overlay's state: active, or ended for a while.
@@ -786,17 +707,7 @@ impl Store {
     /// Create or replace a route, identified by its host and key: the
     /// path, and the client classes it is for (section 4.14).
     pub fn put_route(&self, route: &Route) -> Result<(), StoreError> {
-        let encoded =
-            toml::to_string(route).map_err(|error| StoreError::Decode(error.to_string()))?;
-        self.with(|connection| {
-            connection.execute(
-                "INSERT INTO routes (host, path, spec) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(host, path) DO UPDATE SET spec = excluded.spec, \
-                 resource_version = resource_version + 1",
-                params![route.host, route.key(), encoded],
-            )?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.put_route(route))
     }
 
     /// The rollouts of one application, or of all, oldest first (section
@@ -934,13 +845,7 @@ impl Store {
 
     /// Remove a route, by its host and key.
     pub fn delete_route(&self, host: &str, path: &str) -> Result<(), StoreError> {
-        self.with(|connection| {
-            connection.execute(
-                "DELETE FROM routes WHERE host = ?1 AND path = ?2",
-                params![host, path],
-            )?;
-            Ok(())
-        })
+        self.with(|connection| Writes { connection }.delete_route(host, path))
     }
 
     /// The sequence number of the last event: a version of the whole
@@ -1175,6 +1080,188 @@ fn undecodable(
     error: impl std::error::Error + Send + Sync + 'static,
 ) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(error))
+}
+
+/// Writes made together in one transaction (section 10.10): those of an
+/// apply's commit phase.
+pub struct Writes<'a> {
+    connection: &'a Connection,
+}
+
+impl Writes<'_> {
+    /// Set the application's own access log choice (section 11.2); an
+    /// empty one leaves the `[logs]` table's.
+    pub fn set_app_access_log(
+        &self,
+        name: &str,
+        access_log: &crate::model::AccessLogSpec,
+    ) -> Result<(), StoreError> {
+        let encoded = if access_log.is_empty() {
+            None
+        } else {
+            Some(
+                toml::to_string(access_log)
+                    .map_err(|error| StoreError::Decode(error.to_string()))?,
+            )
+        };
+
+        let changed = self.connection.execute(
+            "UPDATE apps SET access_log = ?2, resource_version = resource_version + 1 \
+                 WHERE name = ?1",
+            params![name, encoded],
+        )?;
+
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("application {name}")));
+        }
+
+        Ok(())
+    }
+
+    /// Record which release serves the application and which a rollback restores.
+    pub fn set_app_releases(
+        &self,
+        name: &str,
+        current: Option<&str>,
+        previous: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE apps SET current_release = ?2, previous_release = ?3, \
+                 resource_version = resource_version + 1 WHERE name = ?1",
+            params![name, current, previous],
+        )?;
+        Ok(())
+    }
+
+    /// Create or replace a virtual host.
+    pub fn put_host(&self, name: &str, host: &VirtualHost) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(host).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.connection.execute(
+            "INSERT INTO hosts (name, spec) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+            params![name, encoded],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a virtual host and its routes.
+    pub fn delete_host(&self, name: &str) -> Result<(), StoreError> {
+        self.connection
+            .execute("DELETE FROM routes WHERE host = ?1", [name])?;
+        self.connection
+            .execute("DELETE FROM host_maintenance WHERE host = ?1", [name])?;
+        self.connection
+            .execute("DELETE FROM hosts WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
+    /// Create or replace an HTTP upstream.
+    pub fn put_upstream(&self, name: &str, upstream: &Upstream) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(upstream).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.connection.execute(
+            "INSERT INTO upstreams (name, spec) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+            params![name, encoded],
+        )?;
+        Ok(())
+    }
+
+    /// Remove an HTTP upstream.
+    pub fn delete_upstream(&self, name: &str) -> Result<(), StoreError> {
+        self.connection
+            .execute("DELETE FROM upstreams WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
+    /// Create or replace a client class, its rule tried at `position`
+    /// among the applied ones.
+    pub fn put_client_class(&self, class: &ClientClass, position: i64) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(class).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.connection.execute(
+            "INSERT INTO client_classes (name, position, spec) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(name) DO UPDATE SET position = excluded.position, \
+                 spec = excluded.spec, resource_version = resource_version + 1",
+            params![class.name, position, encoded],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a client class.
+    pub fn delete_client_class(&self, name: &str) -> Result<(), StoreError> {
+        self.connection
+            .execute("DELETE FROM client_classes WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
+    /// Create or replace a rate limit.
+    pub fn put_rate_limit(&self, name: &str, limit: &RateLimit) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(limit).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.connection.execute(
+            "INSERT INTO rate_limits (name, spec) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+            params![name, encoded],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a rate limit.
+    pub fn delete_rate_limit(&self, name: &str) -> Result<(), StoreError> {
+        self.connection
+            .execute("DELETE FROM rate_limits WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
+    /// Create or replace an overlay's declaration.
+    pub fn put_overlay(&self, name: &str, overlay: &Overlay) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(overlay).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.connection.execute(
+            "INSERT INTO overlays (name, spec) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+            params![name, encoded],
+        )?;
+        Ok(())
+    }
+
+    /// Remove an overlay's declaration and its state.
+    pub fn delete_overlay(&self, name: &str) -> Result<(), StoreError> {
+        self.connection
+            .execute("DELETE FROM overlays WHERE name = ?1", [name])?;
+        self.connection
+            .execute("DELETE FROM overlay_state WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
+    /// Create or replace a route, identified by its host and key: the
+    /// path, and the client classes it is for (section 4.14).
+    pub fn put_route(&self, route: &Route) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(route).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.connection.execute(
+            "INSERT INTO routes (host, path, spec) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(host, path) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+            params![route.host, route.key(), encoded],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a route, by its host and key.
+    pub fn delete_route(&self, host: &str, path: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM routes WHERE host = ?1 AND path = ?2",
+            params![host, path],
+        )?;
+        Ok(())
+    }
 }
 
 /// A stored definition, as TOML, back as its type.

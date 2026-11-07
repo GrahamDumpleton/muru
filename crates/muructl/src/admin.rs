@@ -5891,7 +5891,28 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
 
 /// Print a report as people read it.
 fn print_report(report: &pb::ConfigReport, dry_run: bool) {
-    if !report.errors.is_empty() {
+    // Section 10.10: an apply that stopped in its prepare phase says why
+    // and what became of each change.
+
+    let stopped = report
+        .changes
+        .iter()
+        .any(|change| !change.outcome.is_empty());
+
+    if !report.errors.is_empty() && stopped {
+        println!("muru: nothing applied:");
+
+        for error in &report.errors {
+            println!("  {error}");
+        }
+
+        for change in &report.changes {
+            println!(
+                "  {:<15} {:<24} {}",
+                change.action, change.subject, change.outcome
+            );
+        }
+    } else if !report.errors.is_empty() {
         println!("muru: nothing applied; the configuration has errors:");
 
         for error in &report.errors {

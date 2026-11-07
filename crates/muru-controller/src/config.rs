@@ -22,7 +22,7 @@ use muru_proto::admin::v1 as pb;
 use crate::model::{
     EnvSpec, GroupSpec, HttpServerSpec, MountSpec, ReleaseSpec, ScalingSpec, StaticSpec, valid_name,
 };
-use crate::store::{Store, StoreError};
+use crate::store::{Store, StoreError, Writes};
 
 /// What an apply does to one object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,25 +237,49 @@ impl Action {
         }
     }
 
-    /// Whether the edge's snapshot changes with the action.
-    pub fn reconfigures(&self) -> bool {
-        matches!(
-            self,
-            Action::SetAppAccessLog { .. }
-                | Action::PutHost { .. }
-                | Action::RemoveHost { .. }
-                | Action::PutRoute { .. }
-                | Action::RemoveRoute { .. }
-                | Action::PutUpstream { .. }
-                | Action::RemoveUpstream { .. }
-                | Action::PutOverlay { .. }
-                | Action::RemoveOverlay { .. }
-                | Action::PutClientClass { .. }
-                | Action::RemoveClientClass { .. }
-                | Action::PutRateLimit { .. }
-                | Action::RemoveRateLimit { .. }
-        )
+    /// The phase of an apply that carries out the action (section
+    /// 10.10).
+    pub fn phase(&self) -> Phase {
+        match self {
+            Action::CreateApp { .. }
+            | Action::SetAppIdentity { .. }
+            | Action::SetAppPriority { .. }
+            | Action::Deploy { .. } => Phase::Prepare,
+            Action::RemoveRelease { .. } | Action::RemoveApp { .. } => Phase::Finish,
+            _ => Phase::Commit,
+        }
     }
+
+    /// The release the action makes serve, as (app, release): a deploy
+    /// of the release that serves, or a promotion.
+    pub fn serves(&self) -> Option<(&str, &str)> {
+        match self {
+            Action::Deploy {
+                app,
+                id,
+                added: Added::Serving,
+                ..
+            }
+            | Action::Promote { app, id } => Some((app, id)),
+            _ => None,
+        }
+    }
+}
+
+/// The phases of an apply (section 10.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Before anything points at the releases: the applications, the
+    /// identity and priority their processes start with, and the
+    /// releases, recorded and started held or left stopped.
+    Prepare,
+    /// One transaction, then one snapshot: the hosts, routes, upstreams,
+    /// overlays, client classes, rate limits and access logs, and the
+    /// releases that serve.
+    Commit,
+    /// After the snapshot: the releases and applications `--prune`
+    /// removes, drained first.
+    Finish,
 }
 
 /// One change of a plan.
@@ -2405,6 +2429,132 @@ pub fn overlay_releases(
     }
 
     named
+}
+
+/// What an apply's commit phase did (section 10.10).
+#[derive(Debug, Default)]
+pub struct Committed {
+    /// Each change's outcome, by its place in the plan: none for a
+    /// change of another phase, and "serving" for a release made to
+    /// serve, which the caller says more of.
+    pub outcomes: Vec<Option<String>>,
+    /// The releases that now serve, as (app, release, the release each
+    /// takes over from).
+    pub promoted: Vec<(String, String, Option<String>)>,
+    /// The events the writes make, as (type, subject, message), to emit
+    /// at notice level once they are made.
+    pub events: Vec<(&'static str, String, String)>,
+    /// Why the edge did not take the snapshot that followed, if it did
+    /// not.
+    pub snapshot_error: Option<String>,
+}
+
+/// Write the commit phase's changes of a plan in one transaction: all of
+/// them, or, when one fails, none, with the change that failed and why.
+pub fn commit(store: &Store, changes: &[Change]) -> Result<Committed, String> {
+    let routes = store.routes().map_err(|error| error.to_string())?;
+    let mut committed = Committed::default();
+
+    for change in changes {
+        if let Action::PutRoute { route, .. } = &change.action {
+            let before = routes
+                .iter()
+                .find(|stored| stored.host == route.host && stored.key() == route.key())
+                .and_then(|stored| stored.traffic.as_ref());
+
+            // Section 9.4: a changed policy is an event of its own.
+
+            if before != route.traffic.as_ref() {
+                committed.events.push((
+                    "traffic_policy.changed",
+                    format!("route {} {}", route.host, route.key()),
+                    describe_traffic(route.traffic.as_ref()),
+                ));
+            }
+        }
+
+        if let Some((app, id)) = change.action.serves() {
+            let previous = store.app(app).ok().and_then(|app| app.current);
+            committed
+                .promoted
+                .push((app.to_owned(), id.to_owned(), previous));
+        }
+    }
+
+    let promoted = &committed.promoted;
+    let outcomes = store
+        .transaction(|writes| {
+            changes
+                .iter()
+                .map(|change| {
+                    write(writes, &change.action, promoted)
+                        .map_err(|error| anyhow::anyhow!("{}: {error}", change.subject()))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .map_err(|error| format!("{error:#}"))?;
+    committed.outcomes = outcomes;
+    Ok(committed)
+}
+
+/// Write one change of the commit phase in its transaction, and say what
+/// the report shows of it; none for a change of another phase.
+fn write(
+    writes: &Writes,
+    action: &Action,
+    promoted: &[(String, String, Option<String>)],
+) -> Result<Option<String>, StoreError> {
+    let made = |new: bool| if new { "created" } else { "updated" };
+
+    let outcome = match action {
+        Action::SetAppAccessLog { app, access_log } => {
+            writes.set_app_access_log(app, access_log).map(|()| "set")?
+        }
+        Action::PutHost { name, host, new } => writes.put_host(name, host).map(|()| made(*new))?,
+        Action::RemoveHost { name } => writes.delete_host(name).map(|()| "removed")?,
+        Action::PutRoute { route, new } => writes.put_route(route).map(|()| made(*new))?,
+        Action::RemoveRoute { host, path } => {
+            writes.delete_route(host, path).map(|()| "removed")?
+        }
+        Action::PutUpstream {
+            name,
+            upstream,
+            new,
+        } => writes.put_upstream(name, upstream).map(|()| made(*new))?,
+        Action::RemoveUpstream { name } => writes.delete_upstream(name).map(|()| "removed")?,
+        Action::PutOverlay { name, overlay, new } => {
+            writes.put_overlay(name, overlay).map(|()| made(*new))?
+        }
+        Action::RemoveOverlay { name } => writes.delete_overlay(name).map(|()| "removed")?,
+        Action::PutClientClass {
+            class,
+            position,
+            new,
+        } => writes
+            .put_client_class(class, *position)
+            .map(|()| made(*new))?,
+        Action::RemoveClientClass { name } => {
+            writes.delete_client_class(name).map(|()| "removed")?
+        }
+        Action::PutRateLimit { name, limit, new } => {
+            writes.put_rate_limit(name, limit).map(|()| made(*new))?
+        }
+        Action::RemoveRateLimit { name } => writes.delete_rate_limit(name).map(|()| "removed")?,
+        _ => {
+            let Some((app, id)) = action.serves() else {
+                return Ok(None);
+            };
+
+            let previous = promoted
+                .iter()
+                .find(|(serving, release, _)| serving == app && release == id)
+                .and_then(|(_, _, previous)| previous.as_deref());
+            writes.set_app_releases(app, Some(id), previous)?;
+            "serving"
+        }
+    };
+
+    Ok(Some(outcome.to_owned()))
 }
 
 /// Desired state as a document: each application with the release that
@@ -6294,7 +6444,11 @@ mod tests {
             panic!("one change: {:?}", first.changes);
         };
         assert_eq!(change.action.name(), "set-access-log");
-        assert!(change.action.reconfigures(), "the edge needs a snapshot");
+        assert_eq!(
+            change.action.phase(),
+            Phase::Commit,
+            "the edge needs a snapshot"
+        );
         assert_eq!(
             change.detail,
             "access log errors, slow from 250ms, leaving out /healthz"
@@ -6702,7 +6856,8 @@ mod tests {
             ]
         );
         assert_eq!(promoted.changes[2].detail, "serving in place of shop@r1");
-        assert!(!promoted.changes[2].action.reconfigures());
+        assert_eq!(promoted.changes[2].action.phase(), Phase::Commit);
+        assert_eq!(promoted.changes[2].action.serves(), Some(("shop", "r2")));
 
         // A release the daemon has need not be declared without --prune;
         // naming the one that serves changes nothing.
@@ -6741,6 +6896,100 @@ mod tests {
             held.errors[0].contains("--hold leaves traffic where it is"),
             "{}",
             held.errors[0]
+        );
+    }
+
+    #[test]
+    fn the_commit_phase_writes_the_routes_and_the_serving_release_together() {
+        let source = source_dir();
+        let store = store_with_two(&source);
+        let mut document = shop_releases(&source, &["r1", "r2"], "serving = 'r2'");
+        let routed = Document::parse(
+            "[host.shop]\nnames = ['shop.test']\n[[route]]\nhost = 'shop'\napp = 'shop'\npath = '/'\n",
+        )
+        .unwrap();
+        document.merge(routed).unwrap();
+        let plan = plan_with(&store, &document, false, false);
+
+        let committed = commit(&store, &plan.changes).unwrap();
+        assert_eq!(
+            committed.outcomes,
+            vec![
+                Some("created".to_owned()),
+                Some("created".to_owned()),
+                Some("serving".to_owned()),
+            ]
+        );
+        assert_eq!(
+            committed.promoted,
+            vec![("shop".to_owned(), "r2".to_owned(), Some("r1".to_owned()))]
+        );
+        let app = store.app("shop").unwrap();
+        assert_eq!(
+            (app.current.as_deref(), app.previous.as_deref()),
+            (Some("r2"), Some("r1"))
+        );
+        assert_eq!(store.hosts().unwrap().len(), 1);
+        assert_eq!(store.routes().unwrap().len(), 1);
+
+        // A write that fails leaves out every other: here an access log
+        // for an application the store does not have, after a host.
+
+        let store = store_with_two(&source);
+        let mut changes = plan.changes.clone();
+        changes.push(Change {
+            action: Action::SetAppAccessLog {
+                app: "gone".to_owned(),
+                access_log: crate::model::AccessLogSpec::default(),
+            },
+            detail: String::new(),
+        });
+
+        let refused = commit(&store, &changes).unwrap_err();
+        assert!(refused.contains("gone"), "{refused}");
+        assert!(store.hosts().unwrap().is_empty());
+        assert!(store.routes().unwrap().is_empty());
+        assert_eq!(store.app("shop").unwrap().current.as_deref(), Some("r1"));
+    }
+
+    #[test]
+    fn an_apply_adds_releases_before_it_commits_and_removes_them_last() {
+        let source = source_dir();
+        let store = store_with_shop(&source);
+        let mut document = shop_releases(&source, &["r1", "r2"], "");
+        let routed = Document::parse(
+            "[host.shop]\nnames = ['shop.test']\n[[route]]\nhost = 'shop'\napp = 'shop'\npath = '/'\n",
+        )
+        .unwrap();
+        document.merge(routed).unwrap();
+        let plan = plan_with(&store, &document, false, false);
+        let phases: Vec<(&str, Phase)> = plan
+            .changes
+            .iter()
+            .map(|change| (change.action.name(), change.action.phase()))
+            .collect();
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        assert!(
+            phases.contains(&("deploy", Phase::Prepare))
+                && phases.contains(&("create-host", Phase::Commit))
+                && phases.contains(&("create-route", Phase::Commit)),
+            "{phases:?}"
+        );
+        let serving: Vec<_> = plan
+            .changes
+            .iter()
+            .filter_map(|change| change.action.serves())
+            .collect();
+        assert_eq!(serving, vec![("shop", "r2")]);
+
+        let pruned = plan_with(&store, &Document::default(), true, false);
+        assert!(
+            pruned
+                .changes
+                .iter()
+                .all(|change| change.action.phase() == Phase::Finish),
+            "{:?}",
+            pruned.changes
         );
     }
 

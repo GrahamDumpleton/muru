@@ -278,15 +278,39 @@ release the daemon does not have (the last of an application's in id
 order to serve, unless the application's [`serving`
 key](#which-release-serves) names another, and the others held when a
 route names them, else left stopped), creates or updates the hosts and
-routes, and leaves anything already recorded as declared alone. Id order puts ids of the form `rN` first, by number, so
-`r10` comes after `r9`, and every other id after them, by name: files
-adding `r9` and `2026-11-06` serve `2026-11-06`. Releases are
-immutable: a declared release whose settings differ from the recorded
-ones is an error, and the file is applied only when it has no errors at
-all. Unknown keys, invalid names, a missing source directory and a
-source without an entrypoint are errors too. `[[listener]]` entries and
-the `[limits]` table belong in the daemon's own configuration file; in
-an applied file they are reported as warnings and not applied.
+routes, and leaves anything already recorded as declared alone. Id order
+puts ids of the form `rN` first, by number, so `r10` comes after `r9`,
+and every other id after them, by name: files adding `r9` and
+`2026-11-06` serve `2026-11-06`. Releases are immutable: a declared
+release whose settings differ from the recorded ones is an error, and
+the file is applied only when it has no errors at all. Unknown keys,
+invalid names, a missing source directory and a source without an
+entrypoint are errors too. `[[listener]]` entries and the `[limits]`
+table belong in the daemon's own configuration file; in an applied file
+they are reported as warnings and not applied.
+
+The apply happens in two steps. First it creates the applications and
+starts the releases it adds, held, with traffic left where it is and
+nothing yet pointing at them. Then it writes the hosts, routes, overlays
+and the rest of the files together, with which release serves each
+application, and the edge gets all of it in one snapshot. A release that
+does not start stops the apply before the second step: the releases and
+applications it added are removed, and the report says nothing was
+applied, naming the release and why:
+
+```console
+$ muructl apply -f config/
+muru: nothing applied:
+  shop@r3 did not start: the host exited with exit status: 1 before its workers were ready
+  deploy          shop@r3                  failed: the host exited with exit status: 1 before its workers were ready
+  create-host     host shop                not applied
+  create-route    route shop /             not applied
+```
+
+Applies happen one at a time. An apply given while another is under way,
+including one given `--no-wait` that the daemon is still finishing,
+waits for it to end and is then planned against what it left, and its
+report says so. A dry run does not wait.
 
 Four flags say how the releases an apply adds are deployed, as they do
 on `muructl deploy`:
@@ -294,7 +318,7 @@ on `muructl deploy`:
 | Flag | What it does |
 | --- | --- |
 | `--hold` | Starts the releases and leaves traffic where it is |
-| `--no-wait` | Returns once the releases are recorded |
+| `--no-wait` | Returns once the releases are recorded; the rest follows once they start |
 | `--retain DURATION` | How long a release the apply replaces stays warm |
 | `--retain-workers N` | The workers each group of that release keeps meanwhile |
 
@@ -324,13 +348,16 @@ them, else stopped.
 `--dry-run` prints the plan and changes nothing. For each release that
 would take over from one that serves, it says how long that one stays
 warm. `--prune` also removes the routes, hosts, releases and
-applications the files do not contain, in that order: a running release
-drains and stops first. The release that serves each application after
-the apply must be declared, or the apply is refused, since `--prune`
-would remove it, and so must every release a route the files keep names
-in its traffic, and every application such a route sends requests to. `--json` writes the report as JSON. The exit code is 0
-when there is nothing to do or everything applied, 2 for a dry run with
-changes planned, and 1 for errors, for a change that failed, and for a
+applications the files do not contain: the routes and hosts with the
+rest of the files, and the releases and applications after the edge has
+the snapshot, a running release draining and stopping first. The release
+that serves each application after the apply must be declared, or the
+apply is refused, since `--prune` would remove it, and so must every
+release a route the files keep names in its traffic, and every
+application such a route sends requests to. `--json` writes the report
+as JSON. The exit code is 0 when there is nothing to do or everything
+applied, 2 for a dry run with changes planned, and 1 for errors, for a
+release that did not start, for a change that failed, and for a
 snapshot the edge did not take, which the report names: the changes
 were made, and the edge serves what it had until a later snapshot
 reaches it.
@@ -401,10 +428,10 @@ every release the apply adds held.
 Changing the key to `serving = "r2"` and applying the files again
 promotes r2, starting it if it is stopped: all of the application's
 traffic moves to it, and r1 drains and stays warm as `--retain` and
-`--retain-workers` say. The promotion comes after the apply has written
-the hosts and routes, so a split in the same files that still names r1
-keeps it running. The plan says what happens to each release, `serving`,
-`held` or `stopped` for one it adds:
+`--retain-workers` say. The promotion is written with the hosts and
+routes, and reaches the edge in the same snapshot, so a split in the
+same files that still names r1 keeps it running. The plan says what
+happens to each release, `serving`, `held` or `stopped` for one it adds:
 
 ```console
 $ muructl apply -f config/ --dry-run
