@@ -346,6 +346,16 @@ def test_a_release_that_does_not_start_leaves_nothing_changed(
     assert json.loads(daemon.get("/").body)["release"] == "r1"
     assert "config.apply_failed" in daemon.events()
 
+    # Issue #454: each release the undo removes is an event saying why.
+
+    removed = [
+        line for line in daemon.muructl("events").stdout.splitlines() if "release.removed" in line
+    ]
+    assert len(removed) == 3, removed
+    assert all(
+        "the apply that added it was undone: shop@r3 did not start" in line for line in removed
+    )
+
 
 def test_a_route_and_a_promotion_reach_the_edge_in_one_snapshot(
     daemon: Daemon, tmp_path: Path
@@ -431,6 +441,14 @@ def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path
     ]
     assert daemon.muructl("app", "list").stdout.strip() == "no applications"
     assert daemon.get("/").status == 503
+
+    # Issue #454: each release pruned is an event saying why.
+
+    removed = [
+        line for line in daemon.muructl("events").stdout.splitlines() if "release.removed" in line
+    ]
+    assert [line.split()[4] for line in removed] == ["shop@r1", "shop@r2"], removed
+    assert all("pruned: the applied files do not declare it" in line for line in removed)
 
 
 def test_export_applies_back_without_changes(daemon: Daemon, tmp_path: Path) -> None:

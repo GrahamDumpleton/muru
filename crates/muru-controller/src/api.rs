@@ -2047,7 +2047,10 @@ impl Service {
 
         for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
             let outcome = match &change.action {
-                Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
+                Action::RemoveRelease { app, id } => {
+                    self.remove_release(app, id, "pruned: the applied files do not declare it")
+                        .await
+                }
                 Action::RemoveApp { app } => self
                     .handle
                     .store
@@ -2276,8 +2279,10 @@ impl Service {
             }
         }
 
+        let why = format!("the apply that added it was undone: {error}");
+
         for (app, id) in prepared.releases.iter().rev() {
-            if let Err(why) = self.remove_release(app, id).await {
+            if let Err(why) = self.remove_release(app, id, &why).await {
                 tracing::warn!(%why, "removing {app}@{id} after a failed apply failed");
             }
         }
@@ -2319,8 +2324,9 @@ impl Service {
         report.errors.push(error);
     }
 
-    /// Drain a release if it runs, then drop its record.
-    async fn remove_release(&self, app: &str, id: &str) -> Result<String, String> {
+    /// Drain a release if it runs, then drop its record, with a
+    /// `release.removed` event saying `why`.
+    async fn remove_release(&self, app: &str, id: &str, why: &str) -> Result<String, String> {
         let running = self
             .handle
             .store
@@ -2348,6 +2354,9 @@ impl Service {
             .store
             .delete_release(app, id)
             .map_err(|error| error.to_string())?;
+        self.handle
+            .events
+            .emit("release.removed", &format!("{app}@{id}"), "notice", why);
 
         // Section 8.2: the environment built for the release and its
         // bytecode go with it.
