@@ -13,27 +13,63 @@ use crate::specifier::Version;
 /// The lowest Python Muru supports.
 pub const MINIMUM: (u64, u64) = (3, 11);
 
+/// The part of the probe script that reads the dynamic loader an ELF
+/// executable names, kept apart so a test can run it on its own.
+macro_rules! loader_script {
+    () => {
+        r#"
+import glob, json, platform, re, struct, subprocess, sys
+def loader(path):
+    # The PT_INTERP program header names the loader, wherever in the file
+    # the linker or a later rewrite put the string.
+    with open(path, "rb") as handle:
+        ident = handle.read(16)
+        if ident[:4] != b"\x7fELF":
+            return None
+        wide, order = ident[4] == 2, "<" if ident[5] == 1 else ">"
+        header = order + ("HHIQQQIHHH" if wide else "HHIIIIIHHH")
+        fields = struct.unpack(header, handle.read(struct.calcsize(header)))
+        offset, size, count = fields[4], fields[8], fields[9]
+        entry = order + ("IIQQQQQQ" if wide else "IIIIIIII")
+        for index in range(count):
+            handle.seek(offset + index * size)
+            program = struct.unpack(entry, handle.read(struct.calcsize(entry)))
+            if program[0] == 3:
+                at, length = (program[2], program[5]) if wide else (program[1], program[4])
+                handle.seek(at)
+                return handle.read(length).rstrip(b"\0").decode()
+    return None
+"#
+    };
+}
+
 /// The script the interpreter runs. `-I` keeps the caller's environment
 /// out of it while the interpreter's own site-packages stay on the path,
 /// so the `muru` it reports is the one the environment holds.
-const SCRIPT: &str = r#"
-import json, platform, re, subprocess, sys
+const SCRIPT: &str = concat!(
+    loader_script!(),
+    r#"
 def libc():
     name, version = platform.libc_ver()
     if name == "glibc" or sys.platform != "linux":
         return name, version
     # musl, which platform.libc_ver() reports as nothing before Python 3.14
     # and without its minor version since: the dynamic loader the
-    # interpreter names says which, and prints its version when run.
+    # interpreter names, else the one /lib holds, prints its version when
+    # run.
     try:
-        with open(sys.executable, "rb") as handle:
-            loader = re.search(rb"/lib/ld-musl-[\w.-]+\.so\.1", handle.read(65536))
-        if loader is not None:
-            output = subprocess.run([loader.group().decode()], capture_output=True, text=True).stderr
-            found = re.search(r"Version (\d+\.\d+(?:\.\d+)?)", output)
-            return "musl", found.group(1) if found else version
+        named = loader(sys.executable)
     except Exception:
-        pass
+        named = None
+    candidates = [named] if named and "musl" in named else sorted(glob.glob("/lib/ld-musl-*.so.1"))
+    for candidate in candidates:
+        try:
+            output = subprocess.run([candidate], capture_output=True, text=True).stderr
+        except Exception:
+            continue
+        found = re.search(r"Version (\d+\.\d+(?:\.\d+)?)", output)
+        if found:
+            return "musl", found.group(1)
     return name, version
 libc_name, libc_version = libc()
 try:
@@ -63,7 +99,8 @@ print(json.dumps({
     "executable": sys.executable,
     "muru": muru,
 }))
-"#;
+"#
+);
 
 /// What a probe found.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -293,6 +330,117 @@ mod tests {
                 .unwrap()
                 .starts_with("pypy is not supported")
         );
+    }
+
+    /// An ELF file with a PT_LOAD and then a PT_INTERP program header,
+    /// the interpreter's name `at` bytes into the file.
+    fn elf(wide: bool, big: bool, at: usize, interpreter: &str) -> Vec<u8> {
+        let mut file = vec![0x7f, b'E', b'L', b'F', if wide { 2 } else { 1 }];
+        file.extend([if big { 2 } else { 1 }, 1]);
+        file.resize(16, 0);
+
+        // A value of `width` bytes in the file's byte order.
+
+        let put = |file: &mut Vec<u8>, value: u64, width: usize| {
+            let bytes = if big {
+                value.to_be_bytes()
+            } else {
+                value.to_le_bytes()
+            };
+            file.extend_from_slice(if big {
+                &bytes[8 - width..]
+            } else {
+                &bytes[..width]
+            });
+        };
+        let address = if wide { 8 } else { 4 };
+
+        // The file header: type, machine, version, entry, program and
+        // section header offsets, flags, then the sizes and counts.
+
+        let (header, entry) = if wide { (64, 56) } else { (52, 32) };
+        put(&mut file, 2, 2);
+        put(&mut file, 62, 2);
+        put(&mut file, 1, 4);
+        put(&mut file, 0, address);
+        put(&mut file, header, address);
+        put(&mut file, 0, address);
+        put(&mut file, 0, 4);
+        put(&mut file, header, 2);
+        put(&mut file, entry, 2);
+        put(&mut file, 2, 2);
+        file.resize(usize::try_from(header).unwrap(), 0);
+
+        // The program headers, whose fields come in a different order in
+        // the two classes.
+
+        let name = u64::try_from(interpreter.len() + 1).unwrap();
+        let offset = u64::try_from(at).unwrap();
+
+        for (kind, offset, size) in [(1, 0, 0), (3, offset, name)] {
+            put(&mut file, kind, 4);
+
+            if wide {
+                put(&mut file, 4, 4);
+                put(&mut file, offset, address);
+                put(&mut file, 0, address);
+                put(&mut file, 0, address);
+                put(&mut file, size, address);
+                put(&mut file, size, address);
+                put(&mut file, 1, address);
+            } else {
+                put(&mut file, offset, address);
+                put(&mut file, 0, address);
+                put(&mut file, 0, address);
+                put(&mut file, size, address);
+                put(&mut file, size, address);
+                put(&mut file, 4, 4);
+                put(&mut file, 1, 4);
+            }
+        }
+
+        file.resize(at, 0);
+        file.extend(interpreter.as_bytes());
+        file.push(0);
+        file
+    }
+
+    #[test]
+    fn the_loader_is_read_from_the_program_headers_wherever_it_is() {
+        let Some(python) = crate::uv::find_on_path("python3") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let script = concat!(loader_script!(), "print(loader(sys.argv[1]))");
+
+        // Far past the first 64 KiB, as in a large interpreter whose
+        // loader path was rewritten after linking.
+
+        let cases = [
+            (true, false, "/lib/ld-musl-x86_64.so.1"),
+            (false, true, "/lib/ld-musl-mips.so.1"),
+        ];
+
+        for (wide, big, interpreter) in cases {
+            let path = directory.path().join("python");
+            std::fs::write(&path, elf(wide, big, 1 << 20, interpreter)).unwrap();
+            let output = Command::new(&python)
+                .args(["-I", "-c", script])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), interpreter);
+        }
+
+        let text = directory.path().join("script");
+        std::fs::write(&text, "#!/bin/sh\n").unwrap();
+        let output = Command::new(&python)
+            .args(["-I", "-c", script])
+            .arg(&text)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "None");
     }
 
     #[test]
