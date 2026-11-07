@@ -9,6 +9,104 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a20 (2026-11-07)
+
+### Added
+
+- Added the `serving` key to an application's table in files given to
+  `muructl apply`, naming the release that serves. The other releases the
+  apply adds are started held, so a release declared beside the serving
+  one no longer takes the application's traffic for a moment. Naming a
+  release the daemon has promotes it, and `config export` writes the key.
+  `--prune` now refuses files that leave out the release that serves. ([#420](https://github.com/muruhq/muru/issues/420))
+- Removing a release now records a `release.removed` event saying why:
+  `muructl apply --prune` removed it because the applied files do not
+  declare it, or a failed apply undid it, naming the release that did not
+  start. The event log had shown a release created, ready and stopped, but
+  never removed. ([#454](https://github.com/muruhq/muru/issues/454))
+- A TLS listener of the daemon now gives a connection the certificate of a
+  host that answers on that listener, and a client connecting by IP
+  address, which asks for no name, the certificate of the host whose
+  `names` include the address it connected to. A host's certificate was
+  offered on every listener, and by address only the default host's or
+  the first host's. ([#458](https://github.com/muruhq/muru/issues/458))
+
+### Changed
+
+- `muructl apply` without a `serving` key now starts every release it
+  adds to an application held except the last in id order, which serves.
+  Each took the application's traffic in turn, and the ones before the
+  last were drained as soon as they had served. ([#447](https://github.com/muruhq/muru/issues/447))
+- `muructl apply` now records and leaves stopped a release it adds that
+  neither serves nor is named by a route's traffic or an overlay in the
+  same files, and the plan says `stopped` of it. Such a release was
+  started held at full size and left running. A rollout, a promotion,
+  `serving` naming it, or a route split added later starts it; `--hold`
+  still starts every release the apply adds held. ([#449](https://github.com/muruhq/muru/issues/449))
+
+### Removed
+
+- Removed `muructl config export --all-releases`. An export writes the
+  release that serves each application and the releases its routes'
+  traffic names, which is what applying it elsewhere needs. ([#451](https://github.com/muruhq/muru/issues/451))
+
+### Fixed
+
+- `muructl apply` is now atomic, as the specification says. It starts the
+  releases it adds, held, before it writes anything that points at them,
+  and a release that does not start stops the apply: the releases and
+  applications it added are removed, nothing else changes, and the report
+  and a new `config.apply_failed` event name the release. The hosts,
+  routes, overlays, client classes, rate limits, access logs and
+  promotions are then written in one transaction, and the edge gets them
+  in one snapshot. Changes had been made one at a time, a failure left the
+  earlier ones in place, and a promotion pushed a snapshot of its own.
+  `--no-wait` returns once the releases are recorded, and the daemon
+  finishes the apply. ([#439](https://github.com/muruhq/muru/issues/439))
+- `muructl config export` now writes the releases its routes' traffic
+  splits and client classes name, beside the release that serves. An
+  export taken during a split was refused on another node, since its
+  routes named releases the file did not declare. ([#440](https://github.com/muruhq/muru/issues/440))
+- `muructl apply` now exits 1 when the edge does not take the snapshot
+  that carries the applied changes, renewed certificates included, and
+  says so in place of a warning; `--json` gives the reason as
+  `snapshot_error`. It exited 0, and a renewal the edge refused was
+  reported as one it had. ([#441](https://github.com/muruhq/muru/issues/441))
+- `muructl apply --prune` now refuses files that leave out a release a
+  route they keep names in its traffic, or the application such a route
+  sends requests to, naming the route. It removed them, and the route
+  lost its share or its application. ([#442](https://github.com/muruhq/muru/issues/442))
+- A promotion by hand, by `muructl rollout bluegreen`, the dashboard or the
+  API, is now refused while a rollout of the application is under way,
+  naming `muructl rollout promote` and `muructl rollout abort`. It went
+  ahead and left the rollout judging a candidate against a release that no
+  longer served. ([#446](https://github.com/muruhq/muru/issues/446))
+- `muructl apply` now refuses to promote, by an application's `serving`
+  key, a release whose latest rollout rolled back, by its gates or by an
+  abort, and names the rollout's reason. It promoted the release past its
+  gates. `muructl rollout bluegreen` still promotes such a release by hand. ([#448](https://github.com/muruhq/muru/issues/448))
+- `muructl apply` runs one apply at a time. An apply given while another
+  is under way, including a `--no-wait` one the daemon is still finishing,
+  waits for it to end and is then planned against what it left, and its
+  report says it waited. Two applies had been able to interleave, the
+  second planned against desired state the first had yet to commit. A dry
+  run does not wait. ([#453](https://github.com/muruhq/muru/issues/453))
+- A TLS listener of the daemon now gives a client that asks for no name,
+  as every client connecting by IP address does, the default host's
+  certificate. The handshake failed, so `https://` to an address never
+  connected. ([#456](https://github.com/muruhq/muru/issues/456))
+- On Alpine and other musl-based systems, `muructl` now finds the musllinux
+  runtime library for a Python installed by uv as well. It read musl's
+  version from the interpreter only when the loader's name sat near the
+  start of the executable, which in uv's Python it does not, and then found
+  no wheel. ([#457](https://github.com/muruhq/muru/issues/457))
+
+### Documentation
+
+- The daemon guide says what id order is when an apply picks the release
+  that serves: `rN` ids first, by number, then every other id, by name. ([#443](https://github.com/muruhq/muru/issues/443))
+
+
 ## 0.1.0a19 (2026-11-07)
 
 ### Added
