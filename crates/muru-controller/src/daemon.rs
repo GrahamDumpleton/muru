@@ -26,8 +26,8 @@ use crate::host::{HostProcess, HostSpec};
 use crate::locations::Locations;
 use crate::logs::Logs;
 use crate::model::{
-    Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutState, RolloutStep,
-    now_unix_ms, valid_name,
+    AccessLogSpec, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutState,
+    RolloutStep, now_unix_ms, valid_name,
 };
 use crate::rollouts::{Counters, Verdict, judge};
 use crate::scaling::{Decision, ScaleStatus, Scaler, Signals};
@@ -284,6 +284,16 @@ pub enum Command {
         /// Answered with when maintenance began, or none when it is off.
         done: oneshot::Sender<Result<Option<u64>, String>>,
     },
+    /// Section 4.12: serve the maintenance page for every route of a
+    /// virtual host, or serve the host as usual again.
+    SetHostMaintenance {
+        /// The virtual host.
+        host: String,
+        /// On or off.
+        on: bool,
+        /// Answered with when maintenance began, or none when it is off.
+        done: oneshot::Sender<Result<Option<u64>, String>>,
+    },
     /// Blue/green (section 9.2): move all of an application's traffic to a
     /// release now and drain the one that served.
     PromoteRelease {
@@ -510,6 +520,9 @@ pub struct Handle {
     pub commands: mpsc::Sender<Command>,
     /// The daemon's locations and listener, for status.
     pub info: Arc<Info>,
+    /// The commands running for the API's callers, which the daemon stops
+    /// and waits for before it exits.
+    pub underway: crate::commands::Underway,
 }
 
 /// Facts about the running daemon, for status.
@@ -519,6 +532,8 @@ pub struct Info {
     /// The addresses the edge serves, each with whether it carries TLS,
     /// as a reload may change them.
     pub listeners: std::sync::RwLock<Vec<(SocketAddr, bool)>>,
+    /// The node's limits (section 4.6), as a reload may change them.
+    pub limits: std::sync::RwLock<muru_edge::Limits>,
     /// When the daemon started, Unix milliseconds.
     pub started_unix_ms: u64,
     /// The edge process's pid, for status.
@@ -540,10 +555,9 @@ pub struct Info {
     /// WebSockets open by application and release, from the edge's
     /// metrics as last sampled.
     pub websockets: std::sync::Mutex<HashMap<(String, String), u64>>,
-    /// What each release's entrypoints were detected as, by application
-    /// and release, then by mount, the default mount's under the empty
-    /// name: as its host last announced them.
-    pub interfaces: std::sync::Mutex<Interfaces>,
+    /// What each release's entrypoints run as, as its host last
+    /// announced them.
+    pub interfaces: Interfaces,
     /// The instances of each managed server release (section 9.9), by
     /// application and release, as the daemon last checked them.
     pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceRecord>>>,
@@ -552,8 +566,72 @@ pub struct Info {
     pub provisioning: crate::provision::Provisioning,
 }
 
-/// Detected interfaces by application and release, then by mount.
-pub type Interfaces = HashMap<(String, String), Vec<(String, String)>>;
+/// What each release's entrypoints run as (section 6.7): the interface
+/// its host settled for each, a declared one as declared and one left to
+/// be detected as the callable showed, as the host last announced them.
+/// Everything that needs an interface once a release has started takes
+/// it from `runs_as`, never from the configuration, where it may still
+/// say `auto`.
+#[derive(Debug, Default)]
+pub struct Interfaces {
+    /// By application and release.
+    announced: std::sync::Mutex<HashMap<(String, String), Announced>>,
+}
+
+/// What one release's host announced: each mount with its interface, the
+/// default mount's under the empty name.
+type Announced = Vec<(String, String)>;
+
+impl Interfaces {
+    /// Record what a release's host announced, each mount with its
+    /// interface. An announcement that names none leaves the last as it
+    /// was: a host says nothing of what each worker settles for itself.
+    pub fn announce(&self, app: &str, release: &str, interfaces: Vec<(String, String)>) {
+        if interfaces.is_empty() {
+            return;
+        }
+
+        self.announced
+            .lock()
+            .expect("interfaces poisoned")
+            .insert((app.to_owned(), release.to_owned()), interfaces);
+    }
+
+    /// What a release's host announced, each mount with its interface;
+    /// nothing before its first announcement.
+    pub fn announced(&self, app: &str, release: &str) -> Vec<(String, String)> {
+        self.announced
+            .lock()
+            .expect("interfaces poisoned")
+            .get(&(app.to_owned(), release.to_owned()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The interface a release's default mount, under the empty name,
+    /// or a named mount runs as: what its host announced, and
+    /// `configured` only until it has announced one for the mount.
+    pub fn runs_as(
+        &self,
+        app: &str,
+        release: &str,
+        mount: &str,
+        configured: muru_config::Interface,
+    ) -> muru_config::Interface {
+        let announced = self.announced(app, release);
+        let found = announced
+            .iter()
+            .find(|(name, _)| name == mount)
+            .map(|(_, interface)| interface.as_str());
+
+        match found {
+            Some("wsgi") => muru_config::Interface::Wsgi,
+            Some("asgi") => muru_config::Interface::Asgi,
+            Some("grpc") => muru_config::Interface::Grpc,
+            _ => configured,
+        }
+    }
+}
 
 /// What a ReopenLogs command reached.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -839,6 +917,9 @@ struct Daemon {
     /// The applications in maintenance mode (section 4.12), with when
     /// each was put there.
     maintenance: HashMap<String, u64>,
+    /// The virtual hosts in maintenance mode (section 4.12), with when
+    /// each was turned on.
+    host_maintenance: HashMap<String, u64>,
     /// Section 9.10: the overlays in the warm-up lead before a window,
     /// with the release each keeps running meanwhile.
     warm_ups: BTreeMap<String, Option<(String, String)>>,
@@ -858,6 +939,11 @@ struct Daemon {
     debug_exec: bool,
     /// The listeners' h2c policies, for every snapshot (section 6.13).
     h2c: Vec<pb::H2cPolicy>,
+    /// The listeners' own limits, for every snapshot (section 4.18).
+    listener_limits: Vec<pb::ListenerLimits>,
+    /// The listeners' own proxy settings, for every snapshot (section
+    /// 4.7).
+    listener_proxies: Vec<pb::ListenerProxy>,
     /// The `[limits]` table (section 4.6), for every snapshot.
     limits: muru_edge::Limits,
     /// Which records the access log writes, from the `[logs]` table
@@ -1058,6 +1144,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let info = Arc::new(Info {
         locations: locations.clone(),
         listeners: std::sync::RwLock::new(listeners.clone()),
+        limits: std::sync::RwLock::new(settings.limits.clone()),
         started_unix_ms: crate::model::now_unix_ms(),
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
         metrics,
@@ -1071,16 +1158,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             },
             ..client_rules.defined()
         }),
-        interfaces: std::sync::Mutex::new(Interfaces::new()),
+        interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
         servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
     });
+    let underway = crate::commands::Underway::default();
     let handle = Handle {
         store: Arc::clone(&store),
         events: events.clone(),
         commands,
         info: Arc::clone(&info),
+        underway: underway.clone(),
     };
 
     // The metrics listener (section 11.1), on an internal address.
@@ -1210,6 +1299,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         clients,
         enforcement: crate::clients::Enforcement::default(),
         maintenance: HashMap::new(),
+        host_maintenance: HashMap::new(),
         warm_ups: BTreeMap::new(),
         clock: (None, false),
         secrets: settings.secrets.clone(),
@@ -1218,6 +1308,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         service,
         debug_exec: settings.debug_exec,
         h2c: settings.h2c.clone(),
+        listener_limits: settings.listener_limits.clone(),
+        listener_proxies: settings.listener_proxies.clone(),
         limits: settings.limits.clone(),
         access_log: settings.access_log.clone(),
         access_overrides: Vec::new(),
@@ -1371,6 +1463,28 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         crate::notify::stopping();
     }
 
+    // Section 9.12: a command cannot outlive the daemon it runs under, so
+    // the commands under way are stopped as at their timeout, inside the
+    // shutdown's budget when there is one, while the rest stops. They are
+    // waited for before the API goes, so each caller hears how its
+    // command ended.
+
+    let (why, commands_deadline) = if drain_on_exit {
+        (
+            "the daemon shut down",
+            Instant::now() + daemon.shutdown.budget,
+        )
+    } else {
+        (
+            "the daemon stopped",
+            Instant::now() + crate::commands::STOP_GRACE,
+        )
+    };
+
+    let stopping_commands = tokio::spawn(async move {
+        underway.stop_all(why, commands_deadline.into()).await;
+    });
+
     if drain_on_exit {
         // The shutdown, as the stop signal and muructl daemon stop
         // --shutdown both run it, inside the policy's budget: the delay
@@ -1417,6 +1531,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // socket is unlinked; a stop command polling the socket then gets a
     // refusal straight away instead of waiting on a silent connection.
 
+    let _ = stopping_commands.await;
     let _ = api_stop.send(());
 
     if tokio::time::timeout(Duration::from_secs(5), &mut api)
@@ -1605,6 +1720,19 @@ fn service_identity(named: Option<&str>) -> anyhow::Result<Option<crate::host::I
         "the edge and applications run as the service user"
     );
     Ok(Some(identity))
+}
+
+/// A level's limits on a request (section 4.6) as the snapshot carries
+/// them, or none when the level says nothing.
+fn request_limits_message(limits: &muru_config::RequestLimitSettings) -> Option<pb::RequestLimits> {
+    muru_edge::RequestLimits {
+        max_body_size: limits.max_body_size,
+        queue_timeout: limits.queue_timeout,
+        request_deadline: limits.request_deadline,
+        body_idle_timeout: limits.body_idle_timeout,
+        response_idle_timeout: limits.response_idle_timeout,
+    }
+    .to_message()
 }
 
 /// Section 4.11: a route's upload settings for the edge, with their
@@ -1922,6 +2050,84 @@ pub(crate) fn compression_message(
     muru_edge::compression::Compression::from_snapshot(&message).map(|policy| policy.to_message())
 }
 
+/// A virtual host's or a route's own `compression` table as the snapshot
+/// carries it, checked as the `[compression]` table is: the keys given,
+/// and nothing for the rest, which the level beneath supplies.
+pub(crate) fn compression_choice(
+    table: &muru_config::Compression,
+) -> Result<pb::CompressionChoice, String> {
+    let min_size = match &table.min_size {
+        Some(text) => {
+            match muru_config::parse_size(text).map_err(|error| format!("min_size: {error}"))? {
+                0 => return Err("min_size must be at least 1 byte".to_owned()),
+                size => size,
+            }
+        }
+        None => 0,
+    };
+
+    if table.encodings.as_ref().is_some_and(Vec::is_empty) {
+        return Err(
+            "encodings names no encoding; enabled = false turns compression off".to_owned(),
+        );
+    }
+
+    if table.types.as_ref().is_some_and(Vec::is_empty) {
+        return Err(
+            "types names no content type; enabled = false turns compression off".to_owned(),
+        );
+    }
+
+    let choice = pb::CompressionChoice {
+        enabled: table.enabled,
+        encodings: table.encodings.clone().unwrap_or_default(),
+        min_size,
+        types: table.types.clone().unwrap_or_default(),
+        level: table.level.clone().unwrap_or_default(),
+    };
+
+    muru_edge::compression::Compression::default().with(&choice)?;
+    Ok(choice)
+}
+
+/// A `request_headers` table (section 4.7) as the snapshot carries it.
+fn request_headers_message(table: &muru_config::RequestHeaders) -> pb::HeaderRules {
+    pb::HeaderRules {
+        remove: table.remove.clone(),
+        set: header_fields(&table.set),
+        add: Vec::new(),
+    }
+}
+
+/// A `response_headers` table (section 4.7) as the snapshot carries it,
+/// a header added more than once with a field for each value.
+fn response_headers_message(table: &muru_config::ResponseHeaders) -> pb::HeaderRules {
+    pb::HeaderRules {
+        remove: table.remove.clone(),
+        set: header_fields(&table.set),
+        add: table
+            .add
+            .iter()
+            .flat_map(|(name, values)| {
+                values.values().iter().map(|value| pb::HeaderField {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+            })
+            .collect(),
+    }
+}
+
+fn header_fields(headers: &BTreeMap<String, String>) -> Vec<pb::HeaderField> {
+    headers
+        .iter()
+        .map(|(name, value)| pb::HeaderField {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
 /// A host's certificate chain and key as PEM text, for the snapshot.
 fn read_pem_pair(certificate: &str, key: &str) -> anyhow::Result<(String, String)> {
     let chain =
@@ -2064,6 +2270,14 @@ impl Daemon {
                     slots_busy: pools.iter().map(|pool| pool.busy as usize).sum(),
                     websockets: pools.iter().map(|pool| pool.websockets as usize).sum(),
                     slots_total: pools.iter().map(|pool| pool.slots as usize).sum(),
+                    threads: muru_dashboard::SlotSide::of(
+                        pools.iter().map(|pool| pool.threads_busy as usize).sum(),
+                        pools.iter().map(|pool| pool.threads as usize).sum(),
+                    ),
+                    event_loop: muru_dashboard::SlotSide::of(
+                        pools.iter().map(|pool| pool.loop_busy as usize).sum(),
+                        pools.iter().map(|pool| pool.loop_slots as usize).sum(),
+                    ),
                     waiting: pools.iter().map(|pool| pool.waiting as usize).sum(),
                     created: clock_hms(release.created_unix_ms),
                 });
@@ -2125,6 +2339,10 @@ impl Daemon {
                     gc: measured(status.workers.gc_share.map(|share| share * 100.0), "%"),
                     gil_wait: measured(status.workers.gil_wait_p95_ms, " ms"),
                     loop_lag: measured(status.workers.loop_lag_p95_ms, " ms"),
+                    handoff_wait: status
+                        .workers
+                        .handoff_queue_wait_p95_ms
+                        .map(|wait| format!("{wait:.0} ms")),
                     diagnosis: status.diagnosis.summary.to_owned(),
                     advice: status.diagnosis.advice.to_owned(),
                     last_decision: status
@@ -2170,6 +2388,11 @@ impl Daemon {
             .unwrap_or_default()
             .into_iter()
             .map(|(name, host)| HostRow {
+                maintenance_since: self
+                    .host_maintenance
+                    .get(&name)
+                    .map(|since| clock_hms(*since))
+                    .unwrap_or_default(),
                 name,
                 names: host.names,
                 listeners: host.listeners,
@@ -2334,6 +2557,14 @@ impl Daemon {
             ),
             ("[limits]", settings.limits != self.limits),
             ("[[listener]] h2c", settings.h2c != self.h2c),
+            (
+                "[[listener]] limits",
+                settings.listener_limits != self.listener_limits,
+            ),
+            (
+                "[[listener]] proxy",
+                settings.listener_proxies != self.listener_proxies,
+            ),
             ("[logs] access_log", settings.access_log != self.access_log),
         ] {
             if changed {
@@ -2349,8 +2580,11 @@ impl Daemon {
         self.error_pages = settings.error_pages;
         self.error_override = settings.error_override;
         self.limits = settings.limits;
+        *self.info.limits.write().expect("limits poisoned") = self.limits.clone();
         self.access_log = settings.access_log;
         self.h2c = settings.h2c;
+        self.listener_limits = settings.listener_limits;
+        self.listener_proxies = settings.listener_proxies;
         self.client_rules = settings.client_rules;
         self.clients = clients;
 
@@ -2608,9 +2842,28 @@ impl Daemon {
 
     /// How long an edge is given to finish its connections when it is
     /// replaced: the request deadline, so a response in flight can
-    /// complete, and a little over.
+    /// complete, and a little over. A virtual host or a route may set a
+    /// deadline of its own (section 4.6), so it is the longest of them.
     fn drain_grace(&self) -> Duration {
-        self.limits.request_deadline + Duration::from_secs(5)
+        let hosts = self
+            .store
+            .hosts()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, host)| host.timeouts);
+        let routes = self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|route| route.timeouts);
+        let longest = hosts
+            .chain(routes)
+            .filter_map(|timeouts| timeouts.request_deadline)
+            .filter_map(|text| muru_config::parse_duration(&text).ok())
+            .fold(self.limits.request_deadline, Duration::max);
+
+        longest + Duration::from_secs(5)
     }
 
     /// Section 9.10: the routes and the applications in maintenance mode
@@ -3226,6 +3479,25 @@ impl Daemon {
                     worker.in_flight as f64,
                 ));
 
+                // Section 6.6: the pools an ASGI worker runs synchronous
+                // code on, each of which fills while every new call
+                // waits.
+
+                for (pool, busy, threads) in &worker.sync_pools {
+                    let mut labels = labels.to_vec();
+                    labels.push(("pool", pool.as_str()));
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_worker_sync_threads_busy",
+                        &labels,
+                        *busy as f64,
+                    ));
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_worker_sync_threads",
+                        &labels,
+                        *threads as f64,
+                    ));
+                }
+
                 // Section 7.3: the worker's own signals, as histograms
                 // once it has observed anything.
 
@@ -3240,6 +3512,12 @@ impl Daemon {
                     &labels,
                     &worker.loop_lag,
                     worker.loop_lag_us,
+                ));
+                samples.extend(muru_edge::metrics::signal_histogram(
+                    "muru_handoff_queue_wait_seconds",
+                    &labels,
+                    &worker.handoff_wait,
+                    worker.handoff_wait_us,
                 ));
 
                 // Section 11.1: its garbage collections, by generation.
@@ -3330,6 +3608,12 @@ impl Daemon {
         self.maintenance = self
             .store
             .maintenance()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        self.host_maintenance = self
+            .store
+            .host_maintenance()
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -3442,7 +3726,20 @@ impl Daemon {
                 let scalers = self
                     .store
                     .release(app, id)
-                    .map(|release| scalers_for(&release.spec, &sockets, &record.groups, &pins, now))
+                    .map(|release| {
+                        let interface =
+                            self.info
+                                .interfaces
+                                .runs_as(app, id, "", release.spec.interface);
+                        scalers_for(
+                            &release.spec,
+                            interface,
+                            &sockets,
+                            &record.groups,
+                            &pins,
+                            now,
+                        )
+                    })
                     .unwrap_or_default();
                 let ready_at = record
                     .sockets
@@ -3634,6 +3931,9 @@ impl Daemon {
             }
             Command::SetMaintenance { app, on, done } => {
                 let _ = done.send(self.set_maintenance(&app, on).await);
+            }
+            Command::SetHostMaintenance { host, on, done } => {
+                let _ = done.send(self.set_host_maintenance(&host, on).await);
             }
             Command::OverrideAccessLog {
                 change,
@@ -4221,7 +4521,7 @@ impl Daemon {
             env,
             cwd: spec.source.clone(),
             identity,
-            log: self.host_log(app, id),
+            log: Some(self.host_log(app, id)),
             timeout: None,
             declared: None,
             exclusive: false,
@@ -4536,7 +4836,8 @@ impl Daemon {
         );
         let now = Instant::now();
         let pins = self.store.scale_pins(app, id).unwrap_or_default();
-        let scalers = scalers_for(spec, &sockets, &groups, &pins, now);
+        let interface = self.info.interfaces.runs_as(app, id, "", spec.interface);
+        let scalers = scalers_for(spec, interface, &sockets, &groups, &pins, now);
         let ready_at = host
             .sockets
             .iter()
@@ -4874,15 +5175,31 @@ impl Daemon {
         for (name, id) in routable {
             if let Some(running) = self.running.get(&(name.clone(), id.clone())) {
                 // Section 11.2: the application's own access log choice,
-                // laid over the node's.
+                // which the edge lays over its host's and the node's.
 
                 let access_log = self
                     .store
                     .app(name)
                     .ok()
                     .filter(|app| !app.access_log.is_empty())
-                    .map(|app| app.access_log.over(&self.access_log).to_message());
+                    .map(|app| app.access_log.choice().to_message());
+
+                // Section 4.6: the limits the release, its groups and its
+                // mounts set on the requests they serve.
+
+                let spec = self
+                    .store
+                    .release(name, id)
+                    .ok()
+                    .map(|release| release.spec);
+                let group_limits = |group: &str| {
+                    spec.as_ref()
+                        .and_then(|spec| spec.groups.iter().find(|own| own.name == group))
+                        .and_then(|own| own.limits.message())
+                };
+
                 apps.push(pb::AppWorkers {
+                    limits: spec.as_ref().and_then(|spec| spec.limits.message()),
                     app: name.clone(),
                     release: id.clone(),
                     serving: self.serving.get(name) == Some(id),
@@ -4914,6 +5231,7 @@ impl Daemon {
                         .groups
                         .iter()
                         .map(|group| pb::Group {
+                            limits: group_limits(&group.name),
                             name: group.name.clone(),
                             paths: group.paths.clone(),
                             client_classes: group.client_classes.clone(),
@@ -4935,6 +5253,7 @@ impl Daemon {
                                 .mounts
                                 .iter()
                                 .map(|mount| pb::Mount {
+                                    limits: mount.limits.message(),
                                     name: mount.name.clone(),
                                     path: mount.path.clone(),
                                     internal: mount.internal,
@@ -5036,8 +5355,47 @@ impl Daemon {
             let (certificate_pem, key_pem) =
                 self.certificates.get(&name).cloned().unwrap_or_default();
 
+            // Sections 4.6 and 11.2: the host's limits on a request and
+            // its access log choice, which were checked when applied.
+
+            let limits = muru_config::check_request_limits(
+                host.max_body_size.as_deref(),
+                host.timeouts.as_ref(),
+            )
+            .ok()
+            .and_then(|limits| request_limits_message(&limits));
+            let mut choice = AccessLogSpec::from_host(&host).choice();
+            choice.format = host
+                .access_log_format
+                .as_deref()
+                .and_then(muru_edge::access::Format::parse);
+            choice.file = host
+                .access_log_file
+                .as_ref()
+                .map(|file| Arc::from(self.locations.logs.path.join(file).as_path()));
+            let access_log = (!choice.is_empty()).then(|| choice.to_message());
+
+            // Section 4.12: the host's maintenance mode, with its
+            // exemptions. A host removed since it was turned on is no
+            // longer in it.
+
+            let maintenance = self
+                .host_maintenance
+                .contains_key(&name)
+                .then(|| maintenance_message(true, host.maintenance.as_ref()));
+
             hosts.push(pb::Host {
+                maintenance,
                 name,
+                limits,
+                access_log,
+                request_headers: host.request_headers.as_ref().map(request_headers_message),
+                response_headers: host.response_headers.as_ref().map(response_headers_message),
+                compression: host
+                    .compression
+                    .as_ref()
+                    .and_then(|table| compression_choice(table).ok()),
+                canonical_redirect: host.canonical_redirect,
                 names: host.names,
                 listeners: host.listeners,
                 certificate_pem,
@@ -5070,11 +5428,21 @@ impl Daemon {
             .into_iter()
             .map(|route| pb::Route {
                 upload: upload_message(&route),
-                max_body_size: route
-                    .max_body_size
-                    .as_deref()
-                    .and_then(|size| muru_config::parse_size(size).ok())
-                    .unwrap_or(0),
+                request_headers: route.request_headers.as_ref().map(request_headers_message),
+                response_headers: route
+                    .response_headers
+                    .as_ref()
+                    .map(response_headers_message),
+                compression: route
+                    .compression
+                    .as_ref()
+                    .and_then(|table| compression_choice(table).ok()),
+                limits: muru_config::check_request_limits(
+                    route.max_body_size.as_deref(),
+                    route.timeouts.as_ref(),
+                )
+                .ok()
+                .and_then(|limits| request_limits_message(&limits)),
                 traffic: self.route_traffic(&route, &included, &rollouts),
                 client_classes: route.classes().to_vec(),
                 host: route.host,
@@ -5160,6 +5528,8 @@ impl Daemon {
             rate_limits: self.clients.limits_message.clone(),
             default_traffic,
             h2c: self.h2c.clone(),
+            listener_limits: self.listener_limits.clone(),
+            listener_proxies: self.listener_proxies.clone(),
             limits: Some(self.limits.to_message()),
             access_log: Some(self.access_log.to_message()),
             access_log_overrides: self
@@ -6976,6 +7346,58 @@ impl Daemon {
         Ok(self.maintenance.get(app).copied())
     }
 
+    /// Section 4.12: put a virtual host into maintenance mode or take it
+    /// out, recorded so a daemon restart keeps it, announced as an event,
+    /// and pushed to the edge.
+    async fn set_host_maintenance(&mut self, host: &str, on: bool) -> Result<Option<u64>, String> {
+        let known = self
+            .store
+            .hosts()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|(name, _)| name == host);
+
+        if !known {
+            return Err(format!("no virtual host named {host}"));
+        }
+
+        let was = self.host_maintenance.get(host).copied();
+        let subject = format!("host {host}");
+
+        match (on, was) {
+            (true, Some(since)) => return Ok(Some(since)),
+            (false, None) => return Ok(None),
+            (true, None) => {
+                let since = crate::model::now_unix_ms();
+                self.store
+                    .set_host_maintenance(host, Some(since))
+                    .map_err(|error| error.to_string())?;
+                self.host_maintenance.insert(host.to_owned(), since);
+                self.events.emit(
+                    "maintenance.changed",
+                    &subject,
+                    "notice",
+                    "maintenance on: the edge serves the maintenance page for every route of the host",
+                );
+            }
+            (false, Some(_)) => {
+                self.store
+                    .set_host_maintenance(host, None)
+                    .map_err(|error| error.to_string())?;
+                self.host_maintenance.remove(host);
+                self.events.emit(
+                    "maintenance.changed",
+                    &subject,
+                    "notice",
+                    "maintenance off: the host serves again",
+                );
+            }
+        }
+
+        self.push_snapshot().await?;
+        Ok(self.host_maintenance.get(host).copied())
+    }
+
     /// Section 11.2: put a change to the access log in force, or put the
     /// changes back (every one, or those for one application), and send
     /// the edge the result; with neither, only say what is in force.
@@ -7495,17 +7917,25 @@ impl Daemon {
                 groups,
                 interfaces,
             } => {
-                if !interfaces.is_empty() {
-                    self.info
-                        .interfaces
-                        .lock()
-                        .expect("interfaces poisoned")
-                        .insert(key.clone(), interfaces);
-                }
+                self.info.interfaces.announce(app, id, interfaces);
 
                 let Some(running) = self.running.get_mut(&key) else {
                     return;
                 };
+
+                // Section 7.4: the scalers were sized from the
+                // configuration when the release started, which may have
+                // left the interface to be detected; they follow what
+                // the host found.
+
+                if let Ok(release) = self.store.release(app, id) {
+                    let interface =
+                        self.info
+                            .interfaces
+                            .runs_as(app, id, "", release.spec.interface);
+                    size_scalers(&mut running.scalers, &release.spec, interface);
+                }
+
                 let Some((record, pid)) = running.backend.host().map(|host| {
                     (
                         host.run_dir().join("..").join("host.toml"),
@@ -7895,6 +8325,23 @@ impl Daemon {
             candidates.push((self.locations.daemon_log(), false));
         }
 
+        // Section 11.2: the files virtual hosts name for their own
+        // records, which the edge writes and reopens as it does its own.
+
+        let mut own: Vec<String> = self
+            .store
+            .hosts()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, host)| host.access_log_file)
+            .collect();
+        own.sort();
+        own.dedup();
+        candidates.extend(
+            own.into_iter()
+                .map(|file| (self.locations.logs.path.join(file), false)),
+        );
+
         // Section 9.9: a managed server writes its log itself and cannot
         // be told to reopen it, so its log is rotated in place.
 
@@ -8085,32 +8532,62 @@ fn reopen_own_log(path: &std::path::Path) {
     }
 }
 
+/// Sections 7.3 and 7.4: what one worker offers before the edge has
+/// counted any, and the threads it runs Python on at once without a GIL,
+/// by the interface the release's default mount runs as: its threads for
+/// WSGI, and for ASGI its event loop's concurrency, and its sync threads
+/// with the loop's own. gRPC calls are held on the event loop too
+/// (section 6.13).
+fn worker_size(
+    interface: muru_config::Interface,
+    threads: u32,
+    sync_threads: u32,
+    concurrency: u32,
+) -> (f64, u32) {
+    match interface {
+        muru_config::Interface::Asgi | muru_config::Interface::Grpc => {
+            (concurrency as f64, sync_threads + 1)
+        }
+        muru_config::Interface::Wsgi | muru_config::Interface::Auto => (threads as f64, threads),
+    }
+}
+
+/// Size each group's scaler for the interface the release runs as, which
+/// its host announces once it has loaded the application: a release left
+/// to be detected is sized as WSGI only until then.
+fn size_scalers(
+    scalers: &mut [GroupScaling],
+    spec: &ReleaseSpec,
+    interface: muru_config::Interface,
+) {
+    for scaling in scalers {
+        let sizes = if scaling.name == muru_edge::routing::DEFAULT_GROUP {
+            Some((spec.threads, spec.sync_threads, spec.concurrency))
+        } else {
+            spec.groups
+                .iter()
+                .find(|group| group.name == scaling.name)
+                .map(|group| (group.threads, group.sync_threads, group.concurrency))
+        };
+
+        if let Some((threads, sync_threads, concurrency)) = sizes {
+            (scaling.slots_per_worker, scaling.threads) =
+                worker_size(interface, threads, sync_threads, concurrency);
+        }
+    }
+}
+
 /// Section 7.4: the scaling state of each group of a release that is
-/// starting or adopted, from its spec, the workers it has and the pins
-/// an operator left on it.
+/// starting or adopted, from its spec, the interface it runs as, the
+/// workers it has and the pins an operator left on it.
 fn scalers_for(
     spec: &ReleaseSpec,
+    interface: muru_config::Interface,
     sockets: &[PathBuf],
     groups: &[GroupRecord],
     pins: &[(String, u32)],
     now: Instant,
 ) -> Vec<GroupScaling> {
-    // gRPC calls are held on the event loop too (section 6.13).
-
-    let asgi = matches!(
-        spec.interface,
-        muru_config::Interface::Asgi | muru_config::Interface::Grpc
-    );
-    let slots = |threads: u32, concurrency: u32| {
-        if asgi {
-            concurrency as f64
-        } else {
-            threads as f64
-        }
-    };
-    let threads = |threads: u32, sync_threads: u32| {
-        if asgi { sync_threads + 1 } else { threads }
-    };
     let memory_limit = spec
         .memory
         .soft_limit
@@ -8118,9 +8595,9 @@ fn scalers_for(
     let mut scalers = vec![GroupScaling {
         name: muru_edge::routing::DEFAULT_GROUP.to_owned(),
         scaler: Scaler::new(spec.scaling.clone(), sockets.len() as u32),
-        slots_per_worker: slots(spec.threads, spec.concurrency),
+        slots_per_worker: 0.0,
         requested: None,
-        threads: threads(spec.threads, spec.sync_threads),
+        threads: 0,
         memory_limit,
         denied: None,
     }];
@@ -8133,13 +8610,15 @@ fn scalers_for(
         scalers.push(GroupScaling {
             name: group.name.clone(),
             scaler: Scaler::new(group.scaling.clone(), current as u32),
-            slots_per_worker: slots(group.threads, group.concurrency),
+            slots_per_worker: 0.0,
             requested: None,
-            threads: threads(group.threads, group.sync_threads),
+            threads: 0,
             memory_limit,
             denied: None,
         });
     }
+
+    size_scalers(&mut scalers, spec, interface);
 
     for (name, count) in pins {
         if let Some(scaling) = scalers.iter_mut().find(|scaling| &scaling.name == name) {
@@ -8380,5 +8859,60 @@ mod tests {
     #[test]
     fn the_clock_state_can_be_read_here() {
         assert!(clock_synchronised().is_some());
+    }
+
+    #[test]
+    fn an_interface_is_the_announced_one_and_the_configured_one_only_until_then() {
+        use muru_config::Interface;
+
+        let interfaces = Interfaces::default();
+        assert_eq!(
+            interfaces.runs_as("shop", "r1", "", Interface::Auto),
+            Interface::Auto
+        );
+
+        interfaces.announce(
+            "shop",
+            "r1",
+            vec![
+                (String::new(), "asgi".to_owned()),
+                ("legacy".to_owned(), "wsgi".to_owned()),
+            ],
+        );
+        assert_eq!(
+            interfaces.runs_as("shop", "r1", "", Interface::Auto),
+            Interface::Asgi
+        );
+        assert_eq!(
+            interfaces.runs_as("shop", "r1", "legacy", Interface::Auto),
+            Interface::Wsgi
+        );
+
+        // A mount the host did not name, another release, and an
+        // announcement that names nothing, which leaves the last one.
+
+        assert_eq!(
+            interfaces.runs_as("shop", "r1", "live", Interface::Auto),
+            Interface::Auto
+        );
+        assert_eq!(
+            interfaces.runs_as("shop", "r2", "", Interface::Wsgi),
+            Interface::Wsgi
+        );
+        interfaces.announce("shop", "r1", Vec::new());
+        assert_eq!(interfaces.announced("shop", "r1").len(), 2);
+    }
+
+    #[test]
+    fn a_release_detected_as_asgi_is_sized_by_its_event_loop() {
+        use muru_config::Interface;
+
+        // Threads 4, sync threads 8, concurrency 1000: as WSGI until the
+        // host has said what it detected, then by the loop.
+
+        assert_eq!(worker_size(Interface::Auto, 4, 8, 1000), (4.0, 4));
+        assert_eq!(worker_size(Interface::Wsgi, 4, 8, 1000), (4.0, 4));
+        assert_eq!(worker_size(Interface::Asgi, 4, 8, 1000), (1000.0, 9));
+        assert_eq!(worker_size(Interface::Grpc, 4, 8, 1000), (1000.0, 9));
     }
 }

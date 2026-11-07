@@ -6,10 +6,13 @@ import asyncio
 import contextlib
 import hashlib
 import os
+import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated, Any
 
+from asgiref.sync import sync_to_async
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.responses import (
     FileResponse,
@@ -36,6 +39,25 @@ application = FastAPI(lifespan=lifespan)
 @application.get("/", response_class=PlainTextResponse)
 async def index() -> str:
     return "Hello from FastAPI\n"
+
+
+@application.get("/blocking", response_class=PlainTextResponse)
+def blocking(seconds: float = 0.5) -> str:
+    """A synchronous endpoint, which FastAPI runs on one of anyio's worker threads."""
+
+    time.sleep(seconds)
+    return threading.current_thread().name
+
+
+@application.get("/sensitive", response_class=PlainTextResponse)
+async def sensitive(seconds: float = 0.5) -> str:
+    """Blocking code through asgiref's thread-sensitive sync_to_async, its default."""
+
+    def held() -> str:
+        time.sleep(seconds)
+        return threading.current_thread().name
+
+    return await sync_to_async(held)()
 
 
 @application.get("/json")

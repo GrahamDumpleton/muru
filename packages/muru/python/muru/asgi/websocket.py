@@ -3,8 +3,8 @@
 ``Handler`` is an ordinary ASGI application. It accepts the socket and
 calls the handler object's ``on_connect(ws)``, ``on_receive(ws, message)``
 for each message, a str for text and bytes for binary, and
-``on_disconnect(ws, code, reason)``, each on an application thread, one at
-a time per socket and in order. Every call for a socket runs in one
+``on_disconnect(ws, code, reason)``, each on a thread, one at a time per
+socket and in order. Every call for a socket runs in one
 context, created at accept, so a context variable set in ``on_connect``
 is visible in later calls whichever thread runs them. A WSGI view hands
 an upgrade to it; it runs as well under any ASGI server.
@@ -113,31 +113,6 @@ class Socket:
         self._run({"type": "websocket.close", "code": code, "reason": reason})
 
 
-class _WorkerPool(concurrent.futures.Executor):
-    """The worker's application thread pool, as an executor."""
-
-    def submit(
-        self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
-    ) -> concurrent.futures.Future[Any]:
-        from muru import _native
-
-        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
-
-        def job() -> None:
-            if not future.set_running_or_notify_cancel():
-                return
-
-            try:
-                future.set_result(fn(*args, **kwargs))
-            except BaseException as error:
-                future.set_exception(error)
-
-        if not _native.submit(job):
-            raise RuntimeError("the worker's thread pool is not running")
-
-        return future
-
-
 _own_pool: concurrent.futures.ThreadPoolExecutor | None = None
 _own_pool_lock = threading.Lock()
 
@@ -145,18 +120,19 @@ _own_pool_lock = threading.Lock()
 def _default_executor() -> concurrent.futures.Executor | None:
     """Return where the callbacks run when the handler names no executor.
 
-    Under Muru, the worker's application threads when its default mount
-    is WSGI, and otherwise the loop's pool for synchronous code (None),
-    since an ASGI worker's application threads are one unless it hands
-    requests to WSGI. Under any other server, a pool of the adapter's own.
+    Under Muru, the loop's pool for synchronous code (None), whatever
+    the worker's default mount: the application threads are what the
+    edge counts WSGI requests against, and a callback on one would be a
+    thread gone that the edge still believed free. Under any other
+    server, a pool of the adapter's own.
     """
 
     global _own_pool
 
-    from muru import _asgi, context
+    from muru import _asgi
 
     if _asgi.current_loop() is not None:
-        return _WorkerPool() if context().interface == "wsgi" else None
+        return None
 
     with _own_pool_lock:
         if _own_pool is None:
@@ -178,11 +154,10 @@ class Handler:
     ``handler`` provides any of ``on_connect``, ``on_receive`` and
     ``on_disconnect``. The socket is accepted with ``subprotocol`` when
     the client offered it, and with the extra response ``headers``.
-    ``executor`` runs the callbacks; by default, under Muru, the worker's
-    application threads when its default mount is WSGI and the loop's
-    pool for synchronous code otherwise, and a thread pool of the
-    adapter's own under any other server. An exception from a callback closes the socket with
-    1011.
+    ``executor`` runs the callbacks; by default, under Muru, the loop's
+    pool for synchronous code, sized by ``sync_threads``, and a thread
+    pool of the adapter's own under any other server. An exception from
+    a callback closes the socket with 1011.
     """
 
     def __init__(

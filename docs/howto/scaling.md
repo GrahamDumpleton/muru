@@ -28,7 +28,9 @@ The group starts with `processes` workers, never fewer than `min_workers`.
 Idle workers are counted in worker equivalents: free slots (threads, or an
 event loop's concurrency) over the slots a worker offers, with workers
 still starting counted as capacity on the way and requests waiting at the
-edge counted as slots wanted. When fewer than `min_spare` idle workers
+edge counted as slots wanted. A group whose workers serve both WSGI and
+ASGI has threads and an event loop, and is as busy as the busier of the
+two. When fewer than `min_spare` idle workers
 remain for `scale_out_window` (5 seconds by default), the group grows by
 what is missing, up to `max_step_up` (4) at a time and never past
 `max_workers`. While requests queue at the edge the group is saturated and
@@ -277,7 +279,7 @@ $ muructl scale status shop
 shop@r42
 GROUP        WORKERS      SLOTS      IDLE    QUEUE-P95  REAPS      POLICY
 default      3 -> 5       12/12      -1.0    230 ms     0/6        spare 2-12 workers, 1-4 idle
-  workers: cpu 12%, gc 0%, gil wait p95 1 ms, loop lag p95 -
+  workers: cpu 12%, gc 0%, gil wait p95 1 ms, loop lag p95 -, handoff wait p95 40 ms
   diagnosis: I/O bound with exhausted slots; for the next release, more threads per worker, or more concurrency for an ASGI application
   last: scale out from 3 to 5 workers: short by 1.0 workers for 5s (2s ago)
 reports      1            0/1        1.0     -          0/6        target 1-6 workers, 80% of slots busy
@@ -306,6 +308,7 @@ in the next release:
 | event loop held by blocking code | loop lag p95 of 100 ms or more | await blocking calls, or run them in a thread |
 | GIL bound | GIL wait p95 of 10 ms or more | more processes with fewer threads each |
 | CPU bound | CPU at 80% or more of what a worker can use | more processes, up to the node's cores |
+| requests handed to WSGI wait for a thread | handoff wait p95 of 100 ms or more | more threads for the requests [handed over](handoff.md#from-asgi-to-wsgi), or a mount for the paths that are |
 | I/O bound with exhausted slots | 80% or more of the slots busy, CPU lower | more threads per worker, or more concurrency |
 | a few heavy requests | queue wait p95 of 100 ms or more with under half the slots busy | a worker group of their own for the slow paths |
 | idle | under 10% of the slots busy and no queue | |

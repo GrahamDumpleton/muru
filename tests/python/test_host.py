@@ -123,6 +123,14 @@ def test_workers_message_lists_the_routed_sockets_by_group(tmp_path: Path) -> No
     instance.mounts = [settled, unsettled]
     assert instance.workers_message()["interfaces"] == {"": "wsgi", "ws": "asgi"}
 
+    # What a worker settled and reported is announced with the host's
+    # own, and is news only the first time.
+
+    assert instance.settle({"other": "wsgi", "odd": "soap"})
+    assert not instance.settle({"other": "wsgi"})
+    assert not instance.settle("wsgi")
+    assert instance.workers_message()["interfaces"] == {"": "wsgi", "ws": "asgi", "other": "wsgi"}
+
 
 def test_a_mount_takes_threads_of_its_own() -> None:
     context = host.Context(app="shop")
@@ -135,6 +143,28 @@ def test_a_mount_takes_threads_of_its_own() -> None:
         "reports=/reports=shop:reports=wsgi=3,2",
         "reports=/reports=shop:reports=wsgi=0,0",
         "reports=/reports=shop:reports=wsgi=-1,2",
+    ):
+        with pytest.raises(argparse.ArgumentTypeError):
+            host.Mount.parse(text, context, 4)
+
+
+def test_a_mount_takes_limits_of_its_own_whether_declared_or_left_to_be_detected() -> None:
+    context = host.Context(app="shop")
+
+    # The limits follow the threads, which may be left empty.
+
+    detected = host.Mount.parse("live=/live=shop:live=auto==500,2000", context, 4)
+    assert (detected.threads, detected.limits) == (None, (500, 2000))
+    declared = host.Mount.parse("live=/live=shop:live=asgi==500,0", context, 4)
+    assert (declared.threads, declared.limits) == (None, (500, 0))
+    both = host.Mount.parse("live=/live=shop:live=auto=4,4=500,0", context, 4)
+    assert (both.threads, both.limits) == ((4, 4), (500, 0))
+
+    for text in (
+        "live=/live=shop:live=wsgi==500,0",
+        "live=/live=shop:live=auto==500",
+        "live=/live=shop:live=auto==-1,0",
+        "live=/live=shop:live=auto=",
     ):
         with pytest.raises(argparse.ArgumentTypeError):
             host.Mount.parse(text, context, 4)
@@ -316,7 +346,7 @@ def test_a_worker_that_does_not_answer_for_stacks_is_read_from_outside_on_3_14(
     frames = [{"file": "/srv/app.py", "line": 3, "function": "application"}]
     monkeypatch.setattr(_outside, "WHOLE", whole)
     instance.signal = lambda pid, signum: signals.append((pid, signum))  # type: ignore[method-assign]
-    instance.read_outside = lambda pid: [(7, frames)]  # type: ignore[method-assign]
+    instance.read_outside = lambda pid: [(7, frames, None)]  # type: ignore[method-assign]
     instance.send_to_supervisor = answers.append  # type: ignore[method-assign]
 
     pending = host.Pending(1, "stacks", {4321: 0})

@@ -217,6 +217,118 @@ pub struct MountSpec {
     /// The interface the mount's requests may be handed to (section 6.14).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<muru_config::Handoff>,
+    /// The mount's own limits on the requests it serves (section 4.6):
+    /// its largest body.
+    #[serde(default, skip_serializing_if = "ServedLimits::is_empty")]
+    pub limits: ServedLimits,
+}
+
+/// The limits a release, a worker group or a mount sets on the requests
+/// it serves (section 4.6), which the edge enforces: sizes in bytes and
+/// durations in milliseconds, each none where the level says nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedLimits {
+    /// The largest request body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_size: Option<u64>,
+    /// How long a request may wait for a worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_timeout_ms: Option<u64>,
+    /// How long a request may take to produce its response head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_deadline_ms: Option<u64>,
+    /// How long a client may pause while sending a body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_idle_timeout_ms: Option<u64>,
+    /// How long a worker may pause mid-response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_idle_timeout_ms: Option<u64>,
+}
+
+impl ServedLimits {
+    /// Whether the level says nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The limits a checked table gave.
+    pub fn from_settings(settings: &muru_config::RequestLimitSettings) -> Self {
+        let millis = |duration: Option<std::time::Duration>| {
+            duration.map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        };
+
+        Self {
+            max_body_size: settings.max_body_size,
+            queue_timeout_ms: millis(settings.queue_timeout),
+            request_deadline_ms: millis(settings.request_deadline),
+            body_idle_timeout_ms: millis(settings.body_idle_timeout),
+            response_idle_timeout_ms: millis(settings.response_idle_timeout),
+        }
+    }
+
+    /// The limits as the snapshot carries them, or none when the level
+    /// says nothing.
+    pub fn message(&self) -> Option<muru_proto::edge::v1::RequestLimits> {
+        (!self.is_empty()).then(|| muru_proto::edge::v1::RequestLimits {
+            max_body_size: self.max_body_size.unwrap_or(0),
+            queue_timeout_ms: self.queue_timeout_ms.unwrap_or(0),
+            request_deadline_ms: self.request_deadline_ms.unwrap_or(0),
+            body_idle_timeout_ms: self.body_idle_timeout_ms.unwrap_or(0),
+            response_idle_timeout_ms: self.response_idle_timeout_ms.unwrap_or(0),
+        })
+    }
+
+    /// The largest body as a table writes it.
+    pub fn max_body_size_text(&self) -> Option<String> {
+        self.max_body_size.map(muru_config::format_size)
+    }
+
+    /// The request timeouts by the key a `timeouts` table gives each,
+    /// with its value as the table writes it, those set alone.
+    pub fn timeouts(&self) -> Vec<(&'static str, String)> {
+        [
+            ("queue_timeout", self.queue_timeout_ms),
+            ("request_deadline", self.request_deadline_ms),
+            ("body_idle_timeout", self.body_idle_timeout_ms),
+            ("response_idle_timeout", self.response_idle_timeout_ms),
+        ]
+        .into_iter()
+        .filter_map(|(key, ms)| {
+            Some((
+                key,
+                muru_config::format_duration(std::time::Duration::from_millis(ms?)),
+            ))
+        })
+        .collect()
+    }
+
+    /// Put the request timeouts into a `timeouts` table, for an export.
+    pub fn fill(&self, table: &mut muru_config::Timeouts) {
+        let format = |ms: Option<u64>| {
+            ms.map(|ms| muru_config::format_duration(std::time::Duration::from_millis(ms)))
+        };
+
+        table.queue_timeout = format(self.queue_timeout_ms);
+        table.request_deadline = format(self.request_deadline_ms);
+        table.body_idle_timeout = format(self.body_idle_timeout_ms);
+        table.response_idle_timeout = format(self.response_idle_timeout_ms);
+    }
+
+    /// The limits as one phrase, for comparing a declared release with
+    /// the recorded one.
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = self
+            .max_body_size_text()
+            .map(|size| format!("max_body_size {size}"))
+            .into_iter()
+            .collect();
+        parts.extend(
+            self.timeouts()
+                .into_iter()
+                .map(|(key, value)| format!("{key} {value}")),
+        );
+        parts.join(" ")
+    }
 }
 
 /// A worker group of a release (section 7.1): its paths and sizes. The
@@ -261,6 +373,10 @@ pub struct GroupSpec {
     /// 7.1).
     #[serde(default, skip_serializing_if = "GroupTimeouts::is_empty")]
     pub timeouts: GroupTimeouts,
+    /// The group's own limits on the requests it serves (section 4.6),
+    /// each the release's when absent.
+    #[serde(default, skip_serializing_if = "ServedLimits::is_empty")]
+    pub limits: ServedLimits,
     /// The group's own memory policy, resolved over the release's; the
     /// release's when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,10 +451,9 @@ impl GroupTimeouts {
             soft_timeout: format(self.soft_timeout_ms),
             hard_timeout: format(self.hard_timeout_ms),
             hard_drain_grace: format(self.hard_drain_grace_ms),
-            shutdown_timeout: None,
-            websocket_drain_grace: None,
             loop_stall_timeout: format(self.loop_stall_timeout_ms),
             gil_stall_timeout: format(self.gil_stall_timeout_ms),
+            ..muru_config::Timeouts::default()
         })
     }
 }
@@ -403,6 +518,10 @@ pub struct ReleaseSpec {
     /// The timeouts the host enforces on its workers (section 7.6).
     #[serde(default)]
     pub timeouts: WorkerTimeouts,
+    /// The release's own limits on the requests it serves (section 4.6),
+    /// which the edge enforces.
+    #[serde(default, skip_serializing_if = "ServedLimits::is_empty")]
+    pub limits: ServedLimits,
     /// The memory policy for the workers (section 7.7).
     #[serde(default)]
     pub memory: MemoryPolicy,
@@ -1296,6 +1415,34 @@ impl AccessLogSpec {
                 .and_then(|slow| muru_config::parse_duration(slow).ok())
                 .unwrap_or(node.slow),
             exclude,
+            format: node.format,
+        }
+    }
+
+    /// The keys of a `[host.NAME]` table.
+    pub fn from_host(host: &muru_config::Host) -> Self {
+        Self {
+            access_log: host.access_log.clone(),
+            access_log_exclude: host.access_log_exclude.clone(),
+            slow: host.slow.clone(),
+        }
+    }
+
+    /// The choice as the edge lays it over the levels beneath: the keys
+    /// given, and none for the rest.
+    pub fn choice(&self) -> muru_edge::access::Choice {
+        muru_edge::access::Choice {
+            mode: self
+                .access_log
+                .as_deref()
+                .and_then(muru_edge::access::Mode::parse),
+            slow: self
+                .slow
+                .as_deref()
+                .and_then(|slow| muru_config::parse_duration(slow).ok()),
+            exclude: self.access_log_exclude.clone(),
+            format: None,
+            file: None,
         }
     }
 

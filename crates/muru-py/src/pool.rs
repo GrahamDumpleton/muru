@@ -86,6 +86,13 @@ pub struct RequestInfo {
     pub thread: Option<u64>,
     /// That thread's native identifier, for a reader from outside.
     pub native: Option<u64>,
+    /// The threads of the event loop's pool for synchronous code that
+    /// are running the request's code now (section 6.6), by their Python
+    /// identifiers: an ASGI request holds one for each `sync_to_async`
+    /// or `asyncio.to_thread` call it awaits.
+    pub sync: Vec<u64>,
+    /// Those threads' native identifiers, for a reader from outside.
+    pub sync_native: Vec<u64>,
     /// The channel of an ASGI request, whose task the soft timeout cancels.
     pub channel: Option<Py<Channel>>,
     /// Wakes a bridge call the application thread is blocked in.
@@ -262,6 +269,11 @@ pub struct RequestSummary {
     pub thread: Option<u64>,
     /// That thread's native identifier.
     pub native: Option<u64>,
+    /// The threads running its synchronous code on a pool of the event
+    /// loop's (section 6.6), by Python identifier.
+    pub sync: Vec<u64>,
+    /// Those threads' native identifiers.
+    pub sync_native: Vec<u64>,
 }
 
 /// The runtime's thread names by Python identifier, as a dict.
@@ -344,6 +356,13 @@ pub struct Shared {
     in_flight: AtomicU32,
     total: AtomicU64,
     next_id: AtomicU64,
+    /// Section 6.6: for each pool synchronous code runs on, in the
+    /// order of `SYNC_POOLS`, the threads running a call now, whether
+    /// for a request in flight, one that has since ended, or nothing a
+    /// request asked for, and the threads the pool has, 0 for a pool the
+    /// worker does not have.
+    sync_busy: [AtomicU32; SYNC_POOLS.len()],
+    sync_threads: [AtomicU32; SYNC_POOLS.len()],
     /// The requests in flight, by id, for the timeouts (section 7.6)
     /// and for inspection (section 11.7).
     active: Mutex<HashMap<u64, RequestInfo>>,
@@ -380,6 +399,8 @@ impl Shared {
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
+            sync_busy: [const { AtomicU32::new(0) }; SYNC_POOLS.len()],
+            sync_threads: [const { AtomicU32::new(0) }; SYNC_POOLS.len()],
             active: Mutex::new(HashMap::new()),
             draining: tokio::sync::watch::channel(false).0,
         })
@@ -443,15 +464,18 @@ impl Shared {
         names
     }
 
-    /// The mounts' own threads and limits, for HELLO (section 6.7). An
-    /// ASGI mount's threads are those its handoffs to WSGI run on
-    /// (section 6.14).
+    /// Every named mount, for HELLO (sections 5.1 and 6.7): the side it
+    /// runs on, which is the count its requests are held against at the
+    /// edge, and its own threads and limits when it has them, all 0 for
+    /// one that shares its side's count. An ASGI mount's threads are
+    /// those its handoffs to WSGI run on (section 6.14).
     pub fn mount_pools(&self) -> Vec<muru_proto::worker::v1::MountPool> {
         let clamp = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
 
-        self.mounts
+        let mut pools: Vec<_> = self
+            .mounts
             .iter()
-            .filter_map(|(name, mount)| {
+            .map(|(name, mount)| {
                 let handoff_threads = match (mount.handoff, &mount.runner, mount.threads) {
                     (true, Some(_), Some((threads, _))) => threads,
                     _ => 0,
@@ -464,20 +488,43 @@ impl Shared {
                     (None, Some((concurrency, connections))) => {
                         (concurrency, concurrency, connections)
                     }
-                    (None, None) if handoff_threads > 0 => (0, 0, 0),
-                    (None, None) => return None,
+                    (None, None) => (0, 0, 0),
                 };
 
-                Some(muru_proto::worker::v1::MountPool {
+                muru_proto::worker::v1::MountPool {
                     mount: name.clone(),
                     reserved: clamp(reserved),
                     max: clamp(max),
                     connections: clamp(connections),
                     handoff_threads: clamp(handoff_threads),
                     on_loop: mount.runner.is_some(),
-                })
+                }
             })
-            .collect()
+            .collect();
+        pools.sort_by(|a, b| a.mount.cmp(&b.mount));
+        pools
+    }
+
+    /// Whether anything the worker serves runs on the shared thread pool
+    /// (section 6.7), which is when HELLO declares its threads: a WSGI
+    /// default mount, a WSGI mount without threads of its own or that
+    /// borrows, or an ASGI application that hands requests to WSGI
+    /// (section 6.14) without threads of its own for them.
+    pub fn uses_threads(&self) -> bool {
+        let default_on_loop = self.asgi.as_ref().is_some_and(|asgi| asgi.runner.is_some());
+
+        if !default_on_loop || self.handoff {
+            return true;
+        }
+
+        self.mounts
+            .values()
+            .any(|mount| match (&mount.runner, mount.threads) {
+                (None, None) => true,
+                (None, Some((reserved, max))) => reserved < max,
+                (Some(_), None) => mount.handoff,
+                (Some(_), Some(_)) => false,
+            })
     }
 
     /// Stop the shared pool and the mounts' own, letting their queued
@@ -523,6 +570,8 @@ impl Shared {
                     },
                     thread: None,
                     native: None,
+                    sync: Vec::new(),
+                    sync_native: Vec::new(),
                     channel: None,
                     interrupt: Arc::clone(&interrupt),
                     timed_out: false,
@@ -789,6 +838,99 @@ impl Shared {
         }
     }
 
+    /// Section 6.6: a pool synchronous code runs on has `threads`
+    /// threads, and `busy` of them are running a call when the pool is
+    /// one the runtime samples and not one whose calls it is told of.
+    /// Unknown pools are ignored.
+    pub fn sync_pool(&self, pool: usize, threads: u32, busy: Option<u32>) {
+        let (Some(size), Some(count)) = (self.sync_threads.get(pool), self.sync_busy.get(pool))
+        else {
+            return;
+        };
+
+        size.store(threads, Ordering::Relaxed);
+
+        if let Some(busy) = busy {
+            count.store(busy, Ordering::Relaxed);
+        }
+    }
+
+    /// Section 6.6: the calling thread, one of a pool for synchronous
+    /// code, has started a call. It is counted as busy in its pool, and
+    /// recorded against the request in flight with the edge's id
+    /// `request_id`, when the call was made in one.
+    pub fn sync_entered(&self, request_id: Option<&str>, pool: usize) {
+        if let Some(busy) = self.sync_busy.get(pool) {
+            busy.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let Some(request_id) = request_id else {
+            return;
+        };
+
+        // SAFETY: PyThread_get_thread_ident reads the calling thread's
+        // identifier and needs no interpreter state.
+
+        let thread = unsafe { ffi::PyThread_get_thread_ident() } as u64;
+
+        if let Some(info) = self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .values_mut()
+            .find(|info| info.request_id == request_id)
+        {
+            info.sync.push(thread);
+            info.sync_native.push(native_thread_id());
+        }
+    }
+
+    /// The calling thread has finished the call `sync_entered` was told
+    /// of, for a request that may have ended meanwhile.
+    pub fn sync_left(&self, request_id: Option<&str>, pool: usize) {
+        // Never below nothing: a call that began before the worker
+        // counted them is not one it counted.
+
+        if let Some(count) = self.sync_busy.get(pool) {
+            let mut busy = count.load(Ordering::Relaxed);
+
+            while busy > 0 {
+                match count.compare_exchange_weak(
+                    busy,
+                    busy - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(now) => busy = now,
+                }
+            }
+        }
+
+        let Some(request_id) = request_id else {
+            return;
+        };
+
+        // SAFETY: as in `sync_entered`.
+
+        let thread = unsafe { ffi::PyThread_get_thread_ident() } as u64;
+
+        if let Some(info) = self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .values_mut()
+            .find(|info| info.request_id == request_id)
+            && let Some(index) = info.sync.iter().position(|held| *held == thread)
+        {
+            // The two lists are filled and emptied together, so a
+            // thread has the same place in both.
+
+            info.sync.swap_remove(index);
+            info.sync_native.swap_remove(index);
+        }
+    }
+
     /// Note which Python thread serves a request: the calling one.
     pub fn request_on_this_thread(&self, id: u64) {
         // SAFETY: PyThread_get_thread_ident reads the calling thread's
@@ -829,6 +971,7 @@ impl Shared {
                 now.saturating_duration_since(info.started).as_millis() as u64,
             )?;
             item.set_item("thread", info.thread)?;
+            item.set_item("sync_threads", info.sync.clone())?;
             list.append(item)?;
         }
 
@@ -849,6 +992,8 @@ impl Shared {
                 elapsed_ms: now.saturating_duration_since(info.started).as_millis() as u64,
                 thread: info.thread,
                 native: info.native,
+                sync: info.sync.clone(),
+                sync_native: info.sync_native.clone(),
             })
             .collect()
     }
@@ -914,7 +1059,10 @@ impl Shared {
     /// a pool thread picks it up, whatever the timeouts make of it, so
     /// one held at `breakpoint()` or streaming its response counts; a
     /// request holds the loop while its channel serves it, except an
-    /// accepted WebSocket, which may stay for hours.
+    /// accepted WebSocket, which may stay for hours. Synchronous code
+    /// (section 6.6) is a side of its own: of the pools it runs on, the
+    /// fullest one's threads running a call, and the oldest request
+    /// whose code a thread of a pool runs.
     pub fn sides(&self) -> Sides {
         let default_is_asgi = self.asgi.as_ref().is_some_and(|asgi| asgi.runner.is_some());
         let has_threads = !default_is_asgi
@@ -932,6 +1080,12 @@ impl Shared {
         let now = Instant::now();
         let mut threads = has_threads.then(|| Side::of(self.threads + reserved));
         let mut event_loop = self.asgi.as_ref().map(|asgi| Side::of(asgi.concurrency));
+        let sync_pools = self.sync_pools();
+        let mut sync = fullest(&sync_pools).map(|(busy, of)| Side {
+            busy,
+            of,
+            oldest_ms: 0,
+        });
 
         for info in self
             .active
@@ -940,6 +1094,12 @@ impl Shared {
             .values()
         {
             let elapsed = now.saturating_duration_since(info.started).as_millis() as u64;
+
+            if !info.sync.is_empty()
+                && let Some(side) = sync.as_mut()
+            {
+                side.oldest_ms = side.oldest_ms.max(elapsed);
+            }
 
             if info.thread.is_some() {
                 if let Some(side) = threads.as_mut() {
@@ -956,8 +1116,59 @@ impl Shared {
         Sides {
             threads,
             event_loop,
+            sync,
+            sync_pools,
         }
     }
+
+    /// Section 6.6: the pools synchronous code runs on, in the order of
+    /// `SYNC_POOLS`, each as its threads running a call and the threads
+    /// it has; none for a pool the worker does not have. The loop's own
+    /// pool is there whenever the worker has a loop. Every busy thread
+    /// counts, including one whose request was cancelled or has ended
+    /// while its call runs on.
+    fn sync_pools(&self) -> [Option<(usize, usize)>; SYNC_POOLS.len()] {
+        let own = self.asgi.as_ref().map_or(0, |asgi| asgi.sync_threads);
+
+        std::array::from_fn(|pool| {
+            let threads = if pool == 0 {
+                own
+            } else {
+                self.sync_threads[pool].load(Ordering::Relaxed) as usize
+            };
+
+            (threads > 0).then(|| {
+                (
+                    self.sync_busy[pool].load(Ordering::Relaxed) as usize,
+                    threads,
+                )
+            })
+        })
+    }
+}
+
+/// The names of the pools synchronous code of an ASGI application runs
+/// on (section 6.6), as the status and the metrics name them: the event
+/// loop's own pool, which `asyncio.to_thread` uses; anyio's worker
+/// threads, which Starlette and FastAPI use; and asgiref's one shared
+/// thread for thread-sensitive calls.
+pub const SYNC_POOLS: [&str; 3] = ["loop", "anyio", "asgiref"];
+
+/// Of some pools, each as its busy threads and its threads, the fullest:
+/// the one with the larger share of its threads busy, and the first of
+/// those that are level. It is the one whose calls wait first.
+fn fullest(pools: &[Option<(usize, usize)>]) -> Option<(usize, usize)> {
+    let mut found: Option<(usize, usize)> = None;
+
+    for (busy, of) in pools.iter().flatten().copied() {
+        // busy / of against the fullest so far, without dividing.
+
+        if found.is_none_or(|(most, threads)| busy * threads > most * of) {
+            found = Some((busy, of));
+        }
+    }
+
+    found
 }
 
 /// What one side of a worker holds (section 11.7).
@@ -1002,18 +1213,43 @@ pub struct Sides {
     pub threads: Option<Side>,
     /// The event loop.
     pub event_loop: Option<Side>,
+    /// Synchronous code run for the event loop: the fullest of the
+    /// pools it runs on.
+    pub sync: Option<Side>,
+    /// Each of those pools, in the order of `SYNC_POOLS`, as its busy
+    /// threads and its threads.
+    pub sync_pools: [Option<(usize, usize)>; SYNC_POOLS.len()],
 }
 
 impl Sides {
-    /// The sides as JSON object members, `"threads":{...},"loop":{...}`,
-    /// without braces, for a report line or a control answer; empty
-    /// with neither side.
+    /// The sides as JSON object members,
+    /// `"threads":{...},"loop":{...},"sync":{...}`, then the pools
+    /// synchronous code runs on as `"sync_pools":{"loop":{...},...}`,
+    /// without braces, for a report line or a control answer; empty with
+    /// no side.
     pub fn json_members(&self) -> String {
-        [("threads", self.threads), ("loop", self.event_loop)]
-            .into_iter()
-            .filter_map(|(name, side)| side.map(|side| format!("\"{name}\":{}", side.json())))
-            .collect::<Vec<_>>()
-            .join(",")
+        let mut members: Vec<String> = [
+            ("threads", self.threads),
+            ("loop", self.event_loop),
+            ("sync", self.sync),
+        ]
+        .into_iter()
+        .filter_map(|(name, side)| side.map(|side| format!("\"{name}\":{}", side.json())))
+        .collect();
+
+        let pools: Vec<String> = SYNC_POOLS
+            .iter()
+            .zip(self.sync_pools)
+            .filter_map(|(name, pool)| {
+                pool.map(|(busy, of)| format!("\"{name}\":{{\"busy\":{busy},\"of\":{of}}}"))
+            })
+            .collect();
+
+        if !pools.is_empty() {
+            members.push(format!("\"sync_pools\":{{{}}}", pools.join(",")));
+        }
+
+        members.join(",")
     }
 }
 

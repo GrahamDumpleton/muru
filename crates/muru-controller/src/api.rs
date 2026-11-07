@@ -225,15 +225,41 @@ impl Admin for Service {
         request: Request<pb::SetMaintenanceRequest>,
     ) -> Result<Response<pb::MaintenanceStatus>, Status> {
         let request = request.into_inner();
-        self.handle.store.app(&request.app).map_err(not_found)?;
         let (done_tx, done_rx) = oneshot::channel();
-        self.handle
-            .commands
-            .send(Command::SetMaintenance {
+
+        // Section 4.12: a virtual host, or an application.
+
+        let command = if request.host.is_empty() {
+            self.handle.store.app(&request.app).map_err(not_found)?;
+            Command::SetMaintenance {
                 app: request.app.clone(),
                 on: request.on,
                 done: done_tx,
-            })
+            }
+        } else if !request.app.is_empty() {
+            return Err(Status::invalid_argument(
+                "maintenance is for an application or a virtual host, not both",
+            ));
+        } else {
+            let hosts = self.handle.store.hosts().map_err(internal)?;
+
+            if !hosts.iter().any(|(name, _)| *name == request.host) {
+                return Err(Status::not_found(format!(
+                    "no virtual host named {}",
+                    request.host
+                )));
+            }
+
+            Command::SetHostMaintenance {
+                host: request.host.clone(),
+                on: request.on,
+                done: done_tx,
+            }
+        };
+
+        self.handle
+            .commands
+            .send(command)
             .await
             .map_err(|_| Status::unavailable(STOPPING))?;
         let since = done_rx
@@ -242,6 +268,7 @@ impl Admin for Service {
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(pb::MaintenanceStatus {
             app: request.app,
+            host: request.host,
             on: since.is_some(),
             since_unix_ms: since.unwrap_or(0),
         }))
@@ -302,37 +329,11 @@ impl Admin for Service {
         let request = request.into_inner();
         self.check_freeze(&request.app, "deploy", request.override_freeze)?;
 
-        // Section 3.3: a deploy takes what its flags and the source do
-        // not give from the release before it, unless it is fresh.
-
-        let previous = if request.fresh {
-            None
-        } else {
-            self.handle
-                .store
-                .app(&request.app)
-                .ok()
-                .and_then(|app| app.current.or(app.previous))
-                .and_then(|id| self.handle.store.release(&request.app, &id).ok())
-                .map(|release| release.spec)
-        };
-
-        // Resolution may run uv and the interpreter, so it is off the
-        // runtime's threads.
-
         let info = std::sync::Arc::clone(&self.handle.info);
-        let resolving = request.clone();
-        let spec = tokio::task::spawn_blocking(move || {
-            config::resolve_spec(
-                &resolving,
-                previous.as_ref(),
-                &config::Tables::default(),
-                &info.provisioning,
-            )
-        })
-        .await
-        .map_err(|error| Status::internal(error.to_string()))?
-        .map_err(Status::invalid_argument)?;
+        let spec = self
+            .resolve_deploy(&request, info.provisioning.clone())
+            .await?
+            .map_err(Status::invalid_argument)?;
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
@@ -372,6 +373,122 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(release_message(release, &self.handle)))
+    }
+
+    async fn plan_deploy(
+        &self,
+        request: Request<pb::DeployRequest>,
+    ) -> Result<Response<pb::DeployPlan>, Status> {
+        let request = request.into_inner();
+        let store = &self.handle.store;
+        let mut refusals = Vec::new();
+
+        if !crate::model::valid_name(&request.app) {
+            refusals.push(format!(
+                "{:?} is not a valid application name: lowercase letters, digits and hyphens, up to 63 characters",
+                request.app
+            ));
+        }
+
+        if let Some(by) = self.frozen().map_err(internal)?.get(&request.app)
+            && !request.override_freeze
+        {
+            refusals.push(format!(
+                "deploys of {} are frozen by overlay {}; give --override-freeze to deploy anyway",
+                request.app,
+                by.join(", ")
+            ));
+        }
+
+        let app = store.app(&request.app).ok();
+
+        let id = if request.release.is_empty() {
+            store.next_release_id(&request.app).map_err(internal)?
+        } else {
+            request.release.clone()
+        };
+
+        if !crate::model::valid_name(&id) {
+            refusals.push(format!("{id:?} is not a valid release id"));
+        } else if store.release(&request.app, &id).is_ok() {
+            refusals.push(format!("release {}@{id} already exists", request.app));
+        }
+
+        // A plan installs nothing: an interpreter the node lacks, which
+        // a deploy would have uv fetch, is found or the plan says so.
+
+        let mut provisioning = self.handle.info.provisioning.clone();
+        let downloads = provisioning.downloads_allowed();
+        provisioning.isolation.no_downloads = true;
+
+        let spec = match self.resolve_deploy(&request, provisioning).await? {
+            Ok(spec) => Some(spec),
+            Err(error) => {
+                refusals.push(if downloads && error.contains("uv python install") {
+                    format!("{error}; a deploy would try to install it, which a dry run does not")
+                } else {
+                    error
+                });
+                None
+            }
+        };
+
+        // Section 13.6: whether the release's memory fits the node's
+        // budget, with the retained releases making way.
+
+        if let Some(spec) = &spec {
+            let budget = self
+                .handle
+                .info
+                .defined
+                .read()
+                .expect("defined names poisoned")
+                .budget
+                .clone();
+
+            if let Err(why) = budget.release_fits(&request.app, spec, budget.retained) {
+                refusals.push(format!("not started: {}: {why}", request.app));
+            }
+        }
+
+        let previous = app
+            .as_ref()
+            .filter(|_| !request.fresh)
+            .and_then(|app| app.current.clone().or_else(|| app.previous.clone()));
+
+        Ok(Response::new(pb::DeployPlan {
+            app: request.app.clone(),
+            release: id,
+            new_app: app.is_none(),
+            description: spec.as_ref().map(config::describe).unwrap_or_default(),
+            settings: spec
+                .as_ref()
+                .filter(|spec| spec.http.is_none())
+                .map(|spec| {
+                    config::release_settings(spec)
+                        .into_iter()
+                        .map(|(key, value)| pb::DeploySetting {
+                            layer: spec.layers.0.get(key).cloned().unwrap_or_default(),
+                            key: key.to_owned(),
+                            value,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            builds: spec.as_ref().is_some_and(|spec| spec.build.builds),
+            serving: app.and_then(|app| app.current).unwrap_or_default(),
+            settings_from: previous
+                .filter(|_| spec.as_ref().is_some_and(|spec| spec.http.is_none()))
+                .unwrap_or_default(),
+            hold: request.hold,
+            retain_ms: request
+                .retain_ms
+                .unwrap_or(crate::daemon::RETENTION.as_millis() as u64),
+            retain_workers: request
+                .retain_workers
+                .unwrap_or(crate::daemon::RETAIN_WORKERS),
+            refusals,
+        }))
     }
 
     async fn list_releases(
@@ -508,7 +625,29 @@ impl Admin for Service {
         // file, the current release's when none is named.
 
         let (app, release, path) = if request.access {
-            (String::new(), String::new(), locations.access_log())
+            // Section 11.2: a virtual host may name a file of its own.
+
+            let own = if request.host.is_empty() {
+                None
+            } else {
+                self.handle
+                    .store
+                    .hosts()
+                    .map_err(internal)?
+                    .into_iter()
+                    .find(|(name, _)| *name == request.host)
+                    .ok_or_else(|| {
+                        Status::not_found(format!("no virtual host named {}", request.host))
+                    })?
+                    .1
+                    .access_log_file
+            };
+
+            let path = own.map_or_else(
+                || locations.access_log(),
+                |file| locations.logs.path.join(file),
+            );
+            (String::new(), String::new(), path)
         } else {
             if request.app.is_empty() {
                 return Err(Status::invalid_argument(
@@ -560,22 +699,10 @@ impl Admin for Service {
         request: Request<pb::RunCommandRequest>,
     ) -> Result<Response<CommandStream>, Status> {
         let request = request.into_inner();
-        let release = self.current_release(&request.app, &request.release)?;
-
-        let command = match (request.name.is_empty(), request.argv.is_empty()) {
-            (true, false) => crate::commands::CommandRequest::OneOff(request.argv),
-            (false, true) => crate::commands::CommandRequest::Declared {
-                name: request.name,
-                inputs: request.inputs.into_iter().collect(),
-                secret_inputs: request.secret_inputs.into_iter().collect(),
-            },
-            (true, true) => return Err(Status::invalid_argument("name the command to run")),
-            (false, false) => {
-                return Err(Status::invalid_argument(
-                    "name a declared command or give a one-off one, not both",
-                ));
-            }
-        };
+        let app = request.app.clone();
+        let release = self.current_release(&app, &request.release)?;
+        let command = crate::commands::CommandRequest::from_message(request)
+            .map_err(Status::invalid_argument)?;
 
         // Section 9.12: the daemon resolves what the release runs with,
         // then the command runs here, outside the daemon's loop, for as
@@ -585,7 +712,7 @@ impl Admin for Service {
         self.handle
             .commands
             .send(Command::PrepareCommand {
-                app: request.app.clone(),
+                app,
                 id: release,
                 request: command,
                 done: done_tx,
@@ -597,12 +724,17 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
 
-        let output = crate::commands::run(
-            prepared,
-            self.handle.events.clone(),
-            self.handle.store.clone(),
-        )
-        .map_err(Status::failed_precondition)?;
+        let output = self
+            .handle
+            .underway
+            .run(
+                prepared,
+                std::sync::Arc::new(crate::commands::Recorded {
+                    events: self.handle.events.clone(),
+                    store: self.handle.store.clone(),
+                }),
+            )
+            .map_err(Status::failed_precondition)?;
         let stream =
             tokio_stream::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(output), Ok);
         Ok(Response::new(Box::pin(stream)))
@@ -631,37 +763,7 @@ impl Admin for Service {
         let commands = spec
             .commands
             .iter()
-            .map(|command| pb::CommandInfo {
-                name: command.name.clone(),
-                description: command.description.clone(),
-                run: command.run.clone(),
-                call: command.call.clone().unwrap_or_default(),
-                inputs: command
-                    .inputs
-                    .iter()
-                    .map(|input| pb::CommandInputInfo {
-                        name: input.name.clone(),
-                        description: input.description.clone(),
-                        required: input.required,
-                        default: input.default.clone().unwrap_or_default(),
-                        pattern: input.pattern.clone().unwrap_or_default(),
-                        secret: input.secret,
-                    })
-                    .collect(),
-                timeout: command
-                    .timeout_ms
-                    .map(|ms| muru_config::format_duration(Duration::from_millis(ms)))
-                    .unwrap_or_default(),
-                exclusive: command.exclusive,
-                last_run: runs.get(&command.name).map(|run| pb::CommandRun {
-                    release: run.release.clone(),
-                    started_unix_ms: run.started_unix_ms,
-                    duration_ms: run.duration_ms,
-                    exit_code: run.exit_code,
-                    ok: run.ok,
-                    message: run.message.clone(),
-                }),
-            })
+            .map(|command| crate::commands::info(command, runs.get(&command.name)))
             .collect();
 
         Ok(Response::new(pb::ListCommandsResponse {
@@ -1295,10 +1397,14 @@ impl Admin for Service {
         _: Request<pb::ListHostsRequest>,
     ) -> Result<Response<pb::ListHostsResponse>, Status> {
         let hosts = self.handle.store.hosts().map_err(internal)?;
+        let maintenance = self.handle.store.host_maintenance().map_err(internal)?;
         Ok(Response::new(pb::ListHostsResponse {
             hosts: hosts
                 .into_iter()
                 .map(|(name, host)| pb::Host {
+                    maintenance: maintenance.iter().any(|(host, _)| *host == name),
+                    access_log_format: host.access_log_format.clone().unwrap_or_default(),
+                    access_log_file: host.access_log_file.clone().unwrap_or_default(),
                     name,
                     names: host.names,
                     listeners: host.listeners,
@@ -1308,6 +1414,17 @@ impl Admin for Service {
                     https_redirect: host.https_redirect,
                     use_canonical_name: host.use_canonical_name,
                     default: host.default,
+                    canonical_redirect: host.canonical_redirect,
+                    max_body_size: host.max_body_size.unwrap_or_default(),
+                    timeouts: timeouts_map(host.timeouts.as_ref()),
+                    access_log: host.access_log.unwrap_or_default(),
+                    compression: compression_note(host.compression.as_ref()),
+                    request_headers: crate::overlays::describe_request_headers(
+                        host.request_headers.as_ref(),
+                    ),
+                    response_headers: crate::overlays::describe_response_headers(
+                        host.response_headers.as_ref(),
+                    ),
                 })
                 .collect(),
         }))
@@ -1388,6 +1505,14 @@ impl Admin for Service {
                         (None, _) => String::new(),
                     },
                     max_body_size: route.max_body_size.clone().unwrap_or_default(),
+                    timeouts: timeouts_map(route.timeouts.as_ref()),
+                    compression: compression_note(route.compression.as_ref()),
+                    request_headers: crate::overlays::describe_request_headers(
+                        route.request_headers.as_ref(),
+                    ),
+                    response_headers: crate::overlays::describe_response_headers(
+                        route.response_headers.as_ref(),
+                    ),
                     host: route.host,
                     path: route.path,
                     app: route.app,
@@ -1452,6 +1577,35 @@ impl Admin for Service {
 
         let mut report = report_message(&plan);
 
+        // Section 10.4: how the releases the apply adds are deployed,
+        // which the plan says of each one it holds, and of each release
+        // one of them takes over from.
+
+        let deploying = Deploying {
+            hold: request.hold,
+            wait: !request.no_wait,
+            retain: crate::daemon::Retention {
+                lasts: request
+                    .retain_ms
+                    .map_or(crate::daemon::RETENTION, Duration::from_millis),
+                workers: request
+                    .retain_workers
+                    .unwrap_or(crate::daemon::RETAIN_WORKERS),
+            },
+        };
+
+        if request.dry_run {
+            report.notes.extend(self.deploy_notes(&plan, &deploying));
+        }
+
+        if deploying.hold {
+            for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
+                if matches!(change.action, Action::Deploy { .. }) {
+                    message.detail = format!("held: {}", message.detail);
+                }
+            }
+        }
+
         if !request.dry_run && plan.errors.is_empty() {
             for (app, (id, by)) in &overridden {
                 self.handle.events.emit(
@@ -1473,7 +1627,7 @@ impl Admin for Service {
         let mut failures = 0;
 
         for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
-            message.outcome = self.carry_out(change).await;
+            message.outcome = self.carry_out(change, &deploying).await;
 
             if message.outcome.starts_with("failed") {
                 failures += 1;
@@ -1576,10 +1730,20 @@ impl Admin for Service {
         }
 
         let (attributions, layers) = if request.effective {
-            (
-                config::make_effective(&self.handle.store, &mut document, app).map_err(internal)?,
-                config::release_layers(&self.handle.store, &document).map_err(internal)?,
-            )
+            let attributions =
+                config::make_effective(&self.handle.store, &mut document, app).map_err(internal)?;
+            let mut layers =
+                config::release_layers(&self.handle.store, &document).map_err(internal)?;
+            let limits = self
+                .handle
+                .info
+                .limits
+                .read()
+                .expect("limits poisoned")
+                .clone();
+            layers.extend(config::served_layers(&self.handle.store, &document).map_err(internal)?);
+            layers.extend(config::route_layers(&self.handle.store, &document, &limits));
+            (attributions, layers)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1598,10 +1762,85 @@ impl Admin for Service {
     }
 }
 
+/// A host's or a route's own request timeouts (section 4.6), by key, as
+/// configured.
+fn timeouts_map(timeouts: Option<&muru_config::RequestTimeouts>) -> BTreeMap<String, String> {
+    let Some(timeouts) = timeouts else {
+        return BTreeMap::new();
+    };
+
+    [
+        ("queue_timeout", &timeouts.queue_timeout),
+        ("request_deadline", &timeouts.request_deadline),
+        ("body_idle_timeout", &timeouts.body_idle_timeout),
+        ("response_idle_timeout", &timeouts.response_idle_timeout),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| Some((key.to_owned(), value.clone()?)))
+    .collect()
+}
+
+/// A host's or a route's own compression settings (section 4.17) as one
+/// word: off when it turns compression off, set when it sets anything
+/// else, and nothing without a table.
+fn compression_note(table: Option<&muru_config::Compression>) -> String {
+    match table {
+        None => String::new(),
+        Some(table) if table.enabled == Some(false) => "off".to_owned(),
+        Some(_) => "set".to_owned(),
+    }
+}
+
+/// How an apply deploys the releases it adds (section 10.4).
+struct Deploying {
+    /// Start them and leave traffic where it is.
+    hold: bool,
+    /// Wait for each to serve or fail.
+    wait: bool,
+    /// How long a release one of them replaces stays warm, and with how
+    /// many workers.
+    retain: crate::daemon::Retention,
+}
+
 impl Service {
+    /// Resolve a deploy request into the release it describes. Section
+    /// 3.3: a deploy takes what its flags and the source do not give
+    /// from the release before it, unless it is fresh. Resolution may
+    /// run uv and the interpreter, so it is off the runtime's threads.
+    async fn resolve_deploy(
+        &self,
+        request: &pb::DeployRequest,
+        provisioning: crate::provision::Provisioning,
+    ) -> Result<Result<ReleaseSpec, String>, Status> {
+        let previous = if request.fresh {
+            None
+        } else {
+            self.handle
+                .store
+                .app(&request.app)
+                .ok()
+                .and_then(|app| app.current.or(app.previous))
+                .and_then(|id| self.handle.store.release(&request.app, &id).ok())
+                .map(|release| release.spec)
+        };
+
+        let resolving = request.clone();
+
+        tokio::task::spawn_blocking(move || {
+            config::resolve_spec(
+                &resolving,
+                previous.as_ref(),
+                &config::Tables::default(),
+                &provisioning,
+            )
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))
+    }
+
     /// Carry out one change of a plan and say how it went: an outcome
     /// starting with "failed" is counted as a failure.
-    async fn carry_out(&self, change: &Change) -> String {
+    async fn carry_out(&self, change: &Change, deploying: &Deploying) -> String {
         let store = &self.handle.store;
 
         let outcome = match &change.action {
@@ -1626,7 +1865,9 @@ impl Service {
                 .set_app_access_log(app, access_log)
                 .map(|()| "set".to_owned())
                 .map_err(|error| error.to_string()),
-            Action::Deploy { app, id, spec } => self.deploy_declared(app, id, spec).await,
+            Action::Deploy { app, id, spec } => {
+                self.deploy_declared(app, id, spec, deploying).await
+            }
             Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
             Action::RemoveApp { app } => store
                 .delete_app(app)
@@ -1713,13 +1954,55 @@ impl Service {
         outcome.unwrap_or_else(|error| format!("failed: {error}"))
     }
 
-    /// Deploy a declared release under its declared id and wait for the
-    /// outcome, as a deploy with --wait does.
+    /// What the plan's deploys would do beyond starting their releases,
+    /// for the report: nothing when a release is held, since traffic
+    /// stays where it is, and otherwise what becomes of the release
+    /// each application's last deploy takes over from.
+    fn deploy_notes(&self, plan: &Plan, deploying: &Deploying) -> Vec<String> {
+        if deploying.hold {
+            return Vec::new();
+        }
+
+        let mut last: BTreeMap<&str, &str> = BTreeMap::new();
+
+        for change in &plan.changes {
+            if let Action::Deploy { app, id, .. } = &change.action {
+                last.insert(app, id);
+            }
+        }
+
+        last.into_iter()
+            .filter_map(|(app, id)| {
+                let serving = self.handle.store.app(app).ok()?.current?;
+
+                Some(if deploying.retain.lasts.is_zero() {
+                    format!(
+                        "{app}@{serving} stops once it has drained, when {app}@{id} takes its place"
+                    )
+                } else {
+                    format!(
+                        "{app}@{serving} stays warm for {} with {} to a group, when {app}@{id} takes its place",
+                        muru_config::format_duration(deploying.retain.lasts),
+                        match deploying.retain.workers {
+                            0 => "its host alone".to_owned(),
+                            1 => "1 worker".to_owned(),
+                            count => format!("{count} workers"),
+                        }
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Deploy a declared release and say how it went: recorded when the
+    /// apply does not wait, else its state, with whether it serves or is
+    /// held.
     async fn deploy_declared(
         &self,
         app: &str,
         id: &str,
         spec: &ReleaseSpec,
+        deploying: &Deploying,
     ) -> Result<String, String> {
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
@@ -1729,15 +2012,20 @@ impl Service {
                 app: app.to_owned(),
                 spec: Box::new(spec.clone()),
                 id: Some(id.to_owned()),
-                retain: crate::daemon::Retention::default(),
-                hold: false,
+                retain: deploying.retain,
+                hold: deploying.hold,
                 created: created_tx,
                 done: done_tx,
             })
             .await
             .map_err(|_| STOPPING.to_owned())?;
 
-        created_rx.await.map_err(|_| STOPPING.to_owned())??;
+        let created = created_rx.await.map_err(|_| STOPPING.to_owned())??;
+
+        if !deploying.wait {
+            return Ok(format!("recorded ({})", created.state));
+        }
+
         let release = done_rx.await.map_err(|_| STOPPING.to_owned())??;
 
         // A release that failed says why, so the one answer an apply
@@ -1759,7 +2047,13 @@ impl Service {
         Ok(format!(
             "{}{}",
             release.state,
-            if serving { " and serving" } else { "" }
+            if serving {
+                " and serving"
+            } else if deploying.hold {
+                " and held: not serving"
+            } else {
+                ""
+            }
         ))
     }
 
@@ -2021,6 +2315,7 @@ fn scale_message(
                 worker_cpu: status.workers.worker_cpu,
                 gil_wait_p95_ms: status.workers.gil_wait_p95_ms,
                 loop_lag_p95_ms: status.workers.loop_lag_p95_ms,
+                handoff_queue_wait_p95_ms: status.workers.handoff_queue_wait_p95_ms,
                 gc_share: status.workers.gc_share,
                 bottleneck: status.diagnosis.bottleneck.to_owned(),
                 diagnosis: status.diagnosis.summary.to_owned(),
@@ -2070,14 +2365,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         .and_then(|app| app.current)
         .as_deref()
         == Some(release.id.as_str());
-    let detected = handle
-        .info
-        .interfaces
-        .lock()
-        .expect("interfaces poisoned")
-        .get(&(release.app.clone(), release.id.clone()))
-        .cloned()
-        .unwrap_or_default();
+    let detected = handle.info.interfaces.announced(&release.app, &release.id);
     let websockets = handle
         .info
         .websockets

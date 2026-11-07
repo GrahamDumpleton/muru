@@ -562,6 +562,46 @@ def test_a_relative_or_deep_run_directory_is_refused_at_start(tmp_path: Path) ->
     assert "shorter path" in deep.stderr
 
 
+def test_the_daemons_file_is_named_only_where_it_is_read(daemon: Daemon, tmp_path: Path) -> None:
+    # Section 13.8: a command that only talks to a running daemon reads
+    # none of the daemon's own files, and takes no flag that names one.
+
+    for flag in ["--config", "--state-dir", "--log-dir", "--cache-dir"]:
+        refused = daemon.muructl("status", flag, str(tmp_path), check=False)
+        assert refused.returncode != 0
+        assert f"unexpected argument '{flag}'" in refused.stderr, refused.stderr
+
+    # The variable that names the file says whose file it is, and its
+    # earlier name is refused so a daemon never passes its file over.
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    where = {
+        "MURU_STATE_DIR": str(tmp_path / "state"),
+        "MURU_LOG_DIR": str(tmp_path / "logs"),
+        "MURU_RUN_DIR": str(support.short_dir("muru-rt-")),
+    }
+    config = tmp_path / "node.toml"
+    config.write_text("[[listener]]\naddress = 'not an address'\n")
+
+    def run(**env: str) -> str:
+        completed = subprocess.run(
+            [str(muructl), "daemon", "run"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, **where, **env},
+            timeout=60,
+        )
+        assert completed.returncode != 0
+        return completed.stdout + completed.stderr
+
+    old = run(MURU_CONFIG=str(config))
+    assert "MURU_CONFIG is set, and the daemon's configuration file is now named by" in old, old
+    assert "MURU_DAEMON_CONFIG" in old, old
+    assert "not an address" in run(MURU_DAEMON_CONFIG=str(config))
+
+
 def test_a_deploy_carries_settings_from_the_previous_release(daemon: Daemon) -> None:
     # Section 3.3: what neither the flags nor the source's table give
     # comes from the release before, a timeout, a memory key and an

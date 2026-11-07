@@ -47,10 +47,26 @@ thread from the moment a pool thread picks it up, so one waiting at
 alone, is counted for as long as it holds the thread. A worker with an
 event loop shows LOOP, the requests on the loop of its `concurrency`,
 and LOOP-OLDEST; open WebSockets are left out of both, since a socket
-may stay for hours, and `muructl websockets` counts them. A worker
-shows the sides it has, and the table the columns any worker of the
-release has, so a WSGI release has the thread columns and an ASGI
-release the loop columns. Every header is one word, so a script can
+may stay for hours, and `muructl websockets` counts them. Beside them,
+SYNC is the threads running synchronous code for the loop, of the
+threads that may: an ASGI application whose views call blocking code
+fills them, and at `8/8` every new call waits for a thread while the
+loop itself has room. Such code runs on one of
+[three pools](asgi.md#one-event-loop-per-worker), the loop's own,
+anyio's and asgiref's shared thread, and SYNC is the fullest of them,
+the one whose calls wait first; `--json` gives each as `sync_pools`.
+SYNC-OLDEST is the age of the oldest request with a call on the loop's
+pool or asgiref's thread, and a dash when the busy threads are anyio's.
+
+```
+WORKER  PID      GROUP      UP       REQUESTS   LOOP      LOOP-OLDEST  SYNC    SYNC-OLDEST  RSS     USS     ROUTED  STATE
+0       41213    default    5m18s    12044      31/1000   4.2s         8/8     4.2s         52MB    34MB    yes     ready
+```
+
+A worker shows the sides it has, and the table the columns any worker
+of the release has, so a WSGI release has the thread columns and an
+ASGI release the loop and sync columns. `muructl debug stacks` names,
+on each thread of the pool, the request whose call it is running. Every header is one word, so a script can
 pick a column by its name.
 
 The figures are as of the moment the status answers: the host asks each
@@ -210,8 +226,9 @@ worth one interval.
 time spent in each, with sys.monitoring, for `--for` (10 s), and prints
 the functions that took longest with their call counts. It needs Python
 3.12 or later. Exact counts cost the worker more than sampling, so a
-worker serving requests in more than half its slots is refused unless
-`--force` is given. The worker keeps serving while the trace runs, so
+worker serving requests on more than half its threads, or holding more
+than half its event loop's concurrency, is refused unless `--force` is
+given. The worker keeps serving while the trace runs, so
 the trace counts the requests it takes meanwhile, each slowed by the
 tracing.
 

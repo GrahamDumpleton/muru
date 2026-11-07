@@ -1,7 +1,8 @@
 //! The worker's own scaling signals (design specification section 7.3):
 //! the CPU time it has used, how long its threads wait for the GIL when
-//! Rust hands work back to Python, and how late its event loop's
-//! heartbeat runs. The host relays them to the daemon, which turns the
+//! Rust hands work back to Python, how late its event loop's heartbeat
+//! runs, and how long requests handed from ASGI to WSGI wait for a
+//! thread. The host relays them to the daemon, which turns the
 //! growth between two reports into rates and percentiles.
 
 use std::sync::OnceLock;
@@ -70,6 +71,10 @@ pub static GIL_WAIT: Histogram = Histogram::new();
 /// How much later than due the event loop's heartbeat ran.
 pub static LOOP_LAG: Histogram = Histogram::new();
 
+/// Waits of requests handed from ASGI to WSGI, from the handoff to an
+/// application thread taking the request (section 6.14).
+pub static HANDOFF_WAIT: Histogram = Histogram::new();
+
 /// The CPU time this process has used, user and system, in
 /// milliseconds.
 fn cpu_ms() -> u64 {
@@ -103,16 +108,18 @@ fn gil_enabled() -> bool {
 }
 
 /// The signals as fields to add to a status line: the CPU time, whether
-/// the interpreter has a GIL, and the two histograms with their sums.
+/// the interpreter has a GIL, and the three histograms with their sums.
 pub fn report_fields() -> String {
     format!(
-        ",\"cpu_ms\":{},\"gil_enabled\":{},\"gil_wait\":{},\"gil_wait_us\":{},\"loop_lag\":{},\"loop_lag_us\":{}",
+        ",\"cpu_ms\":{},\"gil_enabled\":{},\"gil_wait\":{},\"gil_wait_us\":{},\"loop_lag\":{},\"loop_lag_us\":{},\"handoff_wait\":{},\"handoff_wait_us\":{}",
         cpu_ms(),
         gil_enabled(),
         GIL_WAIT.cumulative(),
         GIL_WAIT.sum_us(),
         LOOP_LAG.cumulative(),
-        LOOP_LAG.sum_us()
+        LOOP_LAG.sum_us(),
+        HANDOFF_WAIT.cumulative(),
+        HANDOFF_WAIT.sum_us()
     ) + &crate::gc::report_field()
 }
 

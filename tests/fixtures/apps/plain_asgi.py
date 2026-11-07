@@ -352,6 +352,11 @@ async def application(scope: Scope, receive: Receive, send: Send) -> None:
 
         time.sleep(float(query.get("seconds", "0.5")))
         await respond(send, 200, b"blocked\n")
+    elif path == "/to-thread":
+        # Section 6.6: blocking code run on the loop's pool for synchronous code.
+
+        await asyncio.to_thread(time.sleep, float(query.get("seconds", "0.5")))
+        await respond(send, 200, b"slept on a thread\n")
     elif path == "/state":
         # The scope's state is a copy per request: changes stay here.
 

@@ -99,13 +99,16 @@ bench *args:
 reference:
     MURU_UPDATE_REFERENCE=1 cargo test -p muru-config --test reference
 
-# Build the documentation with warnings as errors.
+# Build the documentation with warnings as errors. Every page is read
+# again (-E), as CI reads them: Sphinx reports a page's warnings only when
+# it reads the page, so a build that reused the pages of an earlier one
+# would pass with a warning that fails in CI.
 docs:
-    uv run sphinx-build -W --keep-going -b html docs docs/_build/html
+    uv run sphinx-build -W --keep-going -E -b html docs docs/_build/html
 
 # Build the LaTeX source for the PDF, which Read the Docs turns into the PDF (no TeX needed here).
 docs-latex:
-    uv run sphinx-build -W --keep-going -b latex docs docs/_build/latex
+    uv run sphinx-build -W --keep-going -E -b latex docs docs/_build/latex
 
 # Check documentation links.
 docs-linkcheck:

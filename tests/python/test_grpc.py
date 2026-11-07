@@ -129,6 +129,22 @@ def run_call(
     return sent
 
 
+def test_the_dispatchers_threads_tell_the_runtime_their_names(
+    monkeypatch: pytest.MonkeyPatch, native: Any
+) -> None:
+    named: list[str] = []
+    monkeypatch.setattr(native, "name_thread", named.append)
+    dispatcher = _grpc.Dispatcher(_grpc.Server(), 1)
+
+    try:
+        dispatcher.executor.submit(lambda: None).result()
+    finally:
+        dispatcher.executor.shutdown()
+
+    assert named == ["muru-grpc_0"]
+
+
+@pytest.mark.usefixtures("native")
 def test_the_dispatcher_runs_calls_and_ends_them_with_a_status() -> None:
     server = _grpc.Server()
     server.add_registered_method_handlers("demo.Svc", handlers())

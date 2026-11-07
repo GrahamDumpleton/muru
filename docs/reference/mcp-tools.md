@@ -25,17 +25,17 @@ ones it names.
 | `overlay_preview` | reads | `muructl overlay preview` | `name` |
 | `skill_status` | reads | `muructl mcp skill status` | none |
 | `docs` | reads | The user guide embedded in `muructl`: the list of pages, or one page's Markdown | `page` |
-| `deploy` | changes | `muructl deploy` | `app`, `source`, `entrypoint`, `python`, `hold`, `wait` (default true) |
+| `deploy` | changes | `muructl deploy` | `app`, `source`, `entrypoint`, `python`, `hold`, `wait` (default true), `dry_run` |
 | `promote` | changes | `muructl rollout bluegreen` | `release` |
 | `rollback` | changes | `muructl rollback` | `app` |
 | `drain` | changes | `muructl drain` | `release` |
 | `rollout` | changes | `muructl rollout canary`, `pause`, `resume`, `promote` or `abort` | `action`, `release` (canary), `app` (the others), `steps`, `hold` |
 | `scale` | changes | `muructl scale` | `target`, `group`, `processes`, `unpin` |
-| `run_command` | changes | `muructl command run`, the output returned as an array of lines (the last 500) with `exit_code` and `message`, as a tool error when the exit status is not 0 | `target`, `name`, `inputs` (an object), `secret_inputs` (an object of STORE/KEY references) |
+| `run_command` | changes | `muructl command run`, the output returned as an array of lines (the last 500) with `exit_code`, `ok` and `message`, as a tool error unless `ok`: the command exited with 0 and was not stopped | `target`, `name`, `inputs` (an object), `secret_inputs` (an object of STORE/KEY references) |
 | `restart` | changes | `muructl restart` | `target`, `worker`, `all`, `force` |
 | `overlay` | changes | `muructl overlay activate`, `end` or `promote` | `action`, `name`, `for` |
-| `maintenance` | changes | `muructl maintenance on` or `off` | `app`, `on` |
-| `apply` | changes | `muructl apply` | `file`, `dry_run` |
+| `maintenance` | changes | `muructl maintenance on` or `off` | `app` or `host`, `on` |
+| `apply` | changes | `muructl apply` | `file`, `dry_run`, `hold`, `wait` (default true) |
 | `log_level` | changes | `muructl logging level` | `target`, `levels`, `for`, `reset` |
 | `access_log` | changes | `muructl logging access` | `mode`, `app`, `paths`, `for`, `reset` |
 | `reopen_logs` | changes | `muructl logs reopen` | `workers` |

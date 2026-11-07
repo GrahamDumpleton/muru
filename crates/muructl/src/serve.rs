@@ -3,8 +3,8 @@
 //! and the environment, with nothing kept between starts.
 //!
 //! The command lays its settings in layers, the project's `[tool.muru]`
-//! table, its serve table, the file `MURU_SERVE_CONFIG` names, one
-//! environment variable per flag and the flags, and then serves through
+//! table, its serve table, one environment variable per flag and the
+//! flags, and then serves through
 //! the same code as `muructl run`, with the production behaviours on and
 //! the container's own: one run directory, no installs, the admin port
 //! and one output stream.
@@ -37,8 +37,8 @@ pub const PROBE_SOCKET: &str = "probe.sock";
 pub const ADMIN_SOCKET: &str = "admin.sock";
 
 /// The arguments of `muructl serve`. Every setting can also come from the
-/// project's serve table, the file `--config` names, or an environment
-/// variable named `MURU_SERVE_` and the flag in upper snake case.
+/// project's serve table or an environment variable named `MURU_SERVE_`
+/// and the flag in upper snake case.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
     /// The application as module:callable, or the project directory whose
@@ -50,8 +50,10 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DIR")]
     chdir: Option<PathBuf>,
 
-    /// A settings file holding the serve table's keys at its top level
-    /// (also MURU_SERVE_CONFIG).
+    /// A project settings file used in place of the pyproject.toml or
+    /// muru.toml beside the code, such as one a deployment mounts: the
+    /// keys of a muru.toml, with serve's own under [serve] (also
+    /// MURU_SERVE_CONFIG).
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
 
@@ -514,9 +516,13 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let limits = Limits::read();
 
     let result = match prepare(&args, limits.as_ref(), |name| std::env::var(name).ok()) {
-        Ok((_, mode, layered)) if args.print_config => {
-            print_config(&layered, &mode);
-            return Ok(());
+        Ok((run_args, mode, layered)) if args.print_config => {
+            crate::resolve_for(&run_args, Some(&mode)).map(|resolved| {
+                print!(
+                    "{}",
+                    crate::print_config::for_serve(&resolved, report(&layered, &mode))
+                );
+            })
         }
         Ok((run_args, mode, _)) => {
             muru_common::log::json_lines(mode.json);
@@ -536,6 +542,125 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     result
+}
+
+/// The project settings file a flag or MURU_SERVE_CONFIG names, to use
+/// in place of the one beside the code (section 13.9). A relative path
+/// is taken from the directory the command runs in.
+pub fn settings_file(
+    flag: Option<&Path>,
+    read: &impl Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    flag.map(Path::to_path_buf)
+        .or_else(|| read("MURU_SERVE_CONFIG").map(PathBuf::from))
+        .map(|path| std::path::absolute(&path).unwrap_or(path))
+}
+
+/// The settings every layer beneath the flags gives: the serve table of
+/// the project's settings, then the environment.
+fn below_flags(
+    table: Option<&(PathBuf, muru_config::ToolMuru)>,
+    read: &impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Layered> {
+    let mut layered = Layered::default();
+
+    if let Some((path, tool)) = table
+        && let Some(serve) = &tool.serve
+    {
+        layered.over(
+            from_table(serve),
+            &crate::print_config::table_name(Some(path), "serve"),
+        );
+    }
+
+    // Each of the environment's settings is named by its variable.
+
+    for (key, value) in from_environment(read)? {
+        let variable = format!("{ENV_PREFIX}{}", key.to_ascii_uppercase());
+        layered.values.insert(key, (value, variable));
+    }
+
+    if !layered
+        .values
+        .get("run_dir")
+        .is_some_and(|(_, source)| source.starts_with(ENV_PREFIX))
+        && let Some(dir) = read("MURU_RUN_DIR")
+    {
+        layered
+            .values
+            .insert("run_dir", (Value::Text(dir), "MURU_RUN_DIR".to_owned()));
+    }
+
+    Ok(layered)
+}
+
+/// Section 13.9: the interpreter the settings name, else the image
+/// contract's, /app/.venv, when nothing nearer names one: an active
+/// virtual environment or the project's own .venv, which muructl run
+/// looks at next.
+fn python_setting(
+    layered: &Layered,
+    project: &Path,
+    read: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    layered.text("python").map(str::to_owned).or_else(|| {
+        let app_venv = Path::new("/app/.venv/bin/python");
+        let nearer = read("VIRTUAL_ENV").is_some() || project.join(".venv").is_dir();
+        (!nearer && app_venv.exists()).then(|| app_venv.display().to_string())
+    })
+}
+
+/// What a command run for the project takes from where `serve` takes
+/// its settings (section 9.12), so a Job and a Deployment made from one
+/// image and environment find the same project, interpreter and runtime
+/// library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSettings {
+    /// The project directory.
+    pub project: PathBuf,
+    /// The interpreter a setting names, or the image contract's.
+    pub python: Option<String>,
+    /// The image's runtime directory, when a setting names one.
+    pub runtime_dir: Option<PathBuf>,
+    /// The project settings file named in place of the one beside the
+    /// code.
+    pub file: Option<PathBuf>,
+}
+
+/// The settings a command takes: each flag, else what `serve` would use,
+/// from the project settings file `serve` would read.
+pub fn command_settings(
+    chdir: Option<&Path>,
+    config: Option<&Path>,
+    python: Option<&str>,
+    runtime_dir: Option<&Path>,
+    read: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<CommandSettings> {
+    let project = chdir
+        .map(Path::to_path_buf)
+        .or_else(|| read("MURU_SERVE_CHDIR").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let file = settings_file(config, &read);
+    let table = muru_config::load_settings(&project, file.as_deref())?;
+    let mut layered = below_flags(table.as_ref(), &read)?;
+    let mut flags = BTreeMap::new();
+
+    if let Some(python) = python {
+        flags.insert("python", Value::Text(python.to_owned()));
+    }
+
+    if let Some(dir) = runtime_dir {
+        flags.insert("runtime_dir", Value::Text(dir.display().to_string()));
+    }
+
+    layered.over(flags, "command line");
+
+    Ok(CommandSettings {
+        python: python_setting(&layered, &project, &read),
+        runtime_dir: layered.text("runtime_dir").map(PathBuf::from),
+        project,
+        file,
+    })
 }
 
 /// Lay the settings, check them, and turn them into `muructl run`'s
@@ -559,34 +684,9 @@ fn prepare(
         _ => chdir.clone().unwrap_or_else(|| PathBuf::from(".")),
     };
 
-    let mut layered = Layered::default();
-    let table = muru_config::load_project(&project)?;
-
-    if let Some((path, tool)) = &table
-        && let Some(serve) = &tool.serve
-    {
-        layered.over(from_table(serve), &format!("[serve] in {}", path.display()));
-    }
-
-    let config = args
-        .config
-        .clone()
-        .or_else(|| read("MURU_SERVE_CONFIG").map(PathBuf::from));
-
-    if let Some(path) = &config {
-        let file = muru_config::load_serve_file(path).map_err(|error| anyhow::anyhow!(error))?;
-        layered.over(from_table(&file), &path.display().to_string());
-    }
-
-    let mut environment = from_environment(&read)?;
-
-    if !environment.contains_key("run_dir")
-        && let Some(dir) = read("MURU_RUN_DIR")
-    {
-        environment.insert("run_dir", Value::Text(dir));
-    }
-
-    layered.over(environment, "environment");
+    let file = settings_file(args.config.as_deref(), &read);
+    let table = muru_config::load_settings(&project, file.as_deref())?;
+    let mut layered = below_flags(table.as_ref(), &read)?;
     layered.over(from_flags(args), "command line");
 
     // An entrypoint from a layer is the argument, unless the argument is
@@ -809,44 +909,122 @@ fn prepare(
     // Section 13.9: the image contract's interpreter, /app/.venv among
     // the places muructl run looks, when nothing nearer names one.
 
-    let python = layered.text("python").map(str::to_owned).or_else(|| {
-        let app_venv = Path::new("/app/.venv/bin/python");
-        let nearer = read("VIRTUAL_ENV").is_some() || project.join(".venv").is_dir();
-        (!nearer && app_venv.exists()).then(|| app_venv.display().to_string())
-    });
-
-    if let Some(python) = python {
+    if let Some(python) = python_setting(&layered, &project, &read) {
         argv.extend(["--python".to_owned(), python]);
     }
 
-    let run_args = RunOnly::try_parse_from(&argv)
+    let mut run_args = RunOnly::try_parse_from(&argv)
         .map(|parsed| parsed.args)
         .map_err(|error| anyhow::anyhow!("{}", error.to_string().trim()))?;
+    run_args.settings_file = file;
     Ok((run_args, mode, layered))
 }
 
-/// `--print-config`: every setting given, with where it came from, and
-/// what `serve` works out.
-fn print_config(layered: &Layered, mode: &Mode) {
-    for (key, (value, source)) in &layered.values {
-        println!("{key} = {value}    # {source}");
+/// The application's settings among serve's keys, which the report
+/// writes at the top level, where the project's file has them.
+const APPLICATION_KEYS: &[&str] = &[
+    "entrypoint",
+    "interface",
+    "factory",
+    "processes",
+    "threads",
+    "sync_threads",
+    "concurrency",
+    "preload",
+    "hooks",
+    "max_requests",
+    "max_lifetime",
+];
+
+/// Serve's keys whose values are numbers, which a layer holds as text.
+const NUMBER_KEYS: &[&str] = &[
+    "min_ready",
+    "max_connections",
+    "max_connections_per_client",
+    "max_requests_per_connection",
+];
+
+/// `--print-config`: what serve's layers add to the report of the
+/// settings that would be used. Each of serve's own settings is written
+/// with where it came from, or its default when it has one, and what
+/// serve worked out from the container follows.
+fn report(layered: &Layered, mode: &Mode) -> crate::print_config::Serve {
+    use crate::print_config::Row;
+
+    let defaults: BTreeMap<&str, toml::Value> = [
+        ("listen", DEFAULT_LISTEN.into()),
+        ("admin_listen", DEFAULT_ADMIN_LISTEN.into()),
+        ("admin_status", false.into()),
+        ("min_ready", 1.into()),
+        ("compression", true.into()),
+        ("access_log", "on".into()),
+        ("slow", "1s".into()),
+        ("log_format", "text".into()),
+        ("timestamps", false.into()),
+        ("run_dir", DEFAULT_RUN_DIR.into()),
+        ("runtime_dir", DEFAULT_RUNTIME_DIR.into()),
+        (
+            "spool_quota",
+            muru_config::format_size(DEFAULT_SPOOL_QUOTA).into(),
+        ),
+        ("shutdown_delay", "0s".into()),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut rows = Vec::new();
+
+    for (key, _) in KEYS {
+        if APPLICATION_KEYS.contains(key) {
+            continue;
+        }
+
+        // The table says compression = true where the flag says
+        // --no-compression.
+
+        let name = if *key == "no_compression" {
+            "compression"
+        } else {
+            key
+        };
+
+        let row = match layered.values.get(key) {
+            Some((value, source)) => {
+                let value = match value {
+                    Value::Flag(on) if *key == "no_compression" => toml::Value::Boolean(!on),
+                    Value::Flag(on) => toml::Value::Boolean(*on),
+                    Value::List(items) => items.clone().into(),
+                    Value::Text(text) => match text.parse::<i64>() {
+                        Ok(number) if NUMBER_KEYS.contains(key) => number.into(),
+                        _ => text.clone().into(),
+                    },
+                };
+
+                Row::new(name, value, source)
+            }
+            None => defaults
+                .get(name)
+                .and_then(|value| Row::new(name, value, "default")),
+        };
+
+        rows.extend(row);
     }
 
-    println!(
-        "# admin port {}, run directory {}, runtime library {}, {} lines, spool quota {} bytes, \
-         {} processes unless set, {}",
-        mode.admin_listen
-            .map_or_else(|| "off".to_owned(), |address| address.to_string()),
-        mode.run_dir.display(),
-        mode.runtime_dir.display(),
-        if mode.json { "json" } else { "text" },
-        mode.spool_quota,
-        mode.default_processes,
-        mode.shutdown.describe()
-    );
+    let mut trailer = vec![mode.shutdown.describe()];
+    trailer.extend(mode.sizing.iter().cloned());
 
-    for line in &mode.sizing {
-        println!("# {line}");
+    crate::print_config::Serve {
+        rows,
+        set: APPLICATION_KEYS
+            .iter()
+            .filter_map(|key| {
+                layered
+                    .values
+                    .get(key)
+                    .map(|(_, source)| (*key, source.clone()))
+            })
+            .collect(),
+        trailer,
     }
 }
 
@@ -901,6 +1079,24 @@ pub fn group_writable(dir: &Path) {
     let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o770));
 }
 
+/// The runtime library the interpreter's own environment holds, when it
+/// is muructl's version, which needs nothing put on PYTHONPATH.
+pub fn environment_library(python: &muru_provision::Resolved) -> Option<muru_provision::Provided> {
+    let version = muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION"));
+
+    python
+        .probe
+        .muru
+        .as_ref()
+        .filter(|found| found.version == version)
+        .map(|_| muru_provision::Provided {
+            pythonpath: None,
+            version,
+            how: muru_provision::runtime::How::Environment,
+            notes: Vec::new(),
+        })
+}
+
 /// Section 13.9: the runtime library, from the environment when it
 /// matches muructl's version, else from the image's runtime directory,
 /// and never fetched.
@@ -908,18 +1104,11 @@ pub fn runtime_library(
     python: &muru_provision::Resolved,
     runtime_dir: &Path,
 ) -> anyhow::Result<muru_provision::Provided> {
-    let version = muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION"));
-
-    if let Some(found) = &python.probe.muru
-        && found.version == version
-    {
-        return Ok(muru_provision::Provided {
-            pythonpath: None,
-            version,
-            how: muru_provision::runtime::How::Environment,
-            notes: Vec::new(),
-        });
+    if let Some(own) = environment_library(python) {
+        return Ok(own);
     }
+
+    let version = muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION"));
 
     let package = runtime_dir.join("muru");
     let installed = std::fs::read_dir(runtime_dir)
@@ -1033,6 +1222,59 @@ mod tests {
     }
 
     #[test]
+    fn a_command_finds_its_settings_where_serve_does() {
+        let dir = tempfile::tempdir().expect("a directory");
+        std::fs::write(
+            dir.path().join("muru.toml"),
+            "entrypoint = 'app:application'\n[serve]\npython = '/table/python'\n\
+             runtime_dir = '/table/runtime'\n",
+        )
+        .expect("the project file");
+        let project = dir.path().display().to_string();
+        let environment = |name: &str| match name {
+            "MURU_SERVE_CHDIR" => Some(project.clone()),
+            "MURU_SERVE_PYTHON" => Some("/env/python".to_owned()),
+            "VIRTUAL_ENV" => Some("/venv".to_owned()),
+            _ => None,
+        };
+
+        // The environment over the project's serve table, and a flag
+        // over both.
+
+        let settings = command_settings(None, None, None, None, environment).expect("settings");
+        assert_eq!(settings.project, dir.path());
+        assert_eq!(settings.python.as_deref(), Some("/env/python"));
+        assert_eq!(
+            settings.runtime_dir.as_deref(),
+            Some(Path::new("/table/runtime"))
+        );
+
+        let flagged = command_settings(
+            Some(dir.path()),
+            None,
+            Some("/flag/python"),
+            Some(Path::new("/flag/runtime")),
+            environment,
+        )
+        .expect("settings");
+        assert_eq!(flagged.python.as_deref(), Some("/flag/python"));
+        assert_eq!(
+            flagged.runtime_dir.as_deref(),
+            Some(Path::new("/flag/runtime"))
+        );
+
+        // Nothing set leaves both to be found as a run finds them.
+
+        let bare = tempfile::tempdir().expect("a directory");
+        let unset = command_settings(Some(bare.path()), None, None, None, |name: &str| {
+            (name == "VIRTUAL_ENV").then(|| "/venv".to_owned())
+        })
+        .expect("settings");
+        assert_eq!(unset.python, None);
+        assert_eq!(unset.runtime_dir, None);
+    }
+
+    #[test]
     fn flags_win_over_the_environment_and_the_environment_over_defaults() {
         let args = parse(&["app:application", "--threads", "8"]);
         let environment = |name: &str| match name {
@@ -1048,7 +1290,7 @@ mod tests {
             layered.values["threads"],
             (Value::Text("8".into()), "command line".into())
         );
-        assert_eq!(layered.values["listen"].1, "environment");
+        assert_eq!(layered.values["listen"].1, "MURU_SERVE_LISTEN");
         assert_eq!(
             layered.list("access_log_exclude"),
             ["/healthz".to_owned(), "/static/*".to_owned()]

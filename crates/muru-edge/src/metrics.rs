@@ -162,22 +162,17 @@ pub const FAMILIES: &[Family] = &[
     Family {
         name: "muru_slots_busy",
         kind: Kind::Gauge,
-        help: "Worker slots handling a request.",
+        help: "Worker slots holding a request, by side: threads, or the event loop.",
     },
     Family {
         name: "muru_slots_total",
         kind: Kind::Gauge,
-        help: "Worker slots across the workers: threads, or the event loop's concurrency.",
-    },
-    Family {
-        name: "muru_async_slots_busy",
-        kind: Kind::Gauge,
-        help: "Requests held on the event loops of ASGI workers.",
+        help: "Worker slots across the workers, by side: threads, or the event loop's concurrency.",
     },
     Family {
         name: "muru_capacity_utilisation",
         kind: Kind::Gauge,
-        help: "Busy worker slots over the slots, averaged over the last 30 seconds.",
+        help: "Busy worker slots over the slots, of the busier side, averaged over the last 30 seconds.",
     },
     Family {
         name: "muru_upstream_health",
@@ -210,6 +205,16 @@ pub const FAMILIES: &[Family] = &[
         help: "Requests a worker has served since it started, as it last reported.",
     },
     Family {
+        name: "muru_worker_sync_threads_busy",
+        kind: Kind::Gauge,
+        help: "Threads of a worker's pool for synchronous code running a call, as it last reported.",
+    },
+    Family {
+        name: "muru_worker_sync_threads",
+        kind: Kind::Gauge,
+        help: "Threads in a worker's pool for synchronous code.",
+    },
+    Family {
         name: "muru_worker_requests_in_flight",
         kind: Kind::Gauge,
         help: "Requests a worker was serving when it last reported.",
@@ -223,6 +228,11 @@ pub const FAMILIES: &[Family] = &[
         name: "muru_worker_memory_bytes",
         kind: Kind::Gauge,
         help: "A worker's memory as it last reported it, by measure: rss, pss or uss.",
+    },
+    Family {
+        name: "muru_handoff_queue_wait_seconds",
+        kind: Kind::Histogram,
+        help: "How long requests handed from ASGI to WSGI waited for a thread.",
     },
     Family {
         name: "muru_gil_wait_seconds",
@@ -838,15 +848,23 @@ const UTILISATION_WINDOW: usize = 30;
 /// second and averaged over the last `UTILISATION_WINDOW`, a saturation
 /// signal for an autoscaler that the moment of a scrape cannot give: an
 /// I/O-bound application waiting on its database shows little CPU while
-/// its slots are full. One edge runs in a process, so one record serves.
+/// its slots are full. A group whose workers have threads and an event
+/// loop is sampled on each side and reported as its busier side, the
+/// one that runs out first. One edge runs in a process, so one record
+/// serves.
 pub static UTILISATION: Utilisation = Utilisation {
     windows: Mutex::new(BTreeMap::new()),
 };
 
-/// The recent busy and total slots of each group.
+/// The recent busy and total slots of each group, on its threads and on
+/// its event loop.
 pub struct Utilisation {
-    windows: Mutex<BTreeMap<GroupKey, Vec<(usize, usize)>>>,
+    windows: Mutex<BTreeMap<GroupKey, Vec<Sides>>>,
 }
+
+/// One second's sample of a group: the slots and the busy slots of its
+/// workers' threads, then of their event loops.
+type Sides = [(usize, usize); 2];
 
 /// A group by its application, release and name.
 type GroupKey = (String, String, String);
@@ -867,8 +885,14 @@ impl Utilisation {
 
             for (group, pool) in pools.pools() {
                 let workers = pool.workers();
-                let busy = workers.iter().map(|worker| worker.in_flight).sum();
-                let slots = workers.iter().map(|worker| worker.slots).sum();
+                let threads = (
+                    workers.iter().map(|worker| worker.threads).sum(),
+                    workers.iter().map(|worker| worker.threads_busy).sum(),
+                );
+                let event_loop = (
+                    workers.iter().map(|worker| worker.loop_slots).sum(),
+                    workers.iter().map(|worker| worker.loop_busy).sum(),
+                );
                 let key = (app.to_owned(), release.to_owned(), group.clone());
                 let mut window = windows.remove(&key).unwrap_or_default();
 
@@ -876,7 +900,7 @@ impl Utilisation {
                     window.remove(0);
                 }
 
-                window.push((busy, slots));
+                window.push([threads, event_loop]);
                 seen.insert(key, window);
             }
         }
@@ -891,8 +915,12 @@ impl Utilisation {
         windows
             .iter()
             .map(|((app, release, group), window)| {
-                let busy: usize = window.iter().map(|(busy, _)| busy).sum();
-                let slots: usize = window.iter().map(|(_, slots)| slots).sum();
+                let (slots, busy) = crate::link::busier((0..2).map(|side| {
+                    (
+                        window.iter().map(|sample| sample[side].0).sum::<usize>(),
+                        window.iter().map(|sample| sample[side].1).sum::<usize>(),
+                    )
+                }));
 
                 let ratio = if slots == 0 {
                     0.0
@@ -941,29 +969,39 @@ pub fn pool_samples(routing: &Routing) -> Vec<Sample> {
                 &labels,
                 pool.waiting() as f64,
             ));
-            samples.push(Sample::new(
-                "muru_slots_busy",
-                &labels,
-                workers.iter().map(|worker| worker.in_flight).sum::<usize>() as f64,
-            ));
-            samples.push(Sample::new(
-                "muru_slots_total",
-                &labels,
-                workers.iter().map(|worker| worker.slots).sum::<usize>() as f64,
-            ));
 
-            // An ASGI worker holds every request it has on its loop; a
-            // WSGI worker's are on its threads.
+            // Section 5.1: a request is held against the side that runs
+            // it, so a group has a series for each side its workers have,
+            // the threads first.
 
-            samples.push(Sample::new(
-                "muru_async_slots_busy",
-                &labels,
-                workers
-                    .iter()
-                    .filter(|worker| worker.worker_type == "asgi")
-                    .map(|worker| worker.in_flight)
-                    .sum::<usize>() as f64,
-            ));
+            let mut sides = [
+                (crate::link::SIDE_THREADS, 0, 0),
+                (crate::link::SIDE_LOOP, 0, 0),
+            ];
+
+            for (side, slots, busy) in workers.iter().flat_map(|worker| worker.sides()) {
+                let entry = sides
+                    .iter_mut()
+                    .find(|(name, _, _)| *name == side)
+                    .expect("a side is the threads or the loop");
+                entry.1 += slots;
+                entry.2 += busy;
+            }
+
+            for (side, slots, busy) in sides {
+                if slots == 0 {
+                    continue;
+                }
+
+                let labels = [
+                    ("app", app),
+                    ("release", release),
+                    ("group", group.as_str()),
+                    ("side", side),
+                ];
+                samples.push(Sample::new("muru_slots_busy", &labels, busy as f64));
+                samples.push(Sample::new("muru_slots_total", &labels, slots as f64));
+            }
         }
     }
 
@@ -1200,6 +1238,9 @@ mod tests {
             app: "shop".to_owned(),
             release: "r1".to_owned(),
             host: "shop.example.com".to_owned(),
+            virtual_host: "shop".to_owned(),
+            referer: None,
+            user_agent: None,
             group: "default".to_owned(),
             mount: "default".to_owned(),
             snapshot: 3,

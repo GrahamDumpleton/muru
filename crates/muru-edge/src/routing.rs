@@ -29,6 +29,8 @@ use crate::upstream::Upstream;
 pub struct Host {
     /// The host's name in the configuration.
     pub name: String,
+    /// The same, shared with the requests the host takes.
+    pub label: Arc<str>,
     /// The listener addresses it answers on; every listener when empty.
     pub listeners: Vec<String>,
     /// Plain HTTP requests are redirected to HTTPS.
@@ -40,6 +42,20 @@ pub struct Host {
     /// The rate limits every request for the host draws from (section
     /// 4.15).
     pub rate_limits: Vec<Arc<crate::ratelimit::Limit>>,
+    /// The limits of a request for the host's routes (section 4.6).
+    pub limits: crate::RequestLimits,
+    /// The compression policy for the host's routes (section 4.17), when
+    /// the host sets any of it: the node's with the host's laid over.
+    pub compression: Option<Arc<crate::compression::Compression>>,
+    /// The host's rules for request headers (section 4.7).
+    pub request_headers: Option<Arc<crate::headers::Rules>>,
+    /// The host's rules for response headers.
+    pub response_headers: Option<Arc<crate::headers::Rules>>,
+    /// The host's maintenance mode (section 4.12), when it is on.
+    pub maintenance: Option<Arc<Maintenance>>,
+    /// The name requests for the host's other names are redirected to,
+    /// when the host redirects them.
+    pub canonical: Option<String>,
 }
 
 /// Maintenance mode for an application (section 4.12): the edge answers
@@ -126,8 +142,18 @@ struct Route {
     auth: Option<Arc<crate::auth::Auth>>,
     /// How uploads are received before dispatch (section 4.11).
     upload: Option<Arc<crate::uploads::Policy>>,
-    /// The route's body limit, in place of the edge's (section 4.6).
-    max_body_size: Option<u64>,
+    /// The limits of the route's requests, over the host's (section
+    /// 4.6).
+    limits: crate::RequestLimits,
+    /// The compression policy for the route's responses (section 4.17),
+    /// when the route sets any of it: the host's with the route's laid
+    /// over.
+    compression: Option<Arc<crate::compression::Compression>>,
+    /// The route's rules for request headers (section 4.7), applied
+    /// after the host's.
+    request_headers: Option<Arc<crate::headers::Rules>>,
+    /// The route's rules for response headers, applied after the host's.
+    response_headers: Option<Arc<crate::headers::Rules>>,
     /// The rate limits the route's requests draw from after the host's
     /// (section 4.15).
     rate_limits: Vec<Arc<crate::ratelimit::Limit>>,
@@ -228,6 +254,9 @@ pub struct GroupSockets {
     pub methods: Vec<String>,
     /// Its workers.
     pub sockets: Vec<std::path::PathBuf>,
+    /// The group's own limits on a request (section 4.6), over its
+    /// release's.
+    pub limits: crate::RequestLimits,
 }
 
 /// A named mount of a release, as a snapshot or a development run names it.
@@ -248,6 +277,9 @@ pub struct MountPath {
     pub cgi_local_redirect: bool,
     /// The file hints by path the mount may give (section 4.9).
     pub sendfile: Arc<Sendfile>,
+    /// The mount's own limits on a request (section 4.6), over its
+    /// group's and its release's.
+    pub limits: crate::RequestLimits,
 }
 
 /// A directory of a release's own files (section 4.9), served under a
@@ -292,6 +324,9 @@ pub struct Selection {
     /// The origins that may call the release through gRPC-Web (section
     /// 6.13).
     pub grpc_web: Arc<crate::grpc::WebOrigins>,
+    /// The limits on a request of what serves it (section 4.6): the
+    /// mount's over the worker group's over the release's.
+    pub limits: crate::RequestLimits,
 }
 
 /// What a request brings to the release choice (section 9.4): its
@@ -534,6 +569,7 @@ fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
         upstream: Some(Arc::clone(upstream)),
         grpc_web: Arc::default(),
         static_path: None,
+        limits: crate::RequestLimits::default(),
     }
 }
 
@@ -663,6 +699,10 @@ pub struct AppPools {
     server: Option<Arc<Upstream>>,
     /// Section 6.13: the origins that may call it through gRPC-Web.
     grpc_web: Arc<crate::grpc::WebOrigins>,
+    /// The release's own limits on a request (section 4.6), which the
+    /// default group's requests have and a named group's or a mount's own
+    /// are laid over.
+    limits: crate::RequestLimits,
 }
 
 /// A path that selects a worker group (section 7.1).
@@ -679,6 +719,8 @@ struct GroupPath {
     name: String,
     /// Its workers.
     pool: Arc<LinkPool>,
+    /// The group's own limits on a request (section 4.6).
+    limits: crate::RequestLimits,
 }
 
 impl GroupPath {
@@ -774,6 +816,7 @@ impl AppPools {
                     methods: group.methods.clone(),
                     name: group.name.clone(),
                     pool: Arc::clone(&pool),
+                    limits: group.limits,
                 });
             }
         }
@@ -803,6 +846,7 @@ impl AppPools {
                 accel_redirect: mount.accel_redirect,
                 cgi_local_redirect: mount.cgi_local_redirect,
                 sendfile: Arc::clone(&mount.sendfile),
+                limits: mount.limits,
             })
             .collect();
         mounts.sort_by_key(|mount| std::cmp::Reverse(mount.path.len()));
@@ -820,6 +864,7 @@ impl AppPools {
             maintenance: None,
             server: None,
             grpc_web: Arc::default(),
+            limits: crate::RequestLimits::default(),
         })
     }
 
@@ -838,6 +883,7 @@ impl AppPools {
             maintenance: None,
             server: None,
             grpc_web: Arc::default(),
+            limits: crate::RequestLimits::default(),
         }
     }
 
@@ -882,6 +928,22 @@ impl AppPools {
         self
     }
 
+    /// The same pools with the release's own limits on a request
+    /// (section 4.6).
+    pub fn with_limits(mut self, limits: crate::RequestLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// The request deadlines the release and its groups set, for the
+    /// longest in force.
+    fn deadlines(&self) -> impl Iterator<Item = std::time::Duration> + '_ {
+        std::iter::once(self.limits)
+            .chain(self.groups.iter().map(|group| group.limits))
+            .chain(self.mounts.iter().map(|mount| mount.limits))
+            .filter_map(|limits| limits.request_deadline)
+    }
+
     /// The same pools in maintenance mode, or out of it.
     pub fn with_maintenance(mut self, maintenance: Option<Arc<Maintenance>>) -> Self {
         self.maintenance = maintenance;
@@ -916,18 +978,25 @@ impl AppPools {
                 upstream: Some(Arc::clone(server)),
                 grpc_web: Arc::default(),
                 static_path: None,
+                limits: self.limits,
             });
         }
 
         let carried = client.host.map(normalise);
-        let (group, pool) = self
+        let (group, pool, group_limits) = self
             .groups
             .iter()
             .find(|group| {
                 prefix_matches(&group.prefix, path) && group.takes(client, carried.as_deref())
             })
-            .map(|group| (group.name.clone(), Arc::clone(&group.pool)))
-            .unwrap_or_else(|| (DEFAULT_GROUP.to_owned(), Arc::clone(&self.default)));
+            .map(|group| (group.name.clone(), Arc::clone(&group.pool), group.limits))
+            .unwrap_or_else(|| {
+                (
+                    DEFAULT_GROUP.to_owned(),
+                    Arc::clone(&self.default),
+                    crate::RequestLimits::default(),
+                )
+            });
         let mount = self
             .mounts
             .iter()
@@ -977,6 +1046,10 @@ impl AppPools {
             upstream: None,
             grpc_web: Arc::clone(&self.grpc_web),
             static_path,
+            limits: mount
+                .map_or_else(crate::RequestLimits::default, |mount| mount.limits)
+                .or(group_limits)
+                .or(self.limits),
         })
     }
 
@@ -1115,6 +1188,26 @@ pub struct Routing {
     /// Section 6.13: the listeners that limit cleartext HTTP/2 to some
     /// clients.
     h2c: HashMap<SocketAddr, crate::proxy::Networks>,
+    /// Section 4.7: the listeners with proxy settings of their own, in
+    /// place of the node's for their connections.
+    listener_trust: HashMap<SocketAddr, Trust>,
+    /// Whether any host or route has compression settings or header
+    /// rules of its own.
+    sites_vary: bool,
+}
+
+/// What the virtual host and the route a client's request names set for
+/// it besides where it goes.
+#[derive(Debug, Clone, Copy)]
+pub struct Site<'a> {
+    /// The compression policy (section 4.17): the route's own over its
+    /// host's over the node's.
+    pub compression: &'a crate::compression::Compression,
+    /// The rules for request headers (section 4.7): the host's, then
+    /// the route's.
+    pub request_headers: [Option<&'a crate::headers::Rules>; 2],
+    /// The rules for response headers: the host's, then the route's.
+    pub response_headers: [Option<&'a crate::headers::Rules>; 2],
 }
 
 /// Where a request goes.
@@ -1133,8 +1226,9 @@ pub enum Decision {
         auth: Option<Arc<crate::auth::Auth>>,
         /// How the route's uploads are received (section 4.11).
         upload: Option<Arc<crate::uploads::Policy>>,
-        /// The route's body limit, in place of the edge's (section 4.6).
-        max_body_size: Option<u64>,
+        /// The route's limits on the request over its host's (section
+        /// 4.6).
+        request_limits: crate::RequestLimits,
         /// The host's and the route's rate limits (section 4.15).
         limits: Vec<Arc<crate::ratelimit::Limit>>,
         /// The methods the route refuses.
@@ -1142,8 +1236,20 @@ pub enum Decision {
         /// The route's site mode.
         mode: Option<Arc<str>>,
     },
-    /// Redirected to HTTPS: the host insists on it.
-    Redirect,
+    /// Redirected: to HTTPS when the host insists on it, to the host's
+    /// canonical name when the request named another, or both at once.
+    Redirect {
+        /// To HTTPS.
+        https: bool,
+        /// To this name.
+        canonical: Option<String>,
+    },
+    /// The host is in maintenance mode (section 4.12) and the request is
+    /// not one its exemptions let through (503).
+    Maintenance {
+        /// The Retry-After the page carries, in seconds.
+        retry_after: u32,
+    },
     /// No virtual host answers to that name on this listener (421).
     Misdirected,
     /// The host has no route for the path (404).
@@ -1173,6 +1279,9 @@ pub enum Decision {
         cookies: Vec<String>,
         /// The check the route asks for first (section 4.16).
         auth: Option<Arc<crate::auth::Auth>>,
+        /// The route's limits on the request over its host's (section
+        /// 4.6), for what the fallback serves.
+        request_limits: crate::RequestLimits,
         /// The host's and the route's rate limits (section 4.15).
         limits: Vec<Arc<crate::ratelimit::Limit>>,
     },
@@ -1185,6 +1294,17 @@ impl Decision {
         match self {
             Self::Serve { limits, .. } | Self::Static { limits, .. } => limits,
             _ => &[],
+        }
+    }
+
+    /// The limits the route sets on the request, over its host's
+    /// (section 4.6); nothing where no route serves it.
+    pub fn request_limits(&self) -> crate::RequestLimits {
+        match self {
+            Self::Serve { request_limits, .. } | Self::Static { request_limits, .. } => {
+                *request_limits
+            }
+            _ => crate::RequestLimits::default(),
         }
     }
 }
@@ -1216,6 +1336,8 @@ impl Routing {
             default_policy: None,
             default_app: None,
             h2c: HashMap::new(),
+            listener_trust: HashMap::new(),
+            sites_vary: false,
         }
     }
 
@@ -1284,6 +1406,7 @@ impl Routing {
             .await?
             .with_errors(Arc::new(errors))
             .with_maintenance(maintenance)
+            .with_limits(crate::RequestLimits::from_message(app.limits.as_ref()))
             .with_sendfile(Sendfile::new(&app.sendfile_roots, &app.sendfile_header))
             .with_waking(&app.waking_groups)
             .with_grpc_web(&app.grpc_web_origins)
@@ -1416,6 +1539,18 @@ impl Routing {
             h2c.insert(listener, networks);
         }
 
+        let mut listener_trust = HashMap::new();
+
+        for own in &snapshot.listener_proxies {
+            let listener: SocketAddr = own
+                .listener
+                .parse()
+                .map_err(|_| anyhow::anyhow!("proxy: {:?} is not IP:PORT", own.listener))?;
+            let trust = Trust::from_snapshot(&own.proxy.clone().unwrap_or_default())
+                .map_err(|error| anyhow::anyhow!("listener {listener}: proxy: {error}"))?;
+            listener_trust.insert(listener, trust);
+        }
+
         // Section 5.1: a worker that could not be connected to is reported
         // rather than refusing the snapshot.
 
@@ -1463,6 +1598,8 @@ impl Routing {
             default_policy,
             default_app: default_name,
             h2c,
+            listener_trust,
+            sites_vary: false,
         };
 
         for host in &snapshot.hosts {
@@ -1493,11 +1630,37 @@ impl Routing {
             };
             routing.hosts.push(Host {
                 name: host.name.clone(),
+                label: Arc::from(host.name.as_str()),
                 listeners: host.listeners.clone(),
                 https_redirect: host.https_redirect,
                 server_name,
                 errors: Arc::new(errors),
                 rate_limits: named_limits(&host.rate_limits, &format!("host {}", host.name)),
+                limits: crate::RequestLimits::from_message(host.limits.as_ref()),
+                compression: host
+                    .compression
+                    .as_ref()
+                    .map(|choice| routing.compression.with(choice))
+                    .transpose()
+                    .map_err(|error| anyhow::anyhow!("host {}: compression: {error}", host.name))?
+                    .map(Arc::new),
+                canonical: (host.canonical_redirect && !host.canonical.is_empty())
+                    .then(|| normalise(&host.canonical)),
+                maintenance: host
+                    .maintenance
+                    .as_ref()
+                    .map(Maintenance::from_message)
+                    .transpose()
+                    .map_err(|error| anyhow::anyhow!("host {}: {error}", host.name))?
+                    .flatten()
+                    .map(Arc::new),
+                request_headers: crate::headers::rules_of(host.request_headers.as_ref()).map_err(
+                    |error| anyhow::anyhow!("host {}: request_headers: {error}", host.name),
+                )?,
+                response_headers: crate::headers::rules_of(host.response_headers.as_ref())
+                    .map_err(|error| {
+                        anyhow::anyhow!("host {}: response_headers: {error}", host.name)
+                    })?,
             });
             routing.routes.push(Vec::new());
         }
@@ -1544,7 +1707,41 @@ impl Routing {
                         anyhow::anyhow!("route {} {}: {error}", route.host, route.path)
                     })?
                     .map(Arc::new);
+                let compression = route
+                    .compression
+                    .as_ref()
+                    .map(|choice| {
+                        routing.hosts[index]
+                            .compression
+                            .as_deref()
+                            .unwrap_or(&routing.compression)
+                            .with(choice)
+                    })
+                    .transpose()
+                    .map_err(|error| {
+                        anyhow::anyhow!("route {} {}: compression: {error}", route.host, route.path)
+                    })?
+                    .map(Arc::new);
+                let request_headers = crate::headers::rules_of(route.request_headers.as_ref())
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "route {} {}: request_headers: {error}",
+                            route.host,
+                            route.path
+                        )
+                    })?;
+                let response_headers = crate::headers::rules_of(route.response_headers.as_ref())
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "route {} {}: response_headers: {error}",
+                            route.host,
+                            route.path
+                        )
+                    })?;
                 routing.routes[index].push(Route {
+                    compression,
+                    request_headers,
+                    response_headers,
                     path: route.path.clone(),
                     classes: route.client_classes.clone(),
                     app: route.app.clone(),
@@ -1561,7 +1758,7 @@ impl Routing {
                         .upload
                         .as_ref()
                         .and_then(crate::uploads::Policy::from_message),
-                    max_body_size: (route.max_body_size > 0).then_some(route.max_body_size),
+                    limits: crate::RequestLimits::from_message(route.limits.as_ref()),
                     rate_limits: named_limits(
                         &route.rate_limits,
                         &format!("route {} {}", route.host, route.path),
@@ -1574,6 +1771,16 @@ impl Routing {
                 });
             }
         }
+
+        routing.sites_vary = routing.hosts.iter().any(|host| {
+            host.compression.is_some()
+                || host.request_headers.is_some()
+                || host.response_headers.is_some()
+        }) || routing.routes.iter().flatten().any(|route| {
+            route.compression.is_some()
+                || route.request_headers.is_some()
+                || route.response_headers.is_some()
+        });
 
         // Section 4.14: of routes with the same path, those for client
         // classes come before the one for every request.
@@ -1670,9 +1877,11 @@ impl Routing {
         Chain::new(levels)
     }
 
-    /// Which peers may speak for the client (section 4.7).
-    pub fn trust(&self) -> &Trust {
-        &self.trust
+    /// Which peers may speak for the client (section 4.7) on the
+    /// listener at `local`: the listener's own settings when it has
+    /// them, else the node's.
+    pub fn trust_on(&self, local: &SocketAddr) -> &Trust {
+        self.listener_trust.get(local).unwrap_or(&self.trust)
     }
 
     /// Section 6.13: whether a client may speak HTTP/2 in cleartext on
@@ -1686,6 +1895,66 @@ impl Routing {
     /// How responses are compressed (section 4.17).
     pub fn compression(&self) -> &crate::compression::Compression {
         &self.compression
+    }
+
+    /// The longest request deadline in force (section 4.6): the node's,
+    /// or a virtual host's, a route's, a release's or a worker group's
+    /// own when one is longer, which is
+    /// how long an edge that stops gives its requests to finish.
+    pub fn longest_deadline(&self, node: std::time::Duration) -> std::time::Duration {
+        self.hosts
+            .iter()
+            .map(|host| host.limits)
+            .chain(self.routes.iter().flatten().map(|route| route.limits))
+            .filter_map(|limits| limits.request_deadline)
+            .chain(
+                self.app_pools()
+                    .iter()
+                    .flat_map(|pools| pools.deadlines().collect::<Vec<_>>()),
+            )
+            .fold(node, std::time::Duration::max)
+    }
+
+    /// What the host and the route a client's request names set for it
+    /// (sections 4.7 and 4.17), by the host the request named and its
+    /// path: the node's alone where no host takes it, and the host's
+    /// where no route does.
+    pub fn site(&self, name: Option<&str>, path: &str, class: &str, listener: &str) -> Site<'_> {
+        let node = Site {
+            compression: &self.compression,
+            request_headers: [None, None],
+            response_headers: [None, None],
+        };
+
+        // Most nodes set none of it, so no host or route is looked for.
+
+        if !self.sites_vary {
+            return node;
+        }
+
+        let Some(index) = self.host_for(name, listener) else {
+            return node;
+        };
+
+        let host = &self.hosts[index];
+        let route = self.routes[index]
+            .iter()
+            .find(|route| route.matches(path, class));
+
+        Site {
+            compression: route
+                .and_then(|route| route.compression.as_deref())
+                .or(host.compression.as_deref())
+                .unwrap_or(&self.compression),
+            request_headers: [
+                host.request_headers.as_deref(),
+                route.and_then(|route| route.request_headers.as_deref()),
+            ],
+            response_headers: [
+                host.response_headers.as_deref(),
+                route.and_then(|route| route.response_headers.as_deref()),
+            ],
+        }
     }
 
     /// The same tables with this compression policy, for a development
@@ -1799,12 +2068,12 @@ impl Routing {
 
             return match selection {
                 Some(selection) => Decision::Serve {
+                    request_limits: selection.limits,
                     selection,
                     server_name: None,
                     cookies,
                     auth: None,
                     upload: None,
-                    max_body_size: None,
                     limits: Vec::new(),
                     methods: None,
                     mode: None,
@@ -1833,8 +2102,33 @@ impl Routing {
             ..*client
         };
 
-        if host.https_redirect && !tls && origin.is_none() {
-            return Decision::Redirect;
+        // Section 4.3: a client's own request is redirected to HTTPS
+        // when the host insists on it, and to the canonical name when
+        // the host redirects its other names there, in one redirect.
+
+        if origin.is_none() {
+            let https = host.https_redirect && !tls;
+            let canonical = host
+                .canonical
+                .as_ref()
+                .filter(|canonical| name.map(normalise).as_ref() != Some(*canonical))
+                .cloned();
+
+            if https || canonical.is_some() {
+                return Decision::Redirect { https, canonical };
+            }
+
+            // Section 4.12: a host in maintenance answers 503 for every
+            // route it has, whatever serves it, except for what its
+            // exemptions let through.
+
+            if let Some(maintenance) = &host.maintenance
+                && !maintenance.exempts(path, client.peer, client.headers)
+            {
+                return Decision::Maintenance {
+                    retry_after: maintenance.retry_after,
+                };
+            }
         }
 
         let Some(route) = self.routes[index]
@@ -1871,6 +2165,9 @@ impl Routing {
                     origin,
                 )
             };
+            let served = fallback
+                .as_ref()
+                .map_or_else(crate::RequestLimits::default, |selection| selection.limits);
             return Decision::Static {
                 route: Arc::clone(static_route),
                 prefix: route.path.clone(),
@@ -1882,6 +2179,7 @@ impl Routing {
                 }),
                 cookies,
                 auth: route.auth.clone(),
+                request_limits: route.limits.or(served).or(host.limits),
                 limits: host
                     .rate_limits
                     .iter()
@@ -1918,12 +2216,12 @@ impl Routing {
         };
 
         Decision::Serve {
-            selection,
             server_name,
             cookies,
             auth: route.auth.clone(),
             upload: route.upload.clone(),
-            max_body_size: route.max_body_size,
+            request_limits: route.limits.or(selection.limits).or(host.limits),
+            selection,
             limits: host
                 .rate_limits
                 .iter()
@@ -2002,8 +2300,21 @@ impl Routing {
                 upstream: None,
                 grpc_web: Arc::default(),
                 static_path: None,
+                limits: crate::RequestLimits::default(),
             }),
         }
+    }
+
+    /// The configured name of the virtual host a request's host selects
+    /// on a listener, as a redirect may name it too; none without one.
+    pub fn host_name(&self, name: Option<&str>, listener: &str) -> Option<Arc<str>> {
+        if self.hosts.is_empty() {
+            return None;
+        }
+
+        self.host_for(name, listener)
+            .or_else(|| name.and_then(|name| self.hosts.iter().position(|host| host.name == name)))
+            .map(|index| Arc::clone(&self.hosts[index].label))
     }
 
     /// The host a name selects on a listener: exact, wildcard, default.
@@ -2067,6 +2378,7 @@ fn mounts_of(app: &pb::AppWorkers) -> Vec<MountPath> {
             accel_redirect: mount.accel_redirect,
             cgi_local_redirect: mount.cgi_local_redirect,
             sendfile: Sendfile::new(&mount.sendfile_roots, &mount.sendfile_header),
+            limits: crate::RequestLimits::from_message(mount.limits.as_ref()),
         })
         .collect()
 }
@@ -2081,6 +2393,7 @@ fn groups_of(app: &pb::AppWorkers) -> Vec<GroupSockets> {
             hosts: group.hosts.clone(),
             methods: group.methods.clone(),
             sockets: paths(&group.sockets),
+            limits: crate::RequestLimits::from_message(group.limits.as_ref()),
         })
         .collect()
 }
@@ -2155,6 +2468,8 @@ mod tests {
             limits: None,
             access_log: None,
             access_log_overrides: Vec::new(),
+            listener_limits: Vec::new(),
+            listener_proxies: Vec::new(),
             worker_sockets: Vec::new(),
             default_app: String::new(),
             default_release: String::new(),
@@ -2256,7 +2571,8 @@ mod tests {
     fn serves(decision: Decision) -> Option<String> {
         match decision {
             Decision::Serve { server_name, .. } => server_name,
-            Decision::Redirect => Some("redirect".to_owned()),
+            Decision::Redirect { .. } => Some("redirect".to_owned()),
+            Decision::Maintenance { .. } => Some("maintenance".to_owned()),
             Decision::Misdirected => Some("421".to_owned()),
             Decision::NoRoute => Some("404".to_owned()),
             Decision::InternalOnly => Some("internal".to_owned()),
@@ -2323,6 +2639,96 @@ mod tests {
             serves(select(&routing, None, "/", plain, false)),
             None,
             "no host header falls to the default host"
+        );
+    }
+
+    #[test]
+    fn a_hosts_limits_and_canonical_name_reach_its_routes() {
+        let mut snapshot = snapshot();
+        snapshot.hosts[1].limits = Some(pb::RequestLimits {
+            max_body_size: 1024,
+            request_deadline_ms: 30_000,
+            ..Default::default()
+        });
+        snapshot.hosts[1].canonical = "WWW.example.com".to_owned();
+        snapshot.hosts[1].canonical_redirect = true;
+        snapshot.routes[2].limits = Some(pb::RequestLimits {
+            max_body_size: 4096,
+            queue_timeout_ms: 2000,
+            ..Default::default()
+        });
+        let routing = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Routing::from_snapshot(&snapshot, None))
+            .unwrap();
+        let plain = "127.0.0.1:8080";
+
+        // The route's limits are laid over its host's, and both over the
+        // node's.
+
+        let limits = select(&routing, Some("www.example.com"), "/", plain, false).request_limits();
+        assert_eq!(
+            limits,
+            crate::RequestLimits {
+                max_body_size: Some(4096),
+                queue_timeout: Some(std::time::Duration::from_secs(2)),
+                request_deadline: Some(std::time::Duration::from_secs(30)),
+                body_idle_timeout: None,
+                response_idle_timeout: None,
+            }
+        );
+        let node = crate::Limits::default();
+        let in_force = limits.over(&node);
+        assert_eq!(in_force.max_body_size, 4096);
+        assert_eq!(
+            in_force.request_deadline,
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(in_force.body_idle_timeout, node.body_idle_timeout);
+        assert_eq!(in_force.max_headers, node.max_headers);
+        assert!(
+            select(&routing, None, "/missing", "127.0.0.1:9", false)
+                .request_limits()
+                .is_empty()
+        );
+
+        // Another of the host's names is redirected to the canonical one;
+        // a host that only insists on HTTPS redirects to nothing else.
+
+        match select(&routing, Some("blog.example.com:8080"), "/", plain, false) {
+            Decision::Redirect { https, canonical } => {
+                assert!(!https);
+                assert_eq!(canonical.as_deref(), Some("www.example.com"));
+            }
+            _ => panic!("not redirected"),
+        }
+
+        match select(&routing, Some("shop.example.com"), "/", plain, false) {
+            Decision::Redirect { https, canonical } => {
+                assert!(https);
+                assert_eq!(canonical, None);
+            }
+            _ => panic!("not redirected"),
+        }
+
+        // An edge that stops waits for the longest deadline any level
+        // sets.
+
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(routing.longest_deadline(second), 30 * second);
+        assert_eq!(routing.longest_deadline(300 * second), 300 * second);
+
+        // A request's host is known by its configured name.
+
+        assert_eq!(
+            routing
+                .host_name(Some("blog.example.com"), plain)
+                .as_deref(),
+            Some("any")
+        );
+        assert_eq!(
+            routing.host_name(Some("other.test"), "127.0.0.1:8443"),
+            None
         );
     }
 

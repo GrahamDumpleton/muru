@@ -100,3 +100,8 @@ Section 11.7 of the design specification; PEP 768; the `_outside` module
 of the runtime library and the host's `stacks_from_outside` and
 `profile_from_outside`; ADR 0025 on the in-process mechanism and ADR 0026
 on who runs as root.
+
+That threads read from outside carry no names but the runtime's is
+superseded by [ADR 0053](0053-threads-read-from-outside-are-named-by-the-kernel.md):
+on Linux the kernel holds the name Python gives each thread, and the
+host reads it for a thread the runtime does not name. The rest stands.

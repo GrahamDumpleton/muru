@@ -68,16 +68,25 @@ def memory_usage() -> dict[str, int] | None:
     """Return the worker's rss, pss and uss in bytes, or None where unmeasured."""
 
 def requests() -> list[dict[str, Any]]:
-    """Return the requests in flight: id, method, path, elapsed ms and thread."""
+    """Return the requests in flight: id, method, path, elapsed ms and threads."""
 
 def suspend_timeouts() -> bool:
     """Take the calling thread's request out of the timeouts while a debugger holds it."""
 
-def submit(job: Callable[[], Any]) -> bool:
-    """Run job on the worker's application thread pool; False when no worker serves here."""
-
 def loop_beat() -> None:
     """Tell the loop stall watchdog that the event loop has run."""
+
+def sync_entered(request_id: str | None = None, pool: int = 0) -> None:
+    """Note that the calling thread of a pool for sync code started a call, for a request."""
+
+def sync_left(request_id: str | None = None, pool: int = 0) -> None:
+    """Note that the calling thread of a pool for sync code finished its call."""
+
+def name_thread(name: str) -> None:
+    """Record the calling thread's name, for a reader from outside the worker."""
+
+def sync_pool(pool: int, threads: int, busy: int | None = None) -> bool:
+    """Say how many threads a pool for sync code has, and how many are busy when sampled."""
 
 def gc_callback(phase: str, info: dict[str, Any]) -> None:
     """Time a collection, for gc.callbacks: start notes the time, stop records it."""

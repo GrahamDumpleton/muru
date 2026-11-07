@@ -30,6 +30,8 @@ from collections.abc import (
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple, NoReturn, TypeVar
 
+from muru import _asgi
+
 try:
     import grpc
 except ImportError as error:  # pragma: no cover - depends on the interpreter
@@ -188,7 +190,9 @@ class Dispatcher:
     def __init__(self, server: Server, threads: int) -> None:
         self.server = server
         self.executor = ThreadPoolExecutor(
-            max_workers=max(1, threads), thread_name_prefix="muru-grpc"
+            max_workers=max(1, threads),
+            thread_name_prefix="muru-grpc",
+            initializer=_asgi._name_thread,
         )
 
     async def __call__(self, scope: MutableMapping[str, Any], receive: Any, send: Any) -> None:

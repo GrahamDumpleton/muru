@@ -26,6 +26,13 @@ moves traffic to it once every worker is ready, and then drains and stops
 the previous one. Requests in flight on the previous release finish
 first. No request is refused during the switch.
 
+A release reaches the daemon in one of two ways. `muructl deploy` makes
+one now, from a source directory and the flags given. Where a record of
+each release is kept in version control, `muructl render` writes the
+release as a file from the same flags, and `muructl apply` makes the
+daemon match the file, as [declaring applications in
+files](#declaring-applications-in-files) describes.
+
 ## Releases
 
 A release is a source directory and the settings fixed at creation: the
@@ -45,6 +52,32 @@ it. The interpreter is the source directory's `.venv` when it has one,
 otherwise the previous release's, otherwise `--python`. `--fresh` deploys
 from the flags, the source and the defaults alone, ignoring the previous
 release.
+
+`deploy --dry-run` asks the daemon what the deploy would do and changes
+nothing. It prints the id the release would take, each setting with the
+layer it would come from, whether an environment would be built, and
+what becomes of the release that serves:
+
+```console
+$ muructl deploy shop /srv/shop --processes 4 --dry-run
+muru: plan (nothing changed): release shop@r4, shop.wsgi:application 4x8 from /srv/shop
+  entrypoint = shop.wsgi:application    ([tool.muru])
+  python = /srv/shop/.venv/bin/python   (the source's .venv)
+  processes = 4                         (deploy flags)
+  threads = 8                           ([tool.muru])
+  sync_threads = 8                      (default)
+  max_requests = 5000                   (the previous release)
+  ...
+  settings nothing else gives come from shop@r3; --fresh takes none
+  the release would take over from shop@r3, which would stay warm for 1800s with 1 worker to a group
+```
+
+When the deploy would be refused, the plan lists why instead: a release
+id already taken, an overlay that freezes the application's deploys, a
+setting that fails its check, or a release the node's memory budget has
+no room for. An interpreter the node does not have is reported and not
+installed. The exit code is 0 when the deploy would go ahead and 1 when
+it would be refused, and `--json` prints the plan as JSON.
 
 ```
 muructl release list shop
@@ -140,6 +173,106 @@ from the source's `[tool.muru]` table and then the defaults, exactly as
 a deploy resolves them. A directory applies every `.toml` file in it, in
 name order, as one configuration.
 
+So a release's table needs only its `source` when the project's own
+file says the rest:
+
+```toml
+# muru.daemon.toml, beside the project's pyproject.toml
+[app.shop.release.r1]
+source = "."
+```
+
+A file kept beside a project's code like this is named
+`muru.daemon.toml`. `muru.toml` there is the project's settings file,
+which has other keys, and a file in this format saved under that name is
+refused as one. Anywhere else, the file's name is yours to choose.
+
+### Writing a release's table
+
+`muructl render` writes the release a command line describes as a file
+of this form. It takes an application, a source directory and the
+settings `muructl deploy` takes for a release, and prints the table:
+
+```text
+$ muructl render shop /srv/shop --release 2026-11-06 --processes 4
+# The release this command line describes, in the daemon's format.
+# Save it as muru.daemon.toml and give it to the daemon with:
+#   muructl apply -f muru.daemon.toml
+# Settings come from the flags, then the source's own settings, then the
+# defaults. The source's settings are [tool.muru] in /srv/shop/pyproject.toml.
+# A setting left at its default is not written; --full writes those too.
+
+[app.shop.release.2026-11-06]
+source = "/srv/shop"
+entrypoint = "shop.wsgi:application"
+processes = 4
+threads = 8
+
+[app.shop.release.2026-11-06.env]
+DJANGO_SETTINGS_MODULE = "shop.settings.production"
+```
+
+```
+muructl render shop /srv/shop --release 2026-11-06 > muru.daemon.toml
+muructl apply -f muru.daemon.toml
+```
+
+The command asks nothing of a daemon and changes nothing, so it runs
+where no daemon does, such as a job that writes the file for a later
+step to commit. It reads the source's settings, so the source is a
+directory it can read.
+
+- **The release id** is the one `--release` names. With none the table
+  is written as `r1`.
+- **The source** is written as the command line gives it. A relative
+  path stays relative, and `muructl apply` takes it from the file's
+  directory, so `muructl render shop . > muru.daemon.toml` beside the
+  code applies from there. With no source the current directory is
+  written as its full path.
+- **The settings** come from the flags, then the source's settings,
+  then the defaults. Nothing comes from a release the application
+  already has, so applying the file gives the release that `muructl
+  deploy --fresh` gives for the same flags.
+- **The interpreter** is written when `--python` or the source's
+  settings name one. Otherwise the table has no `python` key, and the
+  daemon finds the interpreter when the file is applied, as it does for
+  a deploy. A release that builds its environment from `uv.lock` is
+  built by the daemon when the file is applied.
+- **Secrets** are written as the references `--secret` gives. No secret
+  store is read.
+
+A command line that a deploy would refuse is refused with the same
+message, and nothing is printed. `--json` writes the document as JSON.
+
+`--full` writes every setting, the defaults included, with a comment
+beside each saying where it came from: the command line, the source's
+settings or the default.
+
+```text
+$ muructl render shop /srv/shop --release 2026-11-06 --processes 4 --full
+...
+[app.shop.release.2026-11-06]
+source = "/srv/shop"
+entrypoint = "shop.wsgi:application"    # [tool.muru]
+interface = "auto"                      # default
+bytecode = "redirect"                   # default
+processes = 4                           # command line
+threads = 8                             # [tool.muru]
+sync_threads = 8                        # default
+concurrency = 1000                      # default
+preload = "auto"                        # default
+...
+
+# Not set, and off unless set: timeouts.soft_timeout, timeouts.hard_timeout, memory.soft_limit, memory.hard_limit, max_requests, max_lifetime.
+# python is not set: the daemon finds the interpreter when the file is applied,
+# as a deploy does.
+```
+
+A file written this way keeps its meaning when a later version of Muru
+changes a default.
+
+### What an apply does
+
 An apply creates the applications the files name, deploys each declared
 release the daemon does not have (in id order, so the last declared
 release of an application is the one that serves), creates or updates
@@ -152,7 +285,41 @@ entrypoint are errors too. `[[listener]]` entries and the `[limits]`
 table belong in the daemon's own configuration file; in an applied file
 they are reported as warnings and not applied.
 
-`--dry-run` prints the plan and changes nothing. `--prune` also removes
+Four flags say how the releases an apply adds are deployed, as they do
+on `muructl deploy`:
+
+| Flag | What it does |
+| --- | --- |
+| `--hold` | Starts the releases and leaves traffic where it is |
+| `--no-wait` | Returns once the releases are recorded |
+| `--retain DURATION` | How long a release the apply replaces stays warm |
+| `--retain-workers N` | The workers each group of that release keeps meanwhile |
+
+```
+muructl apply -f muru.daemon.toml --hold
+muructl rollout bluegreen shop@2026-11-06
+```
+
+A held release takes no traffic and is reached with the `Muru-Preview`
+header, until a [rollout](rollouts.md) moves traffic to it. `--hold`
+holds every release the apply adds, in every application, and the plan
+and the report say `held` of each:
+
+```console
+$ muructl apply -f config/ --hold --dry-run
+muru: plan (nothing changed)
+  deploy          api@r8                   held: api.asgi:application 2x8 from /srv/api
+  deploy          shop@2026-11-06          held: shop.wsgi:application 4x8 from /srv/shop
+```
+
+An application whose first release is held serves nothing until a
+rollout. To hold the releases of one application and not another's,
+apply their files separately: without `--prune` an apply leaves alone
+what its files do not mention.
+
+`--dry-run` prints the plan and changes nothing. For each release that
+would take over from one that serves, it says how long that one stays
+warm. `--prune` also removes
 the routes, hosts, releases and applications the files do not contain,
 in that order: a running release drains and stops first. `--json` writes
 the report as JSON. The
@@ -247,9 +414,16 @@ locations for the platform, or the system locations with `--system`:
 
 `--state-dir`, `--run-dir`, `--log-dir`, `--cache-dir` and `--config`
 override each, as do `MURU_STATE_DIR`, `MURU_RUN_DIR`, `MURU_LOG_DIR`,
-`MURU_CACHE_DIR` and `MURU_CONFIG`, and the directories systemd provides
-through `StateDirectory=` and its siblings are used when set. `muructl
-daemon run` prints every location and which rule chose it. The run
+`MURU_CACHE_DIR` and `MURU_DAEMON_CONFIG`, and the directories systemd
+provides through `StateDirectory=` and its siblings are used when set.
+`muructl daemon run` prints every location and which rule chose it.
+
+The daemon's own commands take all five flags: the `muructl daemon`
+commands, `muructl up` and `muructl mcp serve --up`, so one set of
+flags starts, stops and reloads a daemon. So does `muructl secret`,
+which reads the daemon's file. Every other command only talks to a
+running daemon, and takes `--socket`, `--run-dir` and `--system` to find
+it. The run
 directory must be an absolute path, and a Unix socket path is limited to
 104 bytes on macOS and 108 on Linux, so a run directory too deep to leave
 room for the workers' sockets, which sit about 35 bytes plus the
@@ -258,8 +432,7 @@ so.
 
 The configuration file is optional. Its `[[listener]]` entries name the
 addresses to serve, each with `tls = true` when the edge terminates TLS
-on it, and its `[limits]` table sets the body size limit and timeouts,
-with the same keys `muructl run --print-config` writes.
+on it, and its `[limits]` table sets the body size limit and timeouts.
 
 ## Running it
 
@@ -414,8 +587,8 @@ file again, checks it whole, and applies what changed:
 
 - the `[proxy]`, `[compression]`, `[error_pages]`, `[error_override]`,
   `[[client_class]]`, `[rate_limit]` and `[limits]` tables, and the
-  `h2c` setting of a `[[listener]]` entry, which the edge is given at
-  once; a connection already open keeps the limits it was accepted
+  `h2c` setting and the `limits` and `proxy` tables of a `[[listener]]`
+  entry, which the edge is given at once; a connection already open keeps the limits it was accepted
   under;
 
 - the `[[listener]]` entries: a changed set starts a new edge on the new

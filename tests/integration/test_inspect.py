@@ -18,6 +18,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from support import server as support
@@ -187,6 +188,138 @@ def test_tasks_list_an_asgi_workers_event_loop(daemon: Daemon) -> None:
     assert "asyncio.sleep" in text or "plain_asgi" in text or "Task-" in text, text
     plain = daemon.muructl("debug", "tasks", "asgi", "--json").stdout
     assert json.loads(plain)["workers"][0]["result"]["lag_ms"] is not None
+
+
+def test_status_and_stacks_show_an_asgi_workers_sync_pool(daemon: Daemon) -> None:
+    assert daemon.deploy(
+        "asgi",
+        support.FIXTURES,
+        "--entrypoint",
+        "plain_asgi:application",
+        "--processes",
+        "1",
+        "--sync-threads",
+        "2",
+        "--memory",
+        "check_interval=1s",
+    ) == ("muru: release asgi@r1 is ready and serving")
+    outcome: list[int] = []
+
+    def blocking() -> None:
+        connection = http.client.HTTPConnection("127.0.0.1", daemon.port, timeout=60)
+
+        try:
+            connection.request("GET", "/to-thread?seconds=3")
+            outcome.append(connection.getresponse().status)
+        finally:
+            connection.close()
+
+    # Three requests each block a thread of a pool of two: both threads
+    # are busy and the third call waits for one.
+
+    threads = [threading.Thread(target=blocking) for _ in range(3)]
+
+    for thread in threads:
+        thread.start()
+
+    time.sleep(0.7)
+
+    try:
+        lines = daemon.muructl("debug", "status", "asgi").stdout.splitlines()
+        stacks = daemon.muructl("debug", "stacks", "asgi").stdout
+        labels = 'app="asgi",release="r1",group="default",worker="0",pool="loop"'
+        busy = f"muru_worker_sync_threads_busy{{{labels}}} 2\n"
+        wait_for(lambda: busy in daemon.muructl("metrics").stdout)
+        assert f"muru_worker_sync_threads{{{labels}}} 2\n" in daemon.muructl("metrics").stdout
+    finally:
+        for thread in threads:
+            thread.join()
+
+    assert outcome == [200, 200, 200]
+    header = lines[0].split()
+    assert header[5:9] == ["LOOP", "LOOP-OLDEST", "SYNC", "SYNC-OLDEST"], header
+    row = lines[1].split()
+    assert row[5] == "3/1000" and row[7] == "2/2", row
+    assert row[8].endswith("s") and row[8] != "-", row
+
+    # Each thread of the pool is named with the request whose call it runs.
+
+    assert stacks.count("serving GET /to-thread?seconds=3 for") == 2, stacks
+    assert "muru-sync" in stacks, stacks
+
+
+def test_status_counts_the_threads_anyio_and_asgiref_run_sync_code_on(daemon: Daemon) -> None:
+    assert daemon.deploy(
+        "fast",
+        support.FIXTURES,
+        "--entrypoint",
+        "fastapi_app:application",
+        "--processes",
+        "1",
+        "--sync-threads",
+        "2",
+        "--memory",
+        "check_interval=1s",
+    ) == ("muru: release fast@r1 is ready and serving")
+    answers: list[str] = []
+
+    def fetch(path: str) -> None:
+        answers.append(daemon.get(path).body.decode())
+
+    def status() -> tuple[str, dict[str, Any]]:
+        row = daemon.muructl("debug", "status", "fast").stdout.splitlines()[1].split()
+        answer = json.loads(daemon.muructl("debug", "status", "fast", "--json").stdout)
+        return row[7], answer["workers"][0]["result"]["sync_pools"]
+
+    # FastAPI runs a synchronous endpoint on anyio's worker threads,
+    # whose limit is the worker's sync threads: of three requests two
+    # run at once and the third waits for a thread.
+
+    started = time.monotonic()
+    threads = [threading.Thread(target=fetch, args=("/blocking?seconds=2",)) for _ in range(3)]
+
+    for thread in threads:
+        thread.start()
+
+    time.sleep(1.2)
+
+    try:
+        column, pools = status()
+        labels = 'app="fast",release="r1",group="default",worker="0",pool="anyio"'
+        busy = f"muru_worker_sync_threads_busy{{{labels}}} 2\n"
+        wait_for(lambda: busy in daemon.muructl("metrics").stdout)
+        assert f"muru_worker_sync_threads{{{labels}}} 2\n" in daemon.muructl("metrics").stdout
+    finally:
+        for thread in threads:
+            thread.join()
+
+    assert time.monotonic() - started >= 3.9
+    assert all(answer.startswith("AnyIO worker thread") for answer in answers), answers
+    assert column == "2/2", column
+    assert pools == {
+        "loop": {"busy": 0, "of": 2},
+        "anyio": {"busy": 2, "of": 2},
+        "asgiref": {"busy": 0, "of": 1},
+    }
+
+    # asgiref runs a thread-sensitive call on its one shared thread,
+    # which is the fullest pool while the call lasts, and the thread is
+    # named with the request.
+
+    answers.clear()
+    thread = threading.Thread(target=fetch, args=("/sensitive?seconds=2",))
+    thread.start()
+    time.sleep(0.7)
+
+    try:
+        column, pools = status()
+        stacks = daemon.muructl("debug", "stacks", "fast").stdout
+    finally:
+        thread.join()
+
+    assert answers[0].startswith("muru-sync-asgiref"), answers
+    assert column == "1/1" and pools["asgiref"] == {"busy": 1, "of": 1}, (column, pools)
+    assert "serving GET /sensitive?seconds=2 for" in stacks and "muru-sync-asgiref" in stacks
 
 
 def readable_from_outside() -> bool:
@@ -477,7 +610,7 @@ def test_trace_counts_calls_and_refuses_a_busy_worker(daemon: Daemon) -> None:
         for thread in threads:
             thread.join()
 
-    assert "the worker is busy (2 of 2 slots)" in refused
+    assert "the worker is busy (2 of 2 threads)" in refused
     assert "total ms" in forced
 
 

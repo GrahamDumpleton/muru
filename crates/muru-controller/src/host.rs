@@ -92,6 +92,10 @@ pub struct WorkerStatus {
     pub in_flight: u64,
     /// The age of its oldest request, in milliseconds.
     pub oldest_ms: u64,
+    /// The pools synchronous code runs on for its event loop (section
+    /// 6.6), each by name with its threads running a call and the
+    /// threads it has; empty for a worker without a loop.
+    pub sync_pools: Vec<(String, u64, u64)>,
     /// Resident set size in bytes, when measured.
     pub rss: Option<u64>,
     /// Proportional set size in bytes, when measured.
@@ -112,6 +116,11 @@ pub struct WorkerStatus {
     pub loop_lag: Vec<u64>,
     /// The sum of its event loop's lateness, in microseconds.
     pub loop_lag_us: u64,
+    /// The waits for a thread of the requests it handed from ASGI to
+    /// WSGI (section 6.14), likewise.
+    pub handoff_wait: Vec<u64>,
+    /// The sum of those waits, in microseconds.
+    pub handoff_wait_us: u64,
     /// Its garbage collections by generation (section 11.1), those with
     /// a collection so far.
     pub gc: Vec<GcGeneration>,
@@ -269,6 +278,21 @@ impl HostMessage {
                                 requests: worker["requests"].as_u64().unwrap_or(0),
                                 in_flight: worker["in_flight"].as_u64().unwrap_or(0),
                                 oldest_ms: worker["oldest_ms"].as_u64().unwrap_or(0),
+                                sync_pools: worker["sync_pools"]
+                                    .as_object()
+                                    .map(|pools| {
+                                        pools
+                                            .iter()
+                                            .filter_map(|(name, pool)| {
+                                                Some((
+                                                    name.clone(),
+                                                    pool["busy"].as_u64()?,
+                                                    pool["of"].as_u64()?,
+                                                ))
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
                                 rss: worker["rss"].as_u64(),
                                 pss: worker["pss"].as_u64(),
                                 uss: worker["uss"].as_u64(),
@@ -278,6 +302,8 @@ impl HostMessage {
                                 gil_wait_us: worker["gil_wait_us"].as_u64().unwrap_or(0),
                                 loop_lag: counts(&worker["loop_lag"]),
                                 loop_lag_us: worker["loop_lag_us"].as_u64().unwrap_or(0),
+                                handoff_wait: counts(&worker["handoff_wait"]),
+                                handoff_wait_us: worker["handoff_wait_us"].as_u64().unwrap_or(0),
                                 gc: generations(&worker["gc"]),
                             })
                             .collect()
@@ -724,14 +750,25 @@ impl HostProcess {
                 .threads
                 .filter(|_| mount.interface == muru_config::Interface::Asgi);
 
-            if let Some(threads) = mount.threads.filter(|_| handoff_threads.is_none()) {
-                text.push_str(&format!("={},{}", threads.reserved(), threads.max()));
-            } else if mount.concurrency.is_some() || mount.max_connections.is_some() {
+            // Section 6.7: the mount's own threads, then its own limits,
+            // either of which may be absent; a mount left to be detected
+            // may carry limits, which its worker checks against what it
+            // detects.
+
+            let threads = mount
+                .threads
+                .filter(|_| handoff_threads.is_none())
+                .map(|threads| format!("{},{}", threads.reserved(), threads.max()))
+                .unwrap_or_default();
+
+            if mount.concurrency.is_some() || mount.max_connections.is_some() {
                 text.push_str(&format!(
-                    "={},{}",
+                    "={threads}={},{}",
                     mount.concurrency.unwrap_or(0),
                     mount.max_connections.unwrap_or(0)
                 ));
+            } else if !threads.is_empty() {
+                text.push_str(&format!("={threads}"));
             }
 
             command.arg("--mount").arg(text);

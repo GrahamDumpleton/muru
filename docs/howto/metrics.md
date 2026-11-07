@@ -53,9 +53,8 @@ Names start with `muru_`. Where they apply, labels name the application
 | `muru_handoffs_total` | counter | app, release, group, to | requests the worker [handed](handoff.md) from WSGI to ASGI (`to` is `asgi`) or from ASGI to WSGI (`wsgi`); such a request is marked `handoff` in the [access log](logging.md) |
 | `muru_auth_requests_total` | counter | result | [authentication sub-requests](auth-subrequests.md) by result: `allowed`, `cached`, `denied` or `unavailable` |
 | `muru_queue_depth` | gauge | app, release, group | requests waiting for a slot |
-| `muru_slots_busy` | gauge | app, release, group | slots handling a request or holding an open WebSocket |
-| `muru_slots_total` | gauge | app, release, group | slots across the workers: threads, or the event loop's concurrency |
-| `muru_async_slots_busy` | gauge | app, release, group | requests held on the event loops of [ASGI](asgi.md) workers, the part of `muru_slots_busy` that is not on threads |
+| `muru_slots_busy` | gauge | app, release, group, side | slots handling a request or holding an open WebSocket, on the workers' `threads` or their event `loop` |
+| `muru_slots_total` | gauge | app, release, group, side | slots across the workers: `threads`, or the event `loop`'s concurrency |
 | `muru_capacity_utilisation` | gauge | app, release, group | busy slots over slots, sampled every second and averaged over the last 30 seconds: how saturated the group is, the signal to [autoscale](#saturation-for-an-autoscaler) on |
 | `muru_upstream_health` | gauge | upstream, address | 1 for an [upstream](upstreams.md) address in service, 0 for one its probes found unhealthy or that was ejected after failed requests |
 | `muru_workers_ready` | gauge | app, release, group | workers listening for requests (under the daemon) |
@@ -64,10 +63,13 @@ Names start with `muru_`. Where they apply, labels name the application
 | `muru_churn_reaps_total` | counter | app, release, group | workers the autoscaler reaped in the last hour, against its churn budget |
 | `muru_worker_requests_total` | counter | app, release, group, worker | requests a worker has served, as it last reported (under the daemon) |
 | `muru_worker_requests_in_flight` | gauge | app, release, group, worker | requests a worker was serving when it last reported |
+| `muru_worker_sync_threads_busy` | gauge | app, release, group, worker, pool | threads running synchronous code for an [ASGI](asgi.md) worker's event loop when it last reported, by the [pool they belong to](asgi.md#one-event-loop-per-worker): `loop`, `anyio` or `asgiref`; absent for a worker without an event loop |
+| `muru_worker_sync_threads` | gauge | app, release, group, worker, pool | threads in that pool, so `muru_worker_sync_threads_busy` equal to it means every new call there waits for one |
 | `muru_worker_cpu_seconds_total` | counter | app, release, group, worker | CPU time a worker has used, user and system, as it last reported every `check_interval` of its memory policy |
 | `muru_worker_memory_bytes` | gauge | app, release, group, worker, measure | a worker's memory as `rss`, `pss` or `uss`, measured every `check_interval` of its [memory policy](memory.md) |
 | `muru_gil_wait_seconds` | histogram | app, release, group, worker | how long a worker's threads waited for the GIL when they had work to run, in buckets from 0.1 ms to 5 s, cumulative since the worker started and reported with its memory; absent until the worker has waited at all, so a free-threaded worker never reports it |
 | `muru_loop_lag_seconds` | histogram | app, release, group, worker | how much later than due an ASGI worker's event loop heartbeat ran, which beats twice a second, in the same buckets; absent for a worker without a loop |
+| `muru_handoff_queue_wait_seconds` | histogram | app, release, group, worker | how long requests an ASGI application [handed to WSGI](handoff.md#from-asgi-to-wsgi) waited for a thread, in the same buckets; absent until the worker has handed one over |
 | `muru_gc_collections_total` | counter | app, release, group, worker, generation | garbage collections a worker has run since it started, by generation: `0`, `1` or `2`, or `full` on a free-threaded interpreter, whose collector takes the whole heap each time |
 | `muru_gc_seconds_total` | counter | app, release, group, worker, generation | time the worker spent collecting, during which it served nothing |
 | `muru_gc_collected_objects_total` | counter | app, release, group, worker, generation | objects the collections freed |
@@ -100,7 +102,8 @@ How many slots are busy, and how long requests wait for one, say more:
 
 - `muru_capacity_utilisation` is the share of a group's slots in use,
   averaged over the last 30 seconds, from 0 to 1. A sustained value near
-  1 means requests are starting to queue.
+  1 means requests are starting to queue. For a group whose workers have
+  threads and an event loop it is the busier side's share.
 - The `queue` phase of `muru_request_duration_seconds` is how long
   requests waited for a slot:
   `histogram_quantile(0.95, sum by (le) (rate(muru_request_duration_seconds_bucket{phase="queue"}[2m])))`.

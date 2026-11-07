@@ -37,9 +37,11 @@ for any command.
 
 A [development run](run-settings.md) started from the same directory is
 found first, as it is for every command. Its admin socket answers
-`status`, `events`, `logs`, `metrics`, `websockets` and `debug`, but not
-the lists or a deploy; stop it, or give `--socket` the daemon's socket,
-when the agent is to deploy.
+`status`, `events`, `logs`, `metrics`, `websockets` and `debug`, and
+`commands` and `run_command` for [the project's own
+commands](commands.md#the-projects-own-commands) with the run's
+application as the target, but not the lists or a deploy; stop it, or
+give `--socket` the daemon's socket, when the agent is to deploy.
 
 ## The development loop
 
@@ -48,7 +50,7 @@ the developer deploy it the same way (see
 [declaring applications in files](daemon.md#declaring-applications-in-files)):
 
 ```toml
-# muru.toml
+# muru.daemon.toml
 [app.shop.release.r1]
 source = "."
 entrypoint = "shop.wsgi:application"
@@ -56,6 +58,11 @@ python = ".venv/bin/python"
 processes = 2
 threads = 4
 ```
+
+The file is named `muru.daemon.toml` because `muru.toml` beside the code
+is the project's own settings file. What the table leaves out comes from
+that file, or from `[tool.muru]` in `pyproject.toml`. `muructl render
+shop . > muru.daemon.toml` writes the file from those settings.
 
 Then the agent, through the tools:
 

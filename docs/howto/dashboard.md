@@ -16,8 +16,10 @@ WebSockets open, charts of requests, errors, latency and what is open
 over time, recent requests and the host's and workers' output, refreshed every two seconds, with no
 sign-in. The In flight tile counts requests not yet answered, as the
 `muru_requests_in_flight` metric does, with the WebSockets open in the
-tile beside it; a worker's busy slots in the table below include a
-WebSocket holding one. The Workers link opens the pages the daemon's
+tile beside it. The workers table shows each worker's busy slots of its
+slots as Threads and as Loop, whichever it has, since WSGI requests are
+held against its threads and ASGI requests against its event loop; an
+open WebSocket holding a slot is counted. The Workers link opens the pages the daemon's
 dashboard has for [looking into the workers](#looking-into-the-workers):
 each worker's status, stacks, tasks and memory, read through the run's
 admin socket, without the restart actions. `--dashboard ADDRESS` moves it to another loopback address and
@@ -75,9 +77,9 @@ path, and open it with the trailing slash: `https://example.com/proxy/8090/`.
 - the last minute: requests per second, median and 95th percentile
   total time, 5xx responses, requests in flight and WebSockets open;
 - every application's releases with their state, whether traffic goes to
-  them, the workers listening, the slots busy (WebSockets hold one each),
-  the WebSockets open and the slots in all, and requests waiting for a
-  slot, with when maintenance mode began for an application
+  them, the workers listening, the busy slots of the slots on their
+  threads and on their event loops (WebSockets hold one each), the
+  WebSockets open, and requests waiting for a slot, with when maintenance mode began for an application
   in it, and the virtual hosts and routes when declared;
 - the [rollouts](rollouts.md) under way and the latest that ended, with
   the candidate's share and what each is doing or why it ended;

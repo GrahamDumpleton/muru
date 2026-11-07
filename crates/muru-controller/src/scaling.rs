@@ -72,6 +72,24 @@ impl Signals {
                 .map(|(_, value)| value.clone())
         };
 
+        // Section 5.1: a group's workers hold requests on their threads
+        // and on their event loops, each side with slots of its own, so
+        // the slots are sampled by side: the total, then the busy ones.
+
+        let mut sides: Vec<(String, f64, f64)> = Vec::new();
+        let mut side = |sample: &Sample| -> usize {
+            let name = label(sample, "side").unwrap_or_default();
+
+            match sides.iter().position(|(side, _, _)| *side == name) {
+                Some(index) => index,
+                None => {
+                    sides.push((name, 0.0, 0.0));
+                    sides.len() - 1
+                }
+            }
+        };
+        let mut slots: Vec<(usize, bool, f64)> = Vec::new();
+
         for sample in samples {
             if label(sample, "app").as_deref() != Some(app)
                 || label(sample, "release").as_deref() != Some(release)
@@ -81,8 +99,8 @@ impl Signals {
             }
 
             match sample.name.as_str() {
-                "muru_slots_busy" => signals.busy += sample.value,
-                "muru_slots_total" => signals.total += sample.value,
+                "muru_slots_busy" => slots.push((side(sample), true, sample.value)),
+                "muru_slots_total" => slots.push((side(sample), false, sample.value)),
                 "muru_queue_depth" => signals.queue_depth += sample.value,
                 "muru_request_duration_seconds_bucket"
                     if label(sample, "phase").as_deref() == Some("queue") =>
@@ -100,6 +118,27 @@ impl Signals {
                     entry.1 += sample.value;
                 }
                 _ => {}
+            }
+        }
+
+        for (index, busy, value) in slots {
+            if busy {
+                sides[index].2 += value;
+            } else {
+                sides[index].1 += value;
+            }
+        }
+
+        // Section 7.4: the group is as busy as its busier side, the one
+        // with the larger share of its slots in use, which is the one
+        // that runs out first; the first of two that are level.
+
+        for (_, total, busy) in sides {
+            let busier = signals.total <= 0.0 || busy * signals.total > signals.busy * total;
+
+            if total > 0.0 && busier {
+                signals.total = total;
+                signals.busy = busy;
             }
         }
 
@@ -122,6 +161,10 @@ pub struct WorkerSignals {
     pub gil_wait_p95_ms: Option<f64>,
     /// The 95th percentile lateness of the event loop, in milliseconds.
     pub loop_lag_p95_ms: Option<f64>,
+    /// The 95th percentile wait for a thread of the requests handed
+    /// from ASGI to WSGI (section 6.14), in milliseconds; none when no
+    /// request was handed over between the reports.
+    pub handoff_queue_wait_p95_ms: Option<f64>,
     /// The share of a worker's wall time spent in garbage collection,
     /// averaged over the workers (section 11.1).
     pub gc_share: Option<f64>,
@@ -142,6 +185,7 @@ impl WorkerSignals {
         let mut cores = Vec::new();
         let mut gil_wait = Vec::new();
         let mut loop_lag = Vec::new();
+        let mut handoff_wait = Vec::new();
         let mut gc = Vec::new();
         let wall_ms = elapsed.as_millis() as f64;
 
@@ -166,6 +210,11 @@ impl WorkerSignals {
 
             add_growth(&mut gil_wait, &worker.gil_wait, &earlier.gil_wait);
             add_growth(&mut loop_lag, &worker.loop_lag, &earlier.loop_lag);
+            add_growth(
+                &mut handoff_wait,
+                &worker.handoff_wait,
+                &earlier.handoff_wait,
+            );
 
             // Time collecting since the earlier report, over every
             // generation, as a share of the wall time.
@@ -184,6 +233,7 @@ impl WorkerSignals {
             cores: mean(&cores),
             gil_wait_p95_ms: p95_ms(&gil_wait),
             loop_lag_p95_ms: p95_ms(&loop_lag),
+            handoff_queue_wait_p95_ms: p95_ms(&handoff_wait),
             gc_share: mean(&gc),
         }
     }
@@ -228,8 +278,8 @@ fn p95_ms(counts: &[u64]) -> Option<f64> {
 /// release, from its slots, its queue and its workers' own signals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnosis {
-    /// The bottleneck: cpu, gil, io, heavy, loop, memory, gc, idle or
-    /// none.
+    /// The bottleneck: cpu, gil, io, heavy, loop, handoff, memory, gc,
+    /// idle or none.
     pub bottleneck: &'static str,
     /// The bottleneck in words.
     pub summary: &'static str,
@@ -292,6 +342,17 @@ pub fn diagnose(
             "cpu",
             "CPU bound",
             "more processes, up to the node's cores; more threads will not help",
+        );
+    }
+
+    // Section 6.14: requests handed from ASGI to WSGI wait inside the
+    // worker for a thread, where the edge's queue does not see them.
+
+    if signals.handoff_queue_wait_p95_ms.unwrap_or(0.0) >= 100.0 {
+        return diagnosis(
+            "handoff",
+            "requests handed to WSGI wait for a thread",
+            "more threads for the requests handed over, or a mount for the paths that are",
         );
     }
 
@@ -1308,6 +1369,26 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_under_a_worker_s_concurrency_is_short_by_one_worker_at_most() {
+        // No worker is ready, so a worker is taken to offer what the
+        // daemon sized it as: 40 requests waiting for a group scaled to
+        // zero are one worker's worth for an event loop of 1000, and
+        // ten workers' worth when it is taken for four threads.
+
+        let scaler = Scaler::new(spare(), 0);
+        let waiting = |slots_per_worker: f64| {
+            scaler.idle(&Signals {
+                queue_depth: 40.0,
+                slots_per_worker,
+                ..Signals::default()
+            })
+        };
+
+        assert!(waiting(1000.0) >= -1.0, "{}", waiting(1000.0));
+        assert_eq!(waiting(4.0), -10.0);
+    }
+
+    #[test]
     fn a_ramp_grows_by_doubling_steps_bounded_by_max_step_up() {
         let spec = ScalingSpec {
             max_workers: 32,
@@ -1570,6 +1651,29 @@ mod tests {
         assert_eq!((signals.busy, signals.total, signals.ready), (3.0, 8.0, 2));
         assert_eq!(signals.queue_buckets.len(), 3);
 
+        // A group whose workers have threads and an event loop is as
+        // busy as its busier side, whichever that is, and the threads
+        // when the two are level.
+
+        let sided = |threads: f64, on_loop: f64| {
+            let samples = [
+                sample("muru_slots_total", "default", &[("side", "threads")], 4.0),
+                sample(
+                    "muru_slots_busy",
+                    "default",
+                    &[("side", "threads")],
+                    threads,
+                ),
+                sample("muru_slots_total", "default", &[("side", "loop")], 1000.0),
+                sample("muru_slots_busy", "default", &[("side", "loop")], on_loop),
+            ];
+            let signals = Signals::from_samples(&samples, "shop", "r1", "default", 1, 4.0, None);
+            (signals.busy, signals.total)
+        };
+        assert_eq!(sided(4.0, 20.0), (4.0, 4.0));
+        assert_eq!(sided(1.0, 900.0), (900.0, 1000.0));
+        assert_eq!(sided(0.0, 0.0), (0.0, 4.0));
+
         let spec = ScalingSpec {
             mode: ScalingMode::Target,
             min_workers: 1,
@@ -1610,6 +1714,7 @@ mod tests {
             group: "default".to_owned(),
             requests: 0,
             in_flight: 0,
+            sync_pools: Vec::new(),
             oldest_ms: 0,
             rss: None,
             pss: None,
@@ -1620,8 +1725,42 @@ mod tests {
             gil_wait_us: 0,
             loop_lag: Vec::new(),
             loop_lag_us: 0,
+            handoff_wait: Vec::new(),
+            handoff_wait_us: 0,
             gc: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_handoff_wait_is_the_growth_between_two_reports() {
+        // Twenty requests handed to WSGI between the reports: ten took
+        // a thread within a millisecond and ten waited up to half a
+        // second, so the 95th percentile is the half second.
+
+        let zeros = vec![0; 11];
+        let mut before = worker(1, 0, zeros.clone(), true);
+        before.handoff_wait = vec![5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5];
+        let mut after = worker(1, 0, zeros.clone(), true);
+        after.handoff_wait = vec![5, 5, 15, 15, 15, 15, 15, 25, 25, 25, 25];
+        let signals = WorkerSignals::between(
+            &[before.clone()],
+            &[after],
+            "default",
+            Duration::from_secs(10),
+            4,
+        );
+        assert_eq!(signals.handoff_queue_wait_p95_ms, Some(500.0));
+
+        // With none handed over meanwhile there is nothing to measure.
+
+        let unchanged = WorkerSignals::between(
+            &[before.clone()],
+            &[before],
+            "default",
+            Duration::from_secs(10),
+            4,
+        );
+        assert_eq!(unchanged.handoff_queue_wait_p95_ms, None);
     }
 
     #[test]
@@ -1725,6 +1864,29 @@ mod tests {
         assert_eq!(diagnose(0.05, None, &quiet, false).bottleneck, "idle");
         assert_eq!(diagnose(0.5, None, &quiet, false).bottleneck, "none");
         assert_eq!(diagnose(0.5, None, &lagging, false).bottleneck, "loop");
+
+        // Requests handed to WSGI waiting for a thread inside the
+        // worker, which the slots at the edge do not show; a cause of
+        // slow threads is named before it.
+
+        let handing = WorkerSignals {
+            handoff_queue_wait_p95_ms: Some(500.0),
+            ..WorkerSignals::default()
+        };
+        assert_eq!(diagnose(0.2, None, &handing, false).bottleneck, "handoff");
+        assert_eq!(
+            diagnose(
+                0.2,
+                None,
+                &WorkerSignals {
+                    worker_cpu: Some(0.95),
+                    ..handing.clone()
+                },
+                false
+            )
+            .bottleneck,
+            "cpu"
+        );
         assert_eq!(diagnose(0.9, None, &busy_cpu, true).bottleneck, "memory");
         assert!(
             diagnose(0.9, None, &quiet, false)

@@ -14,8 +14,11 @@ mod edge;
 mod init;
 mod log_format;
 mod mcp;
+mod print_config;
+mod project_commands;
 mod provision;
 mod pstats;
+mod render;
 mod run_admin;
 mod serve;
 mod serve_admin;
@@ -62,10 +65,11 @@ enum Command {
 
     /// Run one application in a container: configured from the image and the environment, probes and metrics on an admin port, logs on standard output.
     #[command(
-        after_help = "Every setting can also come from the project's [tool.muru.serve] table, a file \
-                      named by --config or MURU_SERVE_CONFIG, or an environment variable named \
-                      MURU_SERVE_ and the flag in upper snake case, such as MURU_SERVE_PROCESSES; \
-                      a flag wins over all of them, and --print-config shows where each came from."
+        after_help = "Every setting can also come from the project's [tool.muru.serve] table, or \
+                      an environment variable named MURU_SERVE_ and the flag in upper snake case, \
+                      such as MURU_SERVE_PROCESSES; a flag wins over both, and --print-config \
+                      shows where each came from. --config or MURU_SERVE_CONFIG names a project \
+                      settings file to read in place of the one beside the code."
     )]
     Serve(Box<serve::ServeArgs>),
 
@@ -99,6 +103,9 @@ enum Command {
 
     /// Create a release from a source directory and move traffic to it.
     Deploy(Box<admin::DeployArgs>),
+
+    /// Write the release a command line describes as a file to apply, without a daemon.
+    Render(Box<render::RenderArgs>),
 
     /// Manage applications.
     App {
@@ -617,11 +624,15 @@ struct RunArgs {
     #[arg(long = "host", value_name = "NAME")]
     hosts: Vec<String>,
 
-    /// Write the equivalent declarative configuration (appendix C) to
-    /// standard output instead of running: the path from a development
-    /// run to a long-running setup.
+    /// Print the settings the run would use, each with where it came
+    /// from, in the shape of the project's file, and exit.
     #[arg(long)]
     print_config: bool,
+
+    /// The project settings file muructl serve was given, read in place
+    /// of the one beside the code (section 13.9).
+    #[arg(skip)]
+    settings_file: Option<PathBuf>,
 
     /// One process and one thread, serving without forking, for debuggers.
     /// Implies --processes 1 --threads 1.
@@ -894,14 +905,17 @@ fn main() -> anyhow::Result<()> {
                     shutdown,
                     timeout,
                     socket,
-                } => admin::daemon_stop(socket, shutdown, timeout).await,
-                admin::DaemonCommand::Reload { socket, output } => {
+                    files,
+                } => admin::daemon_stop(socket, files, shutdown, timeout).await,
+                admin::DaemonCommand::Reload { socket, output, .. } => {
                     admin::daemon_reload(socket, output.json).await
                 }
-                admin::DaemonCommand::Upgrade { timeout, socket } => {
-                    admin::daemon_upgrade(socket, timeout).await
-                }
-                admin::DaemonCommand::Status { socket, output } => {
+                admin::DaemonCommand::Upgrade {
+                    timeout,
+                    socket,
+                    files,
+                } => admin::daemon_upgrade(socket, files, timeout).await,
+                admin::DaemonCommand::Status { socket, output, .. } => {
                     admin::daemon_status(socket, output.json).await
                 }
             }
@@ -911,7 +925,8 @@ fn main() -> anyhow::Result<()> {
         Command::Runtime { command } => runtime.block_on(provision::run(command)),
         Command::Secret { command } => runtime.block_on(admin::secret(command)),
         Command::Logging { command } => runtime.block_on(admin::logging(command)),
-        Command::Deploy(args) => runtime.block_on(admin::deploy(*args)),
+        Command::Deploy(args) => exit_with(runtime, admin::deploy(*args)),
+        Command::Render(args) => render::render(*args),
         Command::App { command } => runtime.block_on(async move {
             match command {
                 admin::AppCommand::List { socket, output } => {
@@ -1017,13 +1032,8 @@ fn main() -> anyhow::Result<()> {
         Command::Mcp { command } => runtime.block_on(mcp::run(command)),
         Command::Exec(args) => exit_with(runtime, admin::exec(args)),
         Command::Commands {
-            command:
-                admin::CommandCommand::List {
-                    target,
-                    socket,
-                    output,
-                },
-        } => runtime.block_on(admin::command_list(target, socket, output.json)),
+            command: admin::CommandCommand::List(args),
+        } => runtime.block_on(admin::command_list(*args)),
         Command::Commands {
             command: admin::CommandCommand::Run(args),
         } => exit_with(runtime, admin::command_run(*args)),
@@ -1260,18 +1270,15 @@ pub(crate) struct HostTimeouts {
     pub gil_stall: Duration,
 }
 
-impl HostTimeouts {
-    /// The timeouts as a `[timeouts]` table, for --print-config.
-    pub fn table(&self) -> muru_config::Timeouts {
-        muru_config::Timeouts {
-            soft_timeout: self.soft.map(muru_config::format_duration),
-            hard_timeout: self.hard.map(muru_config::format_duration),
-            hard_drain_grace: Some(muru_config::format_duration(self.hard_drain_grace)),
-            shutdown_timeout: Some(muru_config::format_duration(self.shutdown)),
-            websocket_drain_grace: Some(muru_config::format_duration(self.websocket_drain_grace)),
-            loop_stall_timeout: Some(muru_config::format_duration(self.loop_stall)),
-            gil_stall_timeout: Some(muru_config::format_duration(self.gil_stall)),
-        }
+/// The limits a table sets on the requests it serves (section 4.6), as
+/// the edge takes them.
+fn served_limits(settings: &muru_config::RequestLimitSettings) -> muru_edge::RequestLimits {
+    muru_edge::RequestLimits {
+        max_body_size: settings.max_body_size,
+        queue_timeout: settings.queue_timeout,
+        request_deadline: settings.request_deadline,
+        body_idle_timeout: settings.body_idle_timeout,
+        response_idle_timeout: settings.response_idle_timeout,
     }
 }
 
@@ -1424,14 +1431,24 @@ fn group_memory(
 /// Largest request body in development (section 13.1, ADR 0008).
 const DEVELOPMENT_MAX_BODY_SIZE: u64 = 100 * 1024 * 1024;
 
-fn limits(args: &RunArgs) -> muru_edge::Limits {
+/// The run's limits: the defaults, with the project table's own limits
+/// on a request over them (section 4.6), and the flags over those.
+fn limits(args: &RunArgs, resolved: &Resolved) -> muru_edge::Limits {
     let defaults = muru_edge::Limits::default();
+    let served = served_limits(&resolved.served).over(&defaults);
     let mut limits = muru_edge::Limits {
-        max_body_size: args.max_body_size.unwrap_or(if args.allow_public {
-            defaults.max_body_size
-        } else {
-            DEVELOPMENT_MAX_BODY_SIZE
-        }),
+        max_body_size: args
+            .max_body_size
+            .or(resolved.served.max_body_size)
+            .unwrap_or(if args.allow_public {
+                defaults.max_body_size
+            } else {
+                DEVELOPMENT_MAX_BODY_SIZE
+            }),
+        queue_timeout: served.queue_timeout,
+        request_deadline: served.request_deadline,
+        body_idle_timeout: served.body_idle_timeout,
+        response_idle_timeout: served.response_idle_timeout,
         max_connections: args.max_connections.unwrap_or(defaults.max_connections),
         max_connections_per_client: args
             .max_connections_per_client
@@ -1644,6 +1661,9 @@ struct Resolved {
     max_lifetime: Option<Duration>,
     /// The host's timeouts from the table (section 7.6).
     timeouts: Option<muru_config::Timeouts>,
+    /// The table's own limits on a request (section 4.6): its
+    /// `max_body_size` and the request timeouts of its `timeouts`.
+    served: muru_config::RequestLimitSettings,
     /// Section 4.10: the default mount's redirect settings from the table.
     accel_redirect: bool,
     cgi_local_redirect: bool,
@@ -1653,20 +1673,17 @@ struct Resolved {
     /// Section 4.9: the application's own directories of files, the
     /// table's with the flags' over them by prefix.
     static_dirs: Vec<muru_config::StaticDir>,
-    /// Section 4.12: the error pages, override and maintenance
-    /// exemptions from the table.
+    /// Section 4.12: the error pages and the override from the table.
     error_pages: std::collections::BTreeMap<String, muru_config::ErrorPage>,
     error_override: Option<muru_config::ErrorOverride>,
-    maintenance: Option<muru_config::Maintenance>,
     /// The memory table (section 7.7).
     memory: Option<muru_config::Memory>,
     /// Environment variables from the table (section 10.8).
     env: std::collections::BTreeMap<String, muru_config::EnvValue>,
-    /// The scaling table (sections 7.2 and 7.4), written out by
-    /// --print-config; a development run never scales.
-    scaling: Option<muru_config::Scaling>,
     /// How the run serves (section 13.1).
     serving: Serving,
+    /// The tables as they were read, for --print-config.
+    layers: print_config::Layers,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -1727,7 +1744,8 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         None => (None, chdir.unwrap_or_else(|| PathBuf::from("."))),
     };
 
-    let (source, table) = match muru_config::load_project(&project)? {
+    let (source, table) = match muru_config::load_settings(&project, args.settings_file.as_deref())?
+    {
         Some((path, table)) => (Some(path), table),
         None => (None, muru_config::ToolMuru::default()),
     };
@@ -1761,6 +1779,7 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         None => (None, muru_config::RunSettings::default(), None),
     };
 
+    let layers = print_config::Layers::new(&table, &run_table, &local_run);
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
 
     // Whether the entrypoint is a factory belongs to the entrypoint: the
@@ -1859,7 +1878,25 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         });
     }
 
+    // Section 4.6: the table's own limits on a request, and those of
+    // its groups and mounts.
+
+    let served =
+        muru_config::check_served_limits(table.max_body_size.as_deref(), table.timeouts.as_ref())
+            .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    for (name, group) in &table.groups {
+        muru_config::check_served_limits(group.max_body_size.as_deref(), group.timeouts.as_ref())
+            .map_err(|error| anyhow::anyhow!("[tool.muru.groups.{name}] {error}"))?;
+    }
+
+    for (name, mount) in &table.mounts {
+        muru_config::check_request_limits(mount.max_body_size.as_deref(), None)
+            .map_err(|error| anyhow::anyhow!("[tool.muru.mounts.{name}] {error}"))?;
+    }
+
     Ok(Resolved {
+        served,
         entrypoint,
         python: table.python.clone(),
         build: table.build.clone(),
@@ -1895,7 +1932,6 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         static_dirs,
         error_pages: table.error_pages,
         error_override: table.error_override,
-        maintenance: table.maintenance,
         logging: table.logging,
         max_requests,
         max_lifetime: match (args.max_lifetime, &table.max_lifetime) {
@@ -1909,145 +1945,9 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         timeouts: table.timeouts,
         memory: table.memory,
         env: table.env,
-        scaling: table.scaling,
         serving,
+        layers,
     })
-}
-
-/// The declarative file equivalent to this run, for --print-config: the
-/// release as section 6.8 would define it, the listeners and the limits.
-fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
-    use muru_config::{App, Document, Listener, Release};
-
-    let name = app_name(&resolved.entrypoint).replace('_', "-");
-    let limits = limits(args);
-    let (http, https) = addresses(args, &resolved.serving);
-    let mut listeners = vec![Listener {
-        address: http.to_string(),
-        tls: false,
-        h2c: None,
-    }];
-
-    if resolved.serving.tls() {
-        listeners.push(Listener {
-            address: https.to_string(),
-            tls: true,
-            h2c: None,
-        });
-    }
-
-    let release = Release {
-        grpc_web_origins: resolved.grpc_web_origins.clone(),
-        kind: None,
-        profile: None,
-        command: Vec::new(),
-        cwd: None,
-        bind: None,
-        instances: None,
-        readiness: None,
-        stop_signal: None,
-        source: Some(resolved.project.display().to_string()),
-        entrypoint: resolved.entrypoint.clone(),
-        interface: (resolved.interface != muru_config::Interface::Auto)
-            .then_some(resolved.interface),
-        reflection: resolved.reflection.then_some(true),
-        handoff: resolved.handoff,
-        factory: resolved.factory.map(|_| true),
-        factory_phase: resolved.factory,
-        python: Some(written_interpreter(
-            &interpreter(args, resolved, false)?.python,
-            &resolved.project,
-        )),
-        build: resolved.build.clone(),
-        bytecode: None,
-        processes: Some(resolved.processes),
-        threads: Some(resolved.threads),
-        sync_threads: Some(resolved.sync_threads),
-        concurrency: Some(resolved.concurrency),
-        preload: Some(resolved.preload),
-        hooks: resolved.hooks.clone(),
-        groups: resolved.groups.clone(),
-        mounts: resolved.mounts.clone(),
-        accel_redirect: resolved.accel_redirect.then_some(true),
-        cgi_local_redirect: resolved.cgi_local_redirect.then_some(true),
-        sendfile_roots: resolved.sendfile_roots.clone(),
-        sendfile_header: resolved.sendfile_header.clone(),
-        static_dirs: resolved.static_dirs.clone(),
-        error_pages: resolved.error_pages.clone(),
-        error_override: resolved.error_override.clone(),
-        maintenance: resolved.maintenance.clone(),
-        logging: resolved.logging.clone(),
-        max_requests: resolved.max_requests,
-        max_lifetime: resolved.max_lifetime.map(muru_config::format_duration),
-        env: resolved.env.clone(),
-        scaling: resolved.scaling.clone(),
-        timeouts: {
-            let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
-            (timeouts.soft.is_some() || timeouts.hard.is_some() || resolved.timeouts.is_some())
-                .then(|| timeouts.table())
-        },
-        memory: {
-            let policy = memory_policy(&args.memory, resolved.memory.as_ref())?;
-            (policy != muru_controller::model::MemoryPolicy::default()).then(|| {
-                muru_config::Memory {
-                    measure: Some(policy.measure),
-                    soft_limit: policy.soft_limit.map(muru_config::format_size),
-                    soft_for: Some(muru_config::format_duration(Duration::from_millis(
-                        policy.soft_for_ms,
-                    ))),
-                    reclaim_first: Some(policy.reclaim_first),
-                    hard_limit: policy.hard_limit.map(muru_config::format_size),
-                    check_interval: Some(muru_config::format_duration(Duration::from_millis(
-                        policy.check_interval_ms,
-                    ))),
-                }
-            })
-        },
-        // The source's own [tool.muru] table carries its commands.
-        commands: std::collections::BTreeMap::new(),
-    };
-    let document = Document {
-        listener: listeners,
-        compression: (!resolved.serving.compression).then(|| muru_config::Compression {
-            enabled: Some(false),
-            ..Default::default()
-        }),
-        limits: Some(muru_config::Limits {
-            max_body_size: Some(muru_config::format_size(limits.max_body_size)),
-            max_header_bytes: Some(muru_config::format_size(limits.max_header_bytes as u64)),
-            max_headers: Some(limits.max_headers),
-            header_read_timeout: Some(muru_config::format_duration(limits.header_read_timeout)),
-            queue_timeout: Some(muru_config::format_duration(limits.queue_timeout)),
-            request_deadline: Some(muru_config::format_duration(limits.request_deadline)),
-            body_idle_timeout: Some(muru_config::format_duration(limits.body_idle_timeout)),
-            response_idle_timeout: Some(muru_config::format_duration(limits.response_idle_timeout)),
-            max_connections: Some(limits.max_connections),
-            max_connections_per_client: Some(limits.max_connections_per_client),
-            keep_alive_timeout: Some(muru_config::format_duration(limits.keep_alive_timeout)),
-            keep_alive_timeout_proxy: Some(muru_config::format_duration(
-                limits.keep_alive_timeout_proxy,
-            )),
-            max_requests_per_connection: Some(limits.max_requests_per_connection),
-            http2: Some(muru_config::Http2Limits {
-                max_concurrent_streams: Some(limits.http2_max_concurrent_streams),
-            }),
-            spool_quota: None,
-        }),
-        app: std::collections::BTreeMap::from([(
-            name,
-            App {
-                release: std::collections::BTreeMap::from([("r1".to_owned(), release)]),
-                ..App::default()
-            },
-        )]),
-        ..Document::default()
-    };
-    let text = document.to_toml().context("writing the configuration")?;
-    Ok(format!(
-        "# The declarative equivalent of this muructl run, for muructl apply.\n\
-         # The release is written as r1; muructl deploy numbers releases itself.\n\
-         # Listeners and limits belong in the daemon configuration file.\n\n{text}"
-    ))
 }
 
 /// A host's named groups as the edge connects them: each group's sockets
@@ -2068,6 +1968,17 @@ fn group_sockets_from(
     announced
         .iter()
         .map(|(name, sockets)| muru_edge::routing::GroupSockets {
+            limits: groups
+                .get(name)
+                .and_then(|group| {
+                    muru_config::check_served_limits(
+                        group.max_body_size.as_deref(),
+                        group.timeouts.as_ref(),
+                    )
+                    .ok()
+                })
+                .map(|settings| served_limits(&settings))
+                .unwrap_or_default(),
             name: name.clone(),
             paths: groups
                 .get(name)
@@ -2124,20 +2035,21 @@ async fn host_control(
     }
 }
 
-/// What a worker takes at once, as its HELLO declared it: threads, its
-/// event loop's concurrency, or both when the default mount is WSGI and
-/// a mount is ASGI.
+/// What a worker takes at once, as its HELLO declared it: the threads of
+/// its shared pool, its event loop's concurrency, or both when it serves
+/// WSGI and ASGI. A mount's own threads or concurrency are on the
+/// mount's line.
 fn capacity(worker: Option<muru_edge::link::WorkerStatus>, threads: usize) -> String {
     let threads_of = |count: usize| admin::counted(count, "thread", "threads");
 
     match worker {
-        Some(worker) if worker.worker_type == "asgi" => format!("concurrency {}", worker.slots),
-        Some(worker) if worker.async_slots > 0 => format!(
+        Some(worker) if worker.shared_threads > 0 && worker.concurrency > 0 => format!(
             "{} and an event loop of concurrency {}",
-            threads_of(worker.slots),
-            worker.async_slots
+            threads_of(worker.shared_threads),
+            worker.concurrency
         ),
-        Some(worker) => threads_of(worker.slots),
+        Some(worker) if worker.concurrency > 0 => format!("concurrency {}", worker.concurrency),
+        Some(worker) => threads_of(worker.shared_threads),
         None => threads_of(threads),
     }
 }
@@ -2182,7 +2094,8 @@ fn group_serves(group: &muru_config::Group) -> String {
     format!("{serves}{asks}{}", admin::group_mounts(&group.mounts))
 }
 
-/// What a named mount serves, from where, and on which threads.
+/// What a named mount serves, from where, and with which threads or
+/// limits of its own.
 fn mount_serves(mount: &muru_config::Mount) -> String {
     let mut serves = if mount.path.is_empty() {
         format!("serves the gRPC services of {}", mount.entrypoint)
@@ -2199,6 +2112,22 @@ fn mount_serves(mount: &muru_config::Mount) -> String {
             threads.reserved, threads.max
         )),
         None => {}
+    }
+
+    let sockets = |count: usize| admin::counted(count, "open WebSocket", "open WebSockets");
+
+    match (mount.concurrency, mount.max_connections) {
+        (Some(concurrency), Some(connections)) => serves.push_str(&format!(
+            " with concurrency {concurrency} of its own and up to {}",
+            sockets(connections)
+        )),
+        (Some(concurrency), None) => {
+            serves.push_str(&format!(" with concurrency {concurrency} of its own"));
+        }
+        (None, Some(connections)) => {
+            serves.push_str(&format!(" with up to {}", sockets(connections)));
+        }
+        (None, None) => {}
     }
 
     if mount.internal.unwrap_or(false) {
@@ -2267,6 +2196,9 @@ fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
         .mounts
         .iter()
         .map(|(name, mount)| muru_edge::routing::MountPath {
+            limits: muru_config::check_request_limits(mount.max_body_size.as_deref(), None)
+                .map(|settings| served_limits(&settings))
+                .unwrap_or_default(),
             name: name.clone(),
             path: mount.path.clone(),
             internal: mount.internal.unwrap_or(false),
@@ -2340,6 +2272,19 @@ fn tls(args: &RunArgs, serving: &Serving, project: &Path) -> anyhow::Result<Opti
         },
         development,
     }))
+}
+
+/// What to say when a project has both a muru.toml and a `[tool.muru]`
+/// table in its pyproject.toml: the first is used and the second is not
+/// read, and the two are never merged.
+pub(crate) fn passed_over_note(project: &Path) -> Option<String> {
+    muru_config::passed_over(project).map(|pyproject| {
+        format!(
+            "{} is used for the project's settings; the [tool.muru] table in {} is not read",
+            project.join("muru.toml").display(),
+            pyproject.display()
+        )
+    })
 }
 
 /// The interpreter to run the host with (sections 8.1 and 13.1): --python
@@ -2476,6 +2421,10 @@ async fn check(args: CheckArgs) -> anyhow::Result<()> {
             "muru: check: [tool.muru] from {} is valid",
             source.display()
         );
+    }
+
+    if let Some(note) = passed_over_note(&resolved.project) {
+        println!("muru: check: {note}");
     }
 
     let python = interpreter(&run_args, &resolved, false)?;
@@ -2680,20 +2629,6 @@ fn interface_label(interface: &str) -> &str {
     }
 }
 
-/// An interpreter as --print-config writes it: relative to the project
-/// when it is inside it (the project's own .venv), so the file works in
-/// another checkout of the project, else absolute.
-fn written_interpreter(python: &Path, project: &Path) -> String {
-    let project = project
-        .canonicalize()
-        .unwrap_or_else(|_| project.to_path_buf());
-
-    match python.strip_prefix(&project) {
-        Ok(relative) => relative.display().to_string(),
-        Err(_) => python.display().to_string(),
-    }
-}
-
 /// Development mode: one host with forked workers behind an embedded edge,
 /// replaced by a new one when --reload sees a source change.
 async fn run(args: RunArgs) -> anyhow::Result<()> {
@@ -2748,13 +2683,26 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         resolved.threads = 1;
     }
 
+    // The interpreter is found as the run would find it, so that one the
+    // run could not use is refused here with the same words.
+
     if args.print_config {
-        print!("{}", declarative(&args, &resolved)?);
+        let python = interpreter(&args, &resolved, false)?;
+        print!(
+            "{}",
+            print_config::for_run(&args, &resolved, &python.describe())
+        );
         return Ok(());
     }
 
     if let Some(source) = &resolved.source {
         muru_common::muru_println!("using [tool.muru] from {}", source.display());
+    }
+
+    if args.settings_file.is_none()
+        && let Some(note) = passed_over_note(&resolved.project)
+    {
+        muru_common::muru_println!("{note}");
     }
 
     // Section 8.2: run is build under the build mode, then serve. A
@@ -2968,6 +2916,15 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         spec.logging.format = Some("json".to_owned());
     }
 
+    // Section 9.12: what the application is served with, which a command
+    // of the project run through the admin socket runs with too.
+
+    let served = Arc::new(run_admin::Served {
+        interpreter: std::sync::Mutex::new((spec.python.clone(), spec.pythonpath.clone())),
+        env: spec.env.clone(),
+        file: args.settings_file.clone(),
+    });
+
     let logs = Logs::default();
     let group_tables = resolved.groups.clone();
     let mounts = mount_paths(&resolved);
@@ -3079,7 +3036,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         development,
         occasions: args.easter_egg.unwrap_or_default(),
         access_log,
-        limits: limits(&args),
+        limits: limits(&args, &resolved),
         compression: if resolved.serving.compression {
             muru_edge::compression::Compression::default()
         } else {
@@ -3247,6 +3204,8 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     // never share one; muructl finds it from the file beside it.
 
     let (admin_stop_tx, admin_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let commands = muru_controller::commands::Underway::default();
+    let mut admin_serving = None;
     let runtime = muru_controller::locations::Locations::resolve(&Default::default())
         .run
         .path;
@@ -3296,12 +3255,14 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
             access_log: edge.access_log(),
             logs: logs.clone(),
             host: Arc::clone(&host_link),
+            served: Arc::clone(&served),
+            commands: commands.clone(),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {
             Ok(serving) => {
                 muru_common::muru_println!("admin socket {}", registration.socket.display());
-                tokio::spawn(serving);
+                admin_serving = Some(tokio::spawn(serving));
             }
             Err(error) => muru_common::muru_println!("no admin socket: {error:#}"),
         }
@@ -3523,6 +3484,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
 
                         spec.python = python.python.clone();
                         spec.pythonpath = library.pythonpath.clone();
+                        served.replace(spec.python.clone(), spec.pythonpath.clone());
                     }
                     Ok(false) => {}
                     Err(error) => {
@@ -3609,6 +3571,36 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         health.stopping();
     }
 
+    // Section 9.12: the commands running through the admin socket are
+    // stopped as at their timeout while the rest stops, inside the same
+    // budget, and waited for, so each caller hears how its command ended
+    // and none is left running.
+
+    let (verb, commands_deadline) = match &serve {
+        Some(mode) => ("serve", Instant::now() + mode.shutdown.budget),
+        None if muru_controller::shutdown::is_main_process() => (
+            "run",
+            Instant::now() + muru_controller::shutdown::DEFAULT_BUDGET,
+        ),
+        None => (
+            "run",
+            Instant::now() + muru_controller::commands::STOP_GRACE,
+        ),
+    };
+
+    let mut stopping_commands = {
+        let commands = commands.clone();
+
+        tokio::spawn(async move {
+            commands
+                .stop_all(
+                    &format!("muructl {verb} shut down"),
+                    commands_deadline.into(),
+                )
+                .await;
+        })
+    };
+
     // Section 13.4: the edge stops accepting and lets the requests in
     // flight finish before the host is told to stop, so no request is
     // written to a worker that is going. As a container's main process
@@ -3664,8 +3656,34 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     // The lines of the last requests are written before the run exits, unless
     // the destination has stalled.
 
+    // In development, another Ctrl-C or SIGTERM, whether during the drain
+    // or while the commands are waited for, kills the commands still
+    // running rather than give them their grace period. muructl serve and
+    // a container's main process keep to their budget.
+
+    if serve.is_none() && !muru_controller::shutdown::is_main_process() {
+        loop {
+            tokio::select! {
+                _ = &mut stopping_commands => break,
+                _ = interrupt.recv() => commands.kill_all(),
+                _ = terminate.recv() => commands.kill_all(),
+            }
+        }
+    } else {
+        let _ = stopping_commands.await;
+    }
+
     let _ = tokio::task::spawn_blocking(move || written.flush(Duration::from_secs(2))).await;
     let _ = admin_stop_tx.send(());
+
+    // The admin socket finishes the streams it is sending, the commands'
+    // last messages among them, unless a client holds one open, such as
+    // `muructl logs --follow`.
+
+    if let Some(serving) = admin_serving {
+        let _ = tokio::time::timeout(Duration::from_secs(1), serving).await;
+    }
+
     drop(registration);
     let _ = std::fs::remove_dir_all(&run_dir);
 

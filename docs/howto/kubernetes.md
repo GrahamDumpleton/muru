@@ -225,8 +225,17 @@ describes both figures.
 
 ## Migrations
 
-A Job runs the application's own migration command from the same image,
-before the Deployment is updated to it:
+Declare the migration as a [command](commands.md) of the project:
+
+```toml
+[tool.muru.commands.migrate]
+description = "Apply database migrations"
+run = ["python", "manage.py", "migrate", "--noinput"]
+timeout = "30m"
+```
+
+A Job runs it from the new image, before the Deployment is updated to
+it:
 
 ```yaml
 apiVersion: batch/v1
@@ -244,14 +253,23 @@ spec:
       containers:
         - name: migrate
           image: registry.example.com/shop:1.4.2
-          command: ["/app/.venv/bin/python", "manage.py", "migrate", "--noinput"]
+          command: ["muructl", "command", "run", "migrate"]
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: ["ALL"]}
 ```
 
-The command runs as any other process in the image does; `muructl` takes
-no part in it.
+With no application named and nothing serving in the Job's pod,
+`muructl` runs the command itself, with the image's interpreter, the
+project's `[tool.muru.env]` variables and the command's timeout, and
+exits with its status, so a failed migration fails the Job. Give the Job
+the environment variables and secrets the Deployment's containers have,
+since the migration reads the same settings. `parallelism` is 1 by
+default, which keeps the migration to one run. An init container or a
+Helm pre-upgrade hook runs the same command.
+
+`muructl exec -- alembic upgrade head` runs a command that is not
+declared, the same way.
 
 ## Looking inside a pod
 
@@ -264,6 +282,7 @@ kubectl exec deploy/shop -- muructl status
 kubectl exec deploy/shop -- muructl logs --access --follow
 kubectl exec deploy/shop -- muructl debug stacks
 kubectl exec deploy/shop -- muructl restart --all
+kubectl exec deploy/shop -- muructl command run backup
 ```
 
 Whoever may exec into the pod may use them, which RBAC decides.

@@ -43,6 +43,9 @@ inputs.label = {}
 run = ["python", "-c", "import time; print('up', flush=True); time.sleep(60)"]
 exclusive = true
 timeout = "2s"
+
+[tool.muru.commands.hold]
+run = ["python", "-c", "import time; print('up', flush=True); time.sleep(60)"]
 """
 
 APP = """
@@ -108,7 +111,7 @@ def test_declared_commands_run_with_their_inputs(tmp_path: Path) -> None:
         assert '"Bob" does not match [a-z]+' in bad.stderr, bad.stderr
 
         unknown = daemon.muructl("command", "run", "ops", "nothing", check=False)
-        assert "ops@r1 has no command named nothing; it declares backup, greet, slow" in (
+        assert "ops@r1 has no command named nothing; it declares backup, greet, hold, slow" in (
             unknown.stderr
         )
 
@@ -215,5 +218,21 @@ def test_exclusive_commands_run_one_at_a_time_and_time_out(tmp_path: Path) -> No
             time.sleep(0.2)
 
         assert json.loads(again.stdout.splitlines()[0])["line"] == "up", again.stdout
+
+        # The daemon shutting down stops a command running under it, and
+        # its caller hears how it ended.
+
+        held = subprocess.Popen(
+            [str(muructl), "command", "run", "ops", "hold", "--socket", socket],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert held.stdout is not None
+        assert held.stdout.readline().strip() == "up"
+        daemon.stop()
+        _, stderr = held.communicate(timeout=30)
+        assert held.returncode == 143, (held.returncode, stderr)
+        assert "stopped because the daemon shut down" in stderr, stderr
     finally:
         daemon.stop()

@@ -300,6 +300,11 @@
           "$ref": "#/$defs/GroupMatch",
           "description": "What the group asks of a request beside its path: the client classes, hosts and methods it takes, each list any of its entries; a group asking more comes before one asking less, and a group with lists and no `paths` takes every path."
         },
+        "max_body_size": {
+          "description": "The largest body of a request the group serves, for example 200MB, which the edge enforces.",
+          "type": "string",
+          "x-default": "the release's"
+        },
         "max_lifetime": {
           "description": "How long a worker of the group lives before it is replaced, for example 1h, with jitter.",
           "type": "string",
@@ -584,7 +589,7 @@
           "x-default": "the release's"
         },
         "concurrency": {
-          "description": "Requests an ASGI mount runs at once on each worker, slots of its own at the edge; it shares the worker's slots when absent.",
+          "description": "Requests an ASGI mount runs at once on each worker, slots of its own at the edge; it shares the event loop's concurrency when absent.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -607,8 +612,13 @@
           "description": "Reachable only through internal redirects: a client's request for its path is answered 404.",
           "type": "boolean"
         },
+        "max_body_size": {
+          "description": "The largest body of a request the mount serves, for example 200MB, which the edge enforces.",
+          "type": "string",
+          "x-default": "the worker group's, else the release's"
+        },
         "max_connections": {
-          "description": "Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; unbounded but by its slots when absent.",
+          "description": "Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; each holds a request slot when absent.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -986,7 +996,7 @@
     },
     "ServeSettings": {
       "additionalProperties": false,
-      "description": "The `[tool.muru.serve]` table (`[serve]` in muru.toml), and the file `MURU_SERVE_CONFIG` names: how `muructl serve` runs the application in a container. A key is a flag of the command in snake case, taking the flag's value; a list key takes the values the flag would be repeated with.",
+      "description": "The `[tool.muru.serve]` table (`[serve]` in muru.toml, and in the file `muructl serve --config` names in its place): how `muructl serve` runs the application in a container. A key is a flag of the command in snake case, taking the flag's value; a list key takes the values the flag would be repeated with.",
       "properties": {
         "access_log": {
           "default": "on",
@@ -1238,8 +1248,13 @@
     },
     "Timeouts": {
       "additionalProperties": false,
-      "description": "The `[timeouts]` table of a release or a `[tool.muru]` table: the timeouts the host enforces on its workers. The edge's own timeouts are the daemon's `[limits]`.",
+      "description": "The `[timeouts]` table of a release or a `[tool.muru]` table: the timeouts the host enforces on its workers, and the four the edge enforces on a request the release serves, which are otherwise the virtual host's or the daemon's `[limits]`.",
       "properties": {
+        "body_idle_timeout": {
+          "description": "Time a client may pause while sending a body to what is served here.",
+          "type": "string",
+          "x-default": "the host's, else `body_idle_timeout` in `[limits]`"
+        },
         "gil_stall_timeout": {
           "default": "30s",
           "description": "How long a worker may go with no thread running Python, or with no report to its host, before it is replaced as for the hard timeout.",
@@ -1258,6 +1273,21 @@
           "default": "10s",
           "description": "How long an ASGI worker's event loop may go without running before the worker is replaced as for the hard timeout.",
           "type": "string"
+        },
+        "queue_timeout": {
+          "description": "Time a request served here may wait for a worker, which the edge enforces; the virtual host's when absent, or else the daemon's `[limits]` value.",
+          "type": "string",
+          "x-default": "the host's, else `queue_timeout` in `[limits]`"
+        },
+        "request_deadline": {
+          "description": "Time a request served here may take to produce its response head.",
+          "type": "string",
+          "x-default": "the host's, else `request_deadline` in `[limits]`"
+        },
+        "response_idle_timeout": {
+          "description": "Time a worker here may pause mid-response.",
+          "type": "string",
+          "x-default": "the host's, else `response_idle_timeout` in `[limits]`"
         },
         "shutdown_timeout": {
           "default": "5s",
@@ -1382,6 +1412,11 @@
       "$ref": "#/$defs/Maintenance",
       "description": "What maintenance mode lets through."
     },
+    "max_body_size": {
+      "description": "The largest body of a request the release serves, for example 50MB, which the edge enforces.",
+      "type": "string",
+      "x-default": "the host's, else `max_body_size` in `[limits]`"
+    },
     "max_lifetime": {
       "description": "How long a worker lives before it is replaced.",
       "type": "string"
@@ -1471,7 +1506,7 @@
     },
     "timeouts": {
       "$ref": "#/$defs/Timeouts",
-      "description": "The timeouts the host enforces on its workers."
+      "description": "The timeouts the host enforces on its workers, and those of a request the release serves, which the edge enforces."
     }
   },
   "title": "The project's [tool.muru] table",

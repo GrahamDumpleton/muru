@@ -202,6 +202,72 @@ def test_counts_reach_the_metrics_and_a_trusted_proxy_waits_longer(tmp_path: Pat
         daemon.stop()
 
 
+def test_a_listener_has_limits_of_its_own_and_a_reload_changes_them(tmp_path: Path) -> None:
+    first, second = support.free_port(), support.free_port()
+    daemon = start_daemon(
+        tmp_path,
+        listeners=[(first, False), (second, False)],
+        config_extra="\n[listener.limits]\nmax_requests_per_connection = 2\nmax_headers = 6\n",
+    )
+
+    def many_headers(port: int) -> bytes:
+        sock = connect(port)
+        extra = "".join(f"X-Extra-{index}: 1\r\n" for index in range(8))
+        sock.sendall(f"GET /catalogue HTTP/1.1\r\nHost: localhost\r\n{extra}\r\n".encode())
+        answer = sock.recv(65536)
+        sock.close()
+        return answer.split(b"\r\n", 1)[0]
+
+    try:
+        assert daemon.deploy("shop", SHOP, "--processes", "1") == (
+            "muru: release shop@r1 is ready and serving"
+        )
+
+        # The table is the second listener's: its connections close after
+        # two requests and its requests carry at most six headers, while
+        # the first listener has the node's limits.
+
+        sock = connect(second)
+        assert b"connection: close" not in exchange(sock, "/catalogue").lower()
+        assert b"connection: close" in exchange(sock, "/catalogue").lower()
+        sock.close()
+        sock = connect(first)
+
+        for _ in range(3):
+            assert b"connection: close" not in exchange(sock, "/catalogue").lower()
+
+        sock.close()
+        assert b"431" in many_headers(second)
+        assert b"200" in many_headers(first)
+
+        # A reload gives the edge a changed table, for the connections
+        # accepted from then on.
+
+        config = tmp_path / "muru.toml"
+        config.write_text(
+            config.read_text().replace(
+                "max_requests_per_connection = 2", "max_requests_per_connection = 1"
+            )
+        )
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert "[[listener]] limits (the edge has it)" in reloaded, reloaded
+        sock = connect(second)
+        deadline = time.monotonic() + 10
+
+        while b"connection: close" not in exchange(sock, "/catalogue").lower():
+            assert time.monotonic() < deadline, "the reloaded limit never took effect"
+            sock.close()
+            time.sleep(0.1)
+            sock = connect(second)
+
+        sock.close()
+        sock = connect(first)
+        assert b"connection: close" not in exchange(sock, "/catalogue").lower()
+        sock.close()
+    finally:
+        daemon.stop()
+
+
 def test_metrics_in_development_count_connections() -> None:
     server = support.start("plain_wsgi:application", workers=1, threads=1)
 

@@ -37,6 +37,7 @@ and reach routes by the route's `name`.
 | `routes.NAME.traffic` | `{ pin = 'r43' }` sends every request to one release of the route's application; `{ split = { r43 = 20 } }` replaces the route's shares |
 | `routes.NAME.target` | What serves the route instead: `{ app = 'NAME' }`, `{ static = '/srv/snapshot' }` or `{ upstream = 'NAME' }` |
 | `routes.NAME.rate_limits` | The [rate limits](client-classes.md) in place of the route's |
+| `routes.NAME.request_headers`, `response_headers` | The [header rules](headers.md), each table in place of the route's |
 | `routes.NAME.error_pages` | [Error pages](error-pages.md) by status or `status:reason`, each in place of the route's page for the same key; the route's other pages stay |
 | `routes.NAME.client_routes` | Routes for [client classes](client-classes.md), by class: each takes the keys above (except `client_routes`) for that class's requests at the route's host and path |
 | `apps.NAME.maintenance` | Maintenance mode on (`true`) or off (`false`) for the application |

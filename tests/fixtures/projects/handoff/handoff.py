@@ -133,6 +133,11 @@ class Chat:
             ws.send(threading.current_thread().name)
             return
 
+        if message == "sleep":
+            time.sleep(1.5)
+            ws.send("slept")
+            return
+
         if message == "bye":
             ws.close(4001, "asked to")
             return

@@ -61,16 +61,32 @@ message Snapshot {
   Limits limits = 17;                   // section 4.6: the limits in force; the edge keeps its current ones when absent
   AccessLog access_log = 18;            // section 11.2: the records the access log writes; the edge keeps its current choice when absent
   repeated AccessLogOverride access_log_overrides = 19; // section 11.2: changes in force for a period, the newest last; only with access_log
+  repeated ListenerLimits listener_limits = 20; // section 4.18: listeners' own limits, over the snapshot's; read only with limits
+  repeated ListenerProxy listener_proxies = 21; // section 4.7: listeners' own trusted proxies, in place of proxy for their connections
 }
 
 // Section 11.2: which access records are written, where the edge was
 // told to write them. A record not written is still counted and kept
 // in memory. The daemon sends the [logs] table's choice in every
-// snapshot, and an application's own on its AppWorkers entries.
+// snapshot, a virtual host's own on its Host entry and an application's
+// own on its AppWorkers entries.
 message AccessLog {
   string mode = 1;                      // on, errors or off; on when empty
   uint64 slow_ms = 2;                   // a request at least this slow is written under errors
   repeated string exclude = 3;          // path patterns never written, * any run of characters and ? one
+  string format = 4;                    // json or combined, for the file; json when empty
+}
+
+// Section 11.2: a virtual host's or an application's own choice of
+// which access records are written, laid over the node's: a key it
+// leaves out is the level beneath's, the application's over its host's
+// over the node's, and its paths are left out besides theirs.
+message AccessLogChoice {
+  string mode = 1;                      // on, errors or off; the level beneath's when empty
+  optional uint64 slow_ms = 2;          // the level beneath's when absent
+  repeated string exclude = 3;          // path patterns never written, besides the levels' beneath
+  string format = 4;                    // json or combined; the node's when empty (a virtual host's choice only)
+  string file = 5;                      // the file that takes the host's records in place of the node's, as a path; the node's when empty
 }
 
 // Section 11.2: a change to which access records are written, for a
@@ -107,6 +123,34 @@ message Limits {
   uint64 websocket_max_message_size = 16;
   uint64 websocket_ping_interval_ms = 17;
   uint64 websocket_idle_timeout_ms = 18;
+}
+
+// Section 4.6: the limits one level sets on a request, each in place of
+// the level beneath's: a route's over those of the mount, the worker
+// group and the release that serve the request, over its virtual host's,
+// over the node's. A field left at 0 says nothing.
+message RequestLimits {
+  uint64 max_body_size = 1;
+  uint64 queue_timeout_ms = 2;
+  uint64 request_deadline_ms = 3;
+  uint64 body_idle_timeout_ms = 4;
+  uint64 response_idle_timeout_ms = 5;
+}
+
+// Sections 4.6 and 4.18: a listener's own limits on its connections and
+// on reading a request's head, each in place of the node's for the
+// connections it accepts. A field that is absent says nothing.
+message ListenerLimits {
+  string listener = 1;                  // the listener's address, as IP:PORT
+  optional uint64 max_header_bytes = 2;
+  optional uint32 max_headers = 3;
+  optional uint64 header_read_timeout_ms = 4;
+  optional uint64 max_connections = 5;
+  optional uint64 max_connections_per_client = 6;
+  optional uint64 keep_alive_timeout_ms = 7;
+  optional uint64 keep_alive_timeout_proxy_ms = 8;
+  optional uint64 max_requests_per_connection = 9;
+  optional uint32 http2_max_concurrent_streams = 10;
 }
 
 // Section 6.13: who may speak HTTP/2 in cleartext on a listener without
@@ -219,6 +263,39 @@ message Compression {
 }
 
 // Section 4.7: which peers may speak for the client, and how.
+// Section 4.17: a virtual host's or a route's own compression settings,
+// laid over the level beneath's key by key: the route's over its host's
+// over the node's.
+message CompressionChoice {
+  optional bool enabled = 1;            // the level beneath's when absent
+  repeated string encodings = 2;        // br, zstd, gzip in preference order; the level beneath's when empty
+  uint64 min_size = 3;                  // bodies smaller than this are left alone; the level beneath's when 0
+  repeated string types = 4;            // content types, exact or family/*; the level beneath's when empty
+  string level = 5;                     // fast, default or best; the level beneath's when empty
+}
+
+// Section 4.7: what a virtual host or a route does to the headers of a
+// request, or of a response: the names are removed, then the headers
+// set, each replacing any there, then those added beside any there.
+message HeaderRules {
+  repeated string remove = 1;
+  repeated HeaderField set = 2;
+  repeated HeaderField add = 3;         // responses only
+}
+
+// A header by name and value.
+message HeaderField {
+  string name = 1;
+  string value = 2;
+}
+
+// Section 4.7: a listener's own proxy settings, which replace the
+// snapshot's whole for the connections the listener accepts.
+message ListenerProxy {
+  string listener = 1;                  // the listener's address, as IP:PORT
+  Proxy proxy = 2;
+}
+
 message Proxy {
   repeated string trusted = 1;          // addresses, CIDR ranges, loopback, private, unix
   repeated string headers = 2;          // header types applied from trusted peers
@@ -240,6 +317,13 @@ message Host {
   repeated ErrorPage error_pages = 10;  // section 4.12: the host's pages
   ErrorOverride error_override = 11;
   repeated string rate_limits = 12;     // section 4.15: applied to every request for the host
+  RequestLimits limits = 13;            // section 4.6: the limits of a request for the host's routes; none when absent
+  bool canonical_redirect = 14;         // requests for the host's other names are redirected to the canonical name
+  AccessLogChoice access_log = 15;      // section 11.2: the host's own access log choice; none when absent
+  CompressionChoice compression = 16;   // section 4.17: the host's own compression settings; none when absent
+  HeaderRules request_headers = 17;     // section 4.7: applied to the host's requests before anything serves them
+  HeaderRules response_headers = 18;    // applied to every response to the host's requests
+  Maintenance maintenance = 19;         // section 4.12: the host's maintenance mode and its exemptions; off when absent
 }
 
 // A route (section 4.5): a path prefix of a host to an application, or
@@ -266,11 +350,15 @@ message Route {
   string upstream = 19;                 // section 4.13: the upstream that takes the requests, instead of an application
   string fallback_upstream = 20;        // the upstream that takes requests no file answers, for a static route
   Upload upload = 21;                   // section 4.11: uploads received and stored by the edge; off when absent
-  uint64 max_body_size = 22;            // section 4.6: the route's body limit; the edge's own when 0
+  reserved 22;
   repeated string rate_limits = 23;     // section 4.15: applied after the host's
   Methods methods = 24;                 // methods the route refuses; none when absent
   string mode = 25;                     // the site mode the application sees as muru.mode; none when empty
   repeated string client_classes = 26;  // section 4.14: the classes the route takes; every request when empty
+  RequestLimits limits = 27;            // section 4.6: the limits of the route's requests, over the host's; none when absent
+  CompressionChoice compression = 28;   // section 4.17: the route's own compression settings, over the host's; none when absent
+  HeaderRules request_headers = 29;     // section 4.7: applied to the route's requests after the host's
+  HeaderRules response_headers = 30;    // applied to every response to the route's requests after the host's
 }
 
 // Section 4.11: how a route's uploads are received before dispatch.
@@ -334,7 +422,9 @@ message AppWorkers {
   repeated string waking_groups = 15;   // section 7.4: groups, "default" among them, whose requests wait to be woken when they have no workers
   repeated string grpc_web_origins = 16; // section 6.13: the origins whose pages may call it through gRPC-Web, or *; no CORS when empty
   repeated StaticDir static_dirs = 17;  // section 4.9: the release's own directories of files, by path prefix
-  AccessLog access_log = 18;            // section 11.2: the application's own access log choice; the snapshot's when absent
+  reserved 18;
+  AccessLogChoice access_log = 19;      // section 11.2: the application's own access log choice; none when absent
+  RequestLimits limits = 20;            // section 4.6: the release's own limits on a request, over its host's; none when absent
 }
 
 // Section 4.9: a directory of a release's own files, served by the edge
@@ -360,6 +450,7 @@ message Mount {
   bool cgi_local_redirect = 6;          // a 200 with a local Location and no body is an internal redirect
   repeated string sendfile_roots = 7;   // section 4.9: directories the mount's X-Muru-Sendfile paths must lie in
   string sendfile_header = 8;           // a second header honoured as X-Muru-Sendfile is; none when empty
+  RequestLimits limits = 9;             // section 4.6: the mount's own limits on a request, over its group's and release's
 }
 
 message Group {
@@ -369,6 +460,7 @@ message Group {
   repeated string client_classes = 4;   // section 4.14: the classes the group takes, ahead of groups naming none
   repeated string hosts = 5;            // ADR 0033: the hosts it takes, lower case; every host when empty
   repeated string methods = 6;          // ADR 0033: the methods it takes, upper case; every method when empty
+  RequestLimits limits = 7;             // section 4.6: the group's own limits on a request, over its release's
 }
 
 message Applied {
@@ -480,10 +572,14 @@ message PoolState {
   string release = 2;
   string group = 3;
   uint32 workers = 4;
-  uint32 slots = 5;
-  uint32 busy = 6;
+  uint32 slots = 5;                     // on both sides together
+  uint32 busy = 6;                      // on both sides together
   uint32 waiting = 7;
   uint32 websockets = 8;                // open WebSockets, each holding a slot
+  uint32 threads = 9;                   // slots on the workers' threads, 0 when nothing runs on them
+  uint32 threads_busy = 10;
+  uint32 loop_slots = 11;               // slots on the workers' event loops, 0 without one
+  uint32 loop_busy = 12;
 }
 
 message WebSocketsRequest {

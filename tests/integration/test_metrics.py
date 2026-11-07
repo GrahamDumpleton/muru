@@ -84,11 +84,13 @@ def test_requests_are_counted_and_served_to_a_scraper(scraped: tuple[Daemon, int
     assert f'muru_request_duration_seconds_count{{{labels},phase="queue"}} 2\n' in text
     assert 'muru_requests_in_flight{app="shop",release="r1"} 0\n' in text, text
     assert 'muru_queue_depth{app="shop",release="r1",group="default"} 0\n' in text, text
-    assert 'muru_slots_busy{app="shop",release="r1",group="default"} 0\n' in text, text
+    assert f'muru_slots_busy{{{labels},side="threads"}} 0\n' in text, text
 
-    # The shop declares two processes of three threads.
+    # The shop declares two processes of three threads, and has no
+    # event loop to count anything against.
 
-    assert 'muru_slots_total{app="shop",release="r1",group="default"} 6\n' in text, text
+    assert f'muru_slots_total{{{labels},side="threads"}} 6\n' in text, text
+    assert 'side="loop"' not in text, text
     assert 'muru_workers_ready{app="shop",release="r1",group="default"} 2\n' in text, text
     assert re.search(r"muru_snapshot_version [1-9]\d*\n", text), text
 
@@ -222,8 +224,10 @@ app = "asgi"
         ), text
         assert "# TYPE muru_worker_recycles_total counter\n" in text
         assert "# TYPE muru_worker_exits_total counter\n" in text
-        assert 'muru_async_slots_busy{app="asgi",release="r1",group="default"} 0\n' in text, text
-        assert f"muru_async_slots_busy{{{labels}}} 0\n" in text, "a WSGI group holds none"
+        asgi = 'app="asgi",release="r1",group="default"'
+        assert f'muru_slots_busy{{{asgi},side="loop"}} 0\n' in text, text
+        assert f'muru_slots_total{{{asgi},side="threads"}}' not in text, "an ASGI group has none"
+        assert f'muru_slots_total{{{labels},side="loop"}}' not in text, "a WSGI group has none"
         listener = f'listener="127.0.0.1:{secure}"'
         assert f'muru_tls_handshakes_total{{{listener},result="completed"}} 1\n' in text, text
         assert f'muru_tls_handshakes_total{{{listener},result="failed"}} 1\n' in text, text

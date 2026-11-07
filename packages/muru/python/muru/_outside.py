@@ -8,14 +8,18 @@ user, which Linux's default ptrace scope allows. macOS allows it only to
 root, so there the host falls back to asking the worker itself, as it
 does on older interpreters.
 
-Threads read from outside have identifiers but no names; the worker's
+Threads read from outside have identifiers but no names. The worker's
 bookkeeping, which the runtime answers without the interpreter, supplies
-the names of its own threads and the request each thread serves.
+the names of the threads that tell the runtime theirs and the request
+each thread serves. On Linux the identifier is the thread's TID, and the
+kernel holds the name Python 3.14 and later give each thread they start,
+which names the rest (ADR 0053).
 """
 
 from __future__ import annotations
 
 import ast
+import codecs
 import functools
 import linecache
 import os
@@ -37,6 +41,17 @@ _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.
 WHOLE = sys.version_info >= (3, 15)
 
 
+# Where Linux shows each process's threads, and so the name each thread
+# has given itself.
+
+PROC = "/proc"
+
+# A thread read from outside: its identifier, its frames, root first, and
+# the name the operating system holds for it, if it has one.
+
+Thread = tuple[int, list[dict[str, Any]], str | None]
+
+
 class Unreadable(Exception):
     """The worker's interpreter cannot be read from outside."""
 
@@ -51,6 +66,55 @@ def _unwinder(pid: int) -> Any:
         return _remote_debugging.RemoteUnwinder(pid, all_threads=True)
     except (OSError, RuntimeError) as error:
         raise Unreadable(str(error)) from None
+
+
+def _comm(path: str) -> str | None:
+    """Return the thread name in a `comm` file, or None.
+
+    Linux keeps 15 bytes of a name and may cut a character in two, so a
+    piece of one left at the end is dropped, and any other byte that is
+    not UTF-8 is replaced. None means the file could not be read, as
+    when the thread has ended, or held no name.
+    """
+
+    try:
+        with open(path, "rb") as file:
+            raw = file.read()
+    except OSError:
+        return None
+
+    # Decoding as if more were to come holds back an unfinished
+    # character rather than replacing it.
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    return decoder.decode(raw.rstrip(b"\n"), final=False) or None
+
+
+class Names:
+    """The names Linux holds for one worker's threads, read once each.
+
+    Python 3.14 and later give the kernel a `threading` thread's name as
+    the thread starts and when it renames itself, cut to 15 bytes, so a
+    thread the runtime has no name for is still named by the TID it is
+    read under. The main thread's TID is the worker's pid, and its name
+    is the process's, which a thread inherits from the one that started
+    it when nothing names it; such a name says nothing and is left out.
+    """
+
+    def __init__(self, pid: int, proc: str = PROC) -> None:
+        self.pid = pid
+        self.task = os.path.join(proc, str(pid), "task")
+        self.process = _comm(os.path.join(proc, str(pid), "comm"))
+        self.known: dict[int, str | None] = {pid: "MainThread"}
+
+    def get(self, tid: int) -> str | None:
+        """Return the thread's name, or None when it has none to give."""
+
+        if tid not in self.known:
+            name = _comm(os.path.join(self.task, str(tid), "comm"))
+            self.known[tid] = None if name == self.process else name
+
+        return self.known[tid]
 
 
 def _line(location: Any) -> int:
@@ -167,18 +231,19 @@ def _main_thread(frames: list[dict[str, Any]]) -> bool:
     """Say whether a thread is the worker's main thread.
 
     It waits in the runtime, called from the host's module, for the
-    worker's life.
+    worker's life. On Linux the main thread is known by its TID, which
+    is the worker's pid; this is for a reader whose identifiers are not.
     """
 
     return bool(frames) and frames[-1]["file"].endswith(os.path.join("muru", "host.py"))
 
 
-def stacks_result(
-    threads: list[tuple[int, list[dict[str, Any]]]], bookkeeping: dict[str, Any]
-) -> dict[str, Any]:
+def stacks_result(threads: list[Thread], bookkeeping: dict[str, Any]) -> dict[str, Any]:
     """Report threads read from outside as the in-process stacks do.
 
-    The bookkeeping names them and gives the request each serves.
+    The bookkeeping names the threads the runtime knows and gives the
+    request each serves; the operating system's name, where the reader
+    found one, names the others.
     """
 
     active = bookkeeping.get("active", [])
@@ -193,12 +258,20 @@ def stacks_result(
         for key in (entry.get("thread"), entry.get("native"))
         if key is not None
     }
+
+    # An ASGI request's code runs on a pool for synchronous code for as
+    # long as a call there takes.
+
+    for entry in active:
+        for key in (*(entry.get("sync_threads") or ()), *(entry.get("sync_native") or ())):
+            serving.setdefault(key, entry)
+
     found = [
         {
             "ident": ident,
-            "name": names.get(
-                str(ident), "MainThread" if _main_thread(frames) else f"thread-{ident}"
-            ),
+            "name": names.get(str(ident))
+            or named
+            or ("MainThread" if _main_thread(frames) else f"thread-{ident}"),
             "daemon": False,
             "frames": [
                 {**frame, "text": linecache.getline(frame["file"], frame["line"]).strip() or None}
@@ -206,7 +279,7 @@ def stacks_result(
             ],
             "request": serving.get(ident),
         }
-        for ident, frames in threads
+        for ident, frames, named in threads
     ]
     found.sort(key=lambda entry: str(entry["name"]))
     return {"threads": found, "active": active, "outside": True}
@@ -215,13 +288,16 @@ def stacks_result(
 class Reader:
     """Reads the workers of one host, once it knows it can."""
 
-    def __init__(self) -> None:
+    def __init__(self, proc: str = PROC) -> None:
         self.unreadable: str | None = None
+        self.proc = proc
 
-    def stacks(self, pid: int) -> list[tuple[int, list[dict[str, Any]]]]:
+    def stacks(self, pid: int) -> list[Thread]:
         """Read the worker's threads with their frames, root first.
 
-        The threads the runtime parks are left out.
+        Each thread's name is read from the operating system as soon as
+        its frames are, while the thread is most likely still there. The
+        threads the runtime parks are left out.
         """
 
         if self.unreadable is not None:
@@ -251,7 +327,12 @@ class Reader:
 
                 time.sleep(0.01)
 
-        return [(ident, frames) for ident, frames in _threads(trace) if not parked(frames)]
+        names = Names(pid, self.proc)
+        return [
+            (ident, frames, names.get(ident))
+            for ident, frames in _threads(trace)
+            if not parked(frames)
+        ]
 
     def profile(
         self, pids: list[int], duration: float, interval: float, names: dict[int, dict[str, str]]
@@ -273,6 +354,7 @@ class Reader:
                 failed[pid] = str(error)
 
         counts: dict[int, Counter[str]] = {pid: Counter() for pid in unwinders}
+        os_names = {pid: Names(pid, self.proc) for pid in unwinders}
         rounds: Counter[int] = Counter()
         deadline = time.monotonic() + duration
 
@@ -304,7 +386,7 @@ class Reader:
                     # As inside, the main thread, which only waits, is
                     # not sampled.
 
-                    if parked(frames) or _main_thread(frames):
+                    if parked(frames) or ident == pid or _main_thread(frames):
                         continue
 
                     labels = [
@@ -312,7 +394,11 @@ class Reader:
                         f"{first_line(frame['file'], frame['line'], frame['function'])})"
                         for frame in frames
                     ]
-                    thread = known.get(str(ident), f"thread-{ident}")
+
+                    # A thread the runtime does not name is named by the
+                    # operating system, asked once for each thread.
+
+                    thread = known.get(str(ident)) or os_names[pid].get(ident) or f"thread-{ident}"
                     counts[pid][";".join([thread, *labels])] += 1
 
                 rounds[pid] += 1

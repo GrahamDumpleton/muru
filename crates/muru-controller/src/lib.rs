@@ -26,6 +26,7 @@ pub mod notify;
 pub mod overlays;
 pub mod provision;
 pub mod reload;
+pub mod render;
 pub mod rollouts;
 pub mod rotation;
 pub mod scaling;

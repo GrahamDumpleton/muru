@@ -85,7 +85,7 @@ pub enum Action {
         /// The host's name.
         name: String,
         /// Its definition.
-        host: VirtualHost,
+        host: Box<VirtualHost>,
         /// Whether it is new rather than changed.
         new: bool,
     },
@@ -522,25 +522,7 @@ fn plan_app(
             continue;
         };
 
-        let tables = Tables {
-            groups: (!table.groups.is_empty()).then_some(&table.groups),
-            mounts: (!table.mounts.is_empty()).then_some(&table.mounts),
-            static_dirs: (!table.static_dirs.is_empty()).then_some(&table.static_dirs[..]),
-            logging: table.logging.as_ref(),
-            scaling: table.scaling.as_ref(),
-            error_pages: (!table.error_pages.is_empty()).then_some(&table.error_pages),
-            error_override: table.error_override.as_ref(),
-            maintenance: table.maintenance.as_ref(),
-            commands: (!table.commands.is_empty()).then_some(&table.commands),
-            declared: true,
-        };
-
-        let spec = match resolve_spec(
-            &request_from(name, table, source),
-            None,
-            &tables,
-            provisioning,
-        ) {
+        let spec = match resolve_declared(name, table, source, provisioning) {
             Ok(spec) => spec,
             Err(error) => {
                 plan.errors.push(format!("{name}@{id}: {error}"));
@@ -890,6 +872,109 @@ fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: 
             valid = false;
         }
 
+        if host.canonical_redirect && host.canonical.is_none() {
+            plan.errors.push(format!(
+                "host {name}: canonical_redirect needs a canonical name"
+            ));
+            valid = false;
+        }
+
+        if let Some(canonical) = &host.canonical {
+            let normalised = muru_edge::routing::normalise(canonical);
+
+            if normalised.is_empty() || normalised.contains('*') || normalised.contains('/') {
+                plan.errors.push(format!(
+                    "host {name}: canonical: {canonical:?} is not a host name"
+                ));
+                valid = false;
+            }
+        }
+
+        // Sections 4.6 and 11.2: the host's limits on a request and its
+        // access log choice.
+
+        if let Err(error) =
+            muru_config::check_request_limits(host.max_body_size.as_deref(), host.timeouts.as_ref())
+        {
+            plan.errors.push(format!("host {name}: {error}"));
+            valid = false;
+        }
+
+        if let Err(error) =
+            muru_config::check_access_log(host.access_log.as_deref(), host.slow.as_deref())
+        {
+            plan.errors.push(format!("host {name}: {error}"));
+            valid = false;
+        }
+
+        // Section 11.2: the format of the host's records and the file
+        // that takes them. Hosts that share a file write it in one
+        // format, so they name the same one or none.
+
+        if let Err(error) = muru_config::check_access_log_format(host.access_log_format.as_deref())
+        {
+            plan.errors.push(format!("host {name}: {error}"));
+            valid = false;
+        }
+
+        if let Some(file) = &host.access_log_file {
+            if let Err(error) = muru_config::check_access_log_file(file) {
+                plan.errors.push(format!("host {name}: {error}"));
+                valid = false;
+            }
+
+            let sharing = document
+                .host
+                .iter()
+                .chain(
+                    stored
+                        .iter()
+                        .filter(|(other, _)| !document.host.contains_key(*other)),
+                )
+                .find(|(other, table)| {
+                    *other != name
+                        && table.access_log_file.as_ref() == Some(file)
+                        && table.access_log_format != host.access_log_format
+                });
+
+            if let Some((other, _)) = sharing {
+                plan.errors.push(format!(
+                    "host {name}: access_log_file {file} is also host {other}'s, with another access_log_format"
+                ));
+                valid = false;
+            }
+        }
+
+        // Section 4.12: what the host's maintenance mode lets through.
+
+        if let Some(table) = &host.maintenance
+            && let Err(error) = muru_config::check_maintenance(table)
+        {
+            plan.errors.push(format!("host {name}: {error}"));
+            valid = false;
+        }
+
+        // Section 4.7: the host's rules for request and response
+        // headers.
+
+        if let Err(error) = muru_config::check_header_tables(
+            host.request_headers.as_ref(),
+            host.response_headers.as_ref(),
+        ) {
+            plan.errors.push(format!("host {name}: {error}"));
+            valid = false;
+        }
+
+        // Section 4.17: the host's own compression settings.
+
+        if let Some(table) = &host.compression
+            && let Err(error) = crate::daemon::compression_choice(table)
+        {
+            plan.errors
+                .push(format!("host {name}: compression: {error}"));
+            valid = false;
+        }
+
         // Section 4.12: the host's error pages, with absolute file paths.
 
         if let Err(error) = check_error_tables(&host.error_pages, host.error_override.as_ref()) {
@@ -921,7 +1006,7 @@ fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: 
             recorded => plan.changes.push(Change {
                 action: Action::PutHost {
                     name: name.clone(),
-                    host: host.clone(),
+                    host: Box::new(host.clone()),
                     new: recorded.is_none(),
                 },
                 detail: describe_host(host),
@@ -1235,6 +1320,18 @@ fn plan_routes(store: &Store, document: &Document, defined: &Defined, plan: &mut
                     .push(format!("route {} {}: {error}", route.host, route.path));
                 valid = false;
             }
+        }
+
+        // Section 4.17: the route's own compression settings.
+
+        if let Some(table) = &route.compression
+            && let Err(error) = crate::daemon::compression_choice(table)
+        {
+            plan.errors.push(format!(
+                "route {} {}: compression: {error}",
+                route.host, route.path
+            ));
+            valid = false;
         }
 
         // Section 9.4: a traffic policy names releases of the route's
@@ -2273,6 +2370,9 @@ pub struct Tables<'a> {
     pub maintenance: Option<&'a muru_config::Maintenance>,
     /// Commands (section 9.12).
     pub commands: Option<&'a BTreeMap<String, muru_config::CommandTable>>,
+    /// The release's own limits on the requests it serves (section
+    /// 4.6): `max_body_size` and the request timeouts of `timeouts`.
+    pub limits: Option<muru_config::RequestLimitSettings>,
     /// Whether the request is a declared release's table rather than a
     /// deploy's flags, which names its layer (section 3.3).
     pub declared: bool,
@@ -2435,8 +2535,14 @@ pub fn check_groups_and_mounts(
             return Err(format!("mount {name}: another mount has the path {path}"));
         }
 
-        muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
-            .map_err(|error| format!("mount {name}: {error}"))?;
+        muru_config::check_mount_limits(
+            mount.concurrency,
+            mount.max_connections,
+            mount.interface,
+            mount.threads,
+            mount.handoff,
+        )
+        .map_err(|error| format!("mount {name}: {error}"))?;
         muru_config::check_mount_threads(mount.threads, mount.interface, mount.handoff)
             .map_err(|error| format!("mount {name}: {error}"))?;
         muru_config::check_handoff(mount.handoff, mount.interface)
@@ -2507,6 +2613,52 @@ fn layer(given: bool, table: bool, previous: bool, declared: bool) -> &'static s
     }
 }
 
+/// Section 13.1: a release's worker processes when nothing sets them.
+pub const DEFAULT_PROCESSES: u32 = 1;
+/// Its application threads in each worker.
+pub const DEFAULT_THREADS: u32 = 4;
+/// Its threads for synchronous code called from an ASGI application.
+pub const DEFAULT_SYNC_THREADS: u32 = 8;
+/// The requests an ASGI worker's event loop takes at once.
+pub const DEFAULT_CONCURRENCY: u32 = 1000;
+
+/// Resolve a declared release as an apply does: from its table and the
+/// source's own settings, never from an earlier release, so that a file
+/// means the same thing wherever it is applied.
+pub fn resolve_declared(
+    app: &str,
+    table: &ReleaseTable,
+    source: &str,
+    provisioning: &crate::provision::Provisioning,
+) -> Result<ReleaseSpec, String> {
+    // Section 4.6: the limits the release sets on the requests it
+    // serves, which no deploy flag carries.
+
+    let served =
+        muru_config::check_served_limits(table.max_body_size.as_deref(), table.timeouts.as_ref())?;
+
+    let tables = Tables {
+        limits: (!served.is_empty()).then_some(served),
+        groups: (!table.groups.is_empty()).then_some(&table.groups),
+        mounts: (!table.mounts.is_empty()).then_some(&table.mounts),
+        static_dirs: (!table.static_dirs.is_empty()).then_some(&table.static_dirs[..]),
+        logging: table.logging.as_ref(),
+        scaling: table.scaling.as_ref(),
+        error_pages: (!table.error_pages.is_empty()).then_some(&table.error_pages),
+        error_override: table.error_override.as_ref(),
+        maintenance: table.maintenance.as_ref(),
+        commands: (!table.commands.is_empty()).then_some(&table.commands),
+        declared: true,
+    };
+
+    resolve_spec(
+        &request_from(app, table, source),
+        None,
+        &tables,
+        provisioning,
+    )
+}
+
 /// Resolve a deploy request into a release spec: the request's settings,
 /// then the source's [tool.muru] table, then the previous release when
 /// one is given (a deploy that is not fresh) and it ran native workers,
@@ -2558,6 +2710,17 @@ pub fn resolve_spec(
         .map_err(|error| error.to_string())?
         .map(|(_, table)| table)
         .unwrap_or_default();
+
+    // Section 4.6: the limits the release sets on the requests it
+    // serves, a declared release's own or else the source's table's.
+
+    let served = match tables.limits {
+        Some(declared) => declared,
+        None => muru_config::check_served_limits(
+            table.max_body_size.as_deref(),
+            table.timeouts.as_ref(),
+        )?,
+    };
 
     // The entrypoint from the request replaces the table's with its
     // factory settings, as muructl run does (section 13.1).
@@ -2641,22 +2804,22 @@ pub fn resolve_spec(
         .processes
         .or(table.processes.map(|value| value as u32))
         .or(previous.map(|previous| previous.processes))
-        .unwrap_or(1);
+        .unwrap_or(DEFAULT_PROCESSES);
     let threads = request
         .threads
         .or(table.threads.map(|value| value as u32))
         .or(previous.map(|previous| previous.threads))
-        .unwrap_or(4);
+        .unwrap_or(DEFAULT_THREADS);
     let sync_threads = request
         .sync_threads
         .or(table.sync_threads.map(|value| value as u32))
         .or(previous.map(|previous| previous.sync_threads))
-        .unwrap_or(8);
+        .unwrap_or(DEFAULT_SYNC_THREADS);
     let concurrency = request
         .concurrency
         .or(table.concurrency.map(|value| value as u32))
         .or(previous.map(|previous| previous.concurrency))
-        .unwrap_or(1000);
+        .unwrap_or(DEFAULT_CONCURRENCY);
     let groups = groups.unwrap_or(&table.groups);
     let mounts = mounts.unwrap_or(&table.mounts);
     check_groups_and_mounts(groups, mounts)?;
@@ -2708,7 +2871,16 @@ pub fn resolve_spec(
             ));
         }
 
+        // Section 4.6: the group's own limits on the requests it serves.
+
+        let served = muru_config::check_served_limits(
+            group.max_body_size.as_deref(),
+            group.timeouts.as_ref(),
+        )
+        .map_err(|error| format!("worker group {name}: {error}"))?;
+
         resolved_groups.push(GroupSpec {
+            limits: crate::model::ServedLimits::from_settings(&served),
             name: name.clone(),
             paths: group.paths.clone(),
             mounts: group.mounts.clone(),
@@ -2793,7 +2965,13 @@ pub fn resolve_spec(
         // Section 4.10: a mount's redirect settings, with the release's
         // as the defaults.
 
+        // Section 4.6: the largest body of a request the mount serves.
+
+        let served = muru_config::check_request_limits(mount.max_body_size.as_deref(), None)
+            .map_err(|error| format!("mount {name}: {error}"))?;
+
         resolved_mounts.push(MountSpec {
+            limits: crate::model::ServedLimits::from_settings(&served),
             name: name.clone(),
             path,
             entrypoint: mount.entrypoint.clone(),
@@ -3041,12 +3219,21 @@ pub fn resolve_spec(
     // Section 6.14: the default mount's handoff, checked against the
     // interface it hands from when that is declared.
 
-    let handoff = table
-        .handoff
-        .or_else(|| previous.and_then(|previous| previous.handoff));
+    let handoff = match request.handoff.as_str() {
+        "" => table
+            .handoff
+            .or_else(|| previous.and_then(|previous| previous.handoff)),
+        given => Some(
+            given
+                .parse()
+                .map_err(|error: muru_config::ParseError| error.to_string())?,
+        ),
+    };
+
     muru_config::check_handoff(handoff, Some(interface))?;
 
     Ok(ReleaseSpec {
+        limits: crate::model::ServedLimits::from_settings(&served),
         source,
         entrypoint,
         interface,
@@ -3113,7 +3300,7 @@ pub fn resolve_spec(
 /// inputs with names Python accepts as keywords, patterns that compile,
 /// no default where one is required or secret, and every placeholder an
 /// input, a secret one only in `env`, where no command line shows it.
-fn resolve_commands(
+pub fn resolve_commands(
     tables: &BTreeMap<String, muru_config::CommandTable>,
 ) -> Result<Vec<crate::model::CommandSpec>, String> {
     let mut commands = Vec::with_capacity(tables.len());
@@ -3333,17 +3520,35 @@ fn resolve_build(
         ));
     }
 
-    let mut extras = settings.extras.clone();
-    extras.extend(request.build_extras.iter().cloned());
-    let mut groups = settings.groups.clone();
-    groups.extend(request.build_groups.iter().cloned());
+    // The request's extras and groups go beside the table's, each once,
+    // so that a declared release which repeats the table's adds nothing.
+
+    let beside = |settings: &[String], request: &[String]| {
+        let mut all = settings.to_vec();
+
+        for name in request {
+            if !all.contains(name) {
+                all.push(name.clone());
+            }
+        }
+
+        all
+    };
+    let extras = beside(&settings.extras, &request.build_extras);
+    let groups = beside(&settings.groups, &request.build_groups);
 
     Ok(crate::model::BuildSpec {
         when,
         extras,
         groups,
-        source_builds: settings.source_builds.unwrap_or(false),
-        compile_bytecode: settings.compile_bytecode.unwrap_or(true),
+        source_builds: request
+            .build_source_builds
+            .or(settings.source_builds)
+            .unwrap_or(false),
+        compile_bytecode: request
+            .build_compile_bytecode
+            .or(settings.compile_bytecode)
+            .unwrap_or(true),
         builds,
     })
 }
@@ -3410,7 +3615,9 @@ fn resolve_interpreter(
 }
 
 /// Section 3.3: where each of a release's settings comes from, by the
-/// keys `release_settings` shows.
+/// keys `release_settings` shows. The build mode and where bytecode goes
+/// (section 8.2) come from the request or the source alone, never an
+/// earlier release.
 fn resolve_layers(
     request: &pb::DeployRequest,
     table: &muru_config::ToolMuru,
@@ -3444,6 +3651,27 @@ fn resolve_layers(
             ),
         ),
         ("python", python),
+        (
+            "build.when",
+            layer(
+                !request.build_when.is_empty(),
+                table
+                    .build
+                    .as_ref()
+                    .is_some_and(|build| build.when.is_some()),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "bytecode",
+            layer(
+                !request.bytecode.is_empty(),
+                table.bytecode.is_some(),
+                false,
+                declared,
+            ),
+        ),
         (
             "interface",
             layer(
@@ -3662,7 +3890,7 @@ fn resolve_layers(
 
 /// Section 3.3: a release's settings as `config show --effective`
 /// shows them beside their layers, by key.
-fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
+pub fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
     let optional = |value: Option<u64>, format: fn(u64) -> String| {
         value.map_or_else(|| "off".to_owned(), format)
     };
@@ -3768,6 +3996,186 @@ pub fn release_layers(store: &Store, document: &Document) -> Result<Vec<String>,
     }
 
     Ok(lines)
+}
+
+/// A level's own limits on a request by the key a table gives each, with
+/// its value as the table writes it, those set alone.
+fn served_settings(limits: &crate::model::ServedLimits) -> Vec<(String, String)> {
+    limits
+        .max_body_size_text()
+        .map(|size| ("max_body_size".to_owned(), size))
+        .into_iter()
+        .chain(
+            limits
+                .timeouts()
+                .into_iter()
+                .map(|(key, value)| (format!("timeouts.{key}"), value)),
+        )
+        .collect()
+}
+
+/// Section 4.6: the limits on a request that the releases an exported
+/// document declares set, with those of their worker groups and mounts,
+/// one line a limit, for `config show --effective`.
+pub fn served_layers(store: &Store, document: &Document) -> Result<Vec<String>, StoreError> {
+    let mut lines = Vec::new();
+
+    for (app, table) in &document.app {
+        for id in table.release.keys() {
+            let spec = store.release(app, id)?.spec;
+
+            for (key, value) in served_settings(&spec.limits) {
+                lines.push(format!("{app}@{id}: {key} = {value} (the release)"));
+            }
+
+            for group in &spec.groups {
+                for (key, value) in served_settings(&group.limits) {
+                    lines.push(format!(
+                        "{app}@{id} group {}: {key} = {value} (the worker group)",
+                        group.name
+                    ));
+                }
+            }
+
+            for mount in &spec.mounts {
+                for (key, value) in served_settings(&mount.limits) {
+                    lines.push(format!(
+                        "{app}@{id} mount {}: {key} = {value} (the mount)",
+                        mount.name
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(lines)
+}
+
+/// A `timeouts` table with a level's request timeouts put in (section
+/// 4.6), the table made when the level sets any and there was none.
+fn with_served(
+    table: Option<muru_config::Timeouts>,
+    limits: &crate::model::ServedLimits,
+) -> Option<muru_config::Timeouts> {
+    if limits.timeouts().is_empty() {
+        return table;
+    }
+
+    let mut table = table.unwrap_or_default();
+    limits.fill(&mut table);
+    Some(table)
+}
+
+/// Section 4.6: the limits of each route an exported document declares,
+/// with the level each came from, one line a limit, for `config show
+/// --effective`: the route, the serving release of the application it
+/// routes to, its virtual host, the daemon's `[limits]` table or the
+/// default. A worker group or a mount of the release may set its own for
+/// the requests it serves, which `served_layers` lists.
+pub fn route_layers(store: &Store, document: &Document, node: &muru_edge::Limits) -> Vec<String> {
+    let stored: BTreeMap<String, VirtualHost> =
+        store.hosts().unwrap_or_default().into_iter().collect();
+    let defaults = muru_edge::Limits::default();
+    let mut lines = Vec::new();
+
+    for route in &document.route {
+        let own = muru_config::check_request_limits(
+            route.max_body_size.as_deref(),
+            route.timeouts.as_ref(),
+        )
+        .unwrap_or_default();
+        let host = document
+            .host
+            .get(&route.host)
+            .or_else(|| stored.get(&route.host))
+            .and_then(|host| {
+                muru_config::check_request_limits(
+                    host.max_body_size.as_deref(),
+                    host.timeouts.as_ref(),
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+        let size = |bytes: u64| muru_config::format_size(bytes);
+        let time = |duration: Duration| muru_config::format_duration(duration);
+        let millis = |ms: u64| time(Duration::from_millis(ms));
+
+        // The release that serves the route's application, when it has
+        // one and nothing else chooses among its releases.
+
+        let serving = (!route.app.is_empty())
+            .then(|| store.app(&route.app).ok()?.current)
+            .flatten()
+            .and_then(|id| Some((store.release(&route.app, &id).ok()?.spec.limits, id)));
+        let release = serving
+            .as_ref()
+            .map_or_else(crate::model::ServedLimits::default, |(limits, _)| *limits);
+        let release_layer = serving
+            .as_ref()
+            .map(|(_, id)| format!("release {}@{id}", route.app))
+            .unwrap_or_default();
+
+        let settings = [
+            (
+                "max_body_size",
+                own.max_body_size.map(size),
+                release.max_body_size.map(size),
+                host.max_body_size.map(size),
+                size(node.max_body_size),
+                node.max_body_size == defaults.max_body_size,
+            ),
+            (
+                "timeouts.queue_timeout",
+                own.queue_timeout.map(time),
+                release.queue_timeout_ms.map(millis),
+                host.queue_timeout.map(time),
+                time(node.queue_timeout),
+                node.queue_timeout == defaults.queue_timeout,
+            ),
+            (
+                "timeouts.request_deadline",
+                own.request_deadline.map(time),
+                release.request_deadline_ms.map(millis),
+                host.request_deadline.map(time),
+                time(node.request_deadline),
+                node.request_deadline == defaults.request_deadline,
+            ),
+            (
+                "timeouts.body_idle_timeout",
+                own.body_idle_timeout.map(time),
+                release.body_idle_timeout_ms.map(millis),
+                host.body_idle_timeout.map(time),
+                time(node.body_idle_timeout),
+                node.body_idle_timeout == defaults.body_idle_timeout,
+            ),
+            (
+                "timeouts.response_idle_timeout",
+                own.response_idle_timeout.map(time),
+                release.response_idle_timeout_ms.map(millis),
+                host.response_idle_timeout.map(time),
+                time(node.response_idle_timeout),
+                node.response_idle_timeout == defaults.response_idle_timeout,
+            ),
+        ];
+
+        for (key, route_value, release_value, host_value, node_value, node_is_default) in settings {
+            let (value, layer) = match (route_value, release_value, host_value) {
+                (Some(value), _, _) => (value, "the route".to_owned()),
+                (None, Some(value), _) => (value, release_layer.clone()),
+                (None, None, Some(value)) => (value, format!("host {}", route.host)),
+                (None, None, None) if node_is_default => (node_value, "default".to_owned()),
+                (None, None, None) => (node_value, "[limits]".to_owned()),
+            };
+
+            lines.push(format!(
+                "route {} {}: {key} = {value} ({layer})",
+                route.host,
+                route.key()
+            ));
+        }
+    }
+
+    lines
 }
 
 /// Section 4.9: the release's own directories of files, layered by
@@ -3943,7 +4351,7 @@ fn resolve_error_tables(
 
 /// A deploy request's keys as the release table they amount to, for the
 /// kind check of section 9.9: which keys are set is what matters.
-fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, String> {
+pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, String> {
     let readiness = (!request.readiness_path.is_empty() || request.readiness_timeout_ms.is_some())
         .then(|| muru_config::Readiness {
             path: (!request.readiness_path.is_empty()).then(|| request.readiness_path.clone()),
@@ -4012,7 +4420,9 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
             websocket_drain_grace: request.websocket_drain_grace_ms.map(format_ms),
             loop_stall_timeout: request.loop_stall_timeout_ms.map(format_ms),
             gil_stall_timeout: request.gil_stall_timeout_ms.map(format_ms),
+            ..muru_config::Timeouts::default()
         }),
+        max_body_size: None,
         memory: memory_given.then(muru_config::Memory::default),
         env: BTreeMap::new(),
         accel_redirect: request.accel_redirect,
@@ -4040,7 +4450,7 @@ fn parse_optional<T: std::str::FromStr<Err = muru_config::ParseError>>(
 }
 
 /// Milliseconds as a duration a table writes.
-fn format_ms(ms: u64) -> String {
+pub(crate) fn format_ms(ms: u64) -> String {
     muru_config::format_duration(Duration::from_millis(ms))
 }
 
@@ -4076,6 +4486,10 @@ fn resolve_http_spec(
     muru_config::check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
 
     Ok(ReleaseSpec {
+        limits: tables
+            .limits
+            .map(|declared| crate::model::ServedLimits::from_settings(&declared))
+            .unwrap_or_default(),
         source,
         entrypoint: String::new(),
         interface: muru_config::Interface::Auto,
@@ -4489,6 +4903,15 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
             .bytecode
             .map(|bytecode| bytecode.as_str().to_owned())
             .unwrap_or_default(),
+        handoff: table
+            .handoff
+            .map(|handoff| handoff.as_str().to_owned())
+            .unwrap_or_default(),
+        build_source_builds: table.build.as_ref().and_then(|build| build.source_builds),
+        build_compile_bytecode: table
+            .build
+            .as_ref()
+            .and_then(|build| build.compile_bytecode),
         processes: table.processes.map(|value| value as u32),
         threads: table.threads.map(|value| value as u32),
         sync_threads: table.sync_threads.map(|value| value as u32),
@@ -4628,10 +5051,14 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 timeout: Some(format_ms(http.readiness_timeout_ms)),
             }),
             stop_signal: http.stop_signal.clone(),
-            timeouts: Some(muru_config::Timeouts {
-                shutdown_timeout: Some(format_ms(spec.timeouts.shutdown_timeout_ms)),
-                ..muru_config::Timeouts::default()
-            }),
+            max_body_size: spec.limits.max_body_size_text(),
+            timeouts: with_served(
+                Some(muru_config::Timeouts {
+                    shutdown_timeout: Some(format_ms(spec.timeouts.shutdown_timeout_ms)),
+                    ..muru_config::Timeouts::default()
+                }),
+                &spec.limits,
+            ),
             env: env_table_from(&spec.env),
             error_pages: spec.error_pages.clone(),
             error_override: spec.error_override.clone(),
@@ -4690,7 +5117,8 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         sync_threads: Some(group.sync_threads as usize),
                         concurrency: Some(group.concurrency as usize),
                         scaling: scaling_table(&group.scaling),
-                        timeouts: group.timeouts.table(),
+                        timeouts: with_served(group.timeouts.table(), &group.limits),
+                        max_body_size: group.limits.max_body_size_text(),
                         memory: group.memory.as_ref().map(crate::model::MemoryPolicy::table),
                         max_requests: group.max_requests,
                         max_lifetime: group.max_lifetime_ms.map(format_ms),
@@ -4724,6 +5152,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         concurrency: mount.concurrency.map(|value| value as usize),
                         max_connections: mount.max_connections.map(|value| value as usize),
                         handoff: mount.handoff,
+                        max_body_size: mount.limits.max_body_size_text(),
                     },
                 )
             })
@@ -4737,33 +5166,38 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         max_lifetime: spec
             .max_lifetime_ms
             .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
-        timeouts: (spec.timeouts != crate::model::WorkerTimeouts::default()).then(|| {
-            muru_config::Timeouts {
-                soft_timeout: spec
-                    .timeouts
-                    .soft_timeout_ms
-                    .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
-                hard_timeout: spec
-                    .timeouts
-                    .hard_timeout_ms
-                    .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
-                hard_drain_grace: Some(muru_config::format_duration(Duration::from_millis(
-                    spec.timeouts.hard_drain_grace_ms,
-                ))),
-                shutdown_timeout: Some(muru_config::format_duration(Duration::from_millis(
-                    spec.timeouts.shutdown_timeout_ms,
-                ))),
-                websocket_drain_grace: Some(muru_config::format_duration(Duration::from_millis(
-                    spec.timeouts.websocket_drain_grace_ms,
-                ))),
-                loop_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
-                    spec.timeouts.loop_stall_timeout_ms,
-                ))),
-                gil_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
-                    spec.timeouts.gil_stall_timeout_ms,
-                ))),
-            }
-        }),
+        max_body_size: spec.limits.max_body_size_text(),
+        timeouts: with_served(
+            (spec.timeouts != crate::model::WorkerTimeouts::default()).then(|| {
+                muru_config::Timeouts {
+                    soft_timeout: spec
+                        .timeouts
+                        .soft_timeout_ms
+                        .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
+                    hard_timeout: spec
+                        .timeouts
+                        .hard_timeout_ms
+                        .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
+                    hard_drain_grace: Some(muru_config::format_duration(Duration::from_millis(
+                        spec.timeouts.hard_drain_grace_ms,
+                    ))),
+                    shutdown_timeout: Some(muru_config::format_duration(Duration::from_millis(
+                        spec.timeouts.shutdown_timeout_ms,
+                    ))),
+                    websocket_drain_grace: Some(muru_config::format_duration(
+                        Duration::from_millis(spec.timeouts.websocket_drain_grace_ms),
+                    )),
+                    loop_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
+                        spec.timeouts.loop_stall_timeout_ms,
+                    ))),
+                    gil_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
+                        spec.timeouts.gil_stall_timeout_ms,
+                    ))),
+                    ..muru_config::Timeouts::default()
+                }
+            }),
+            &spec.limits,
+        ),
         env: env_table_from(&spec.env),
         memory: (spec.memory != crate::model::MemoryPolicy::default()).then(|| {
             muru_config::Memory {
@@ -4861,7 +5295,7 @@ fn describe_http(http: Option<&HttpServerSpec>) -> String {
 
 /// What a release runs, for the report: entrypoint, processes by threads
 /// and the source.
-fn describe(spec: &ReleaseSpec) -> String {
+pub fn describe(spec: &ReleaseSpec) -> String {
     if let Some(http) = &spec.http {
         return format!("{} in {}", http.describe(), spec.source.display());
     }
@@ -5033,6 +5467,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         describe_ms(recorded.max_lifetime_ms),
     );
     compare(
+        "request limits",
+        declared.limits.describe(),
+        recorded.limits.describe(),
+    );
+    compare(
         "soft_timeout",
         describe_ms(declared.timeouts.soft_timeout_ms),
         describe_ms(recorded.timeouts.soft_timeout_ms),
@@ -5096,6 +5535,40 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "maintenance",
         describe_maintenance(declared.maintenance.as_ref()),
         describe_maintenance(recorded.maintenance.as_ref()),
+    );
+
+    // Section 8.2: the build and bytecode settings, each key on its own,
+    // as the spec's equality compares them.
+
+    compare(
+        "build.when",
+        declared.build.when.as_str().to_owned(),
+        recorded.build.when.as_str().to_owned(),
+    );
+    compare(
+        "build.extras",
+        declared.build.extras.join(", "),
+        recorded.build.extras.join(", "),
+    );
+    compare(
+        "build.groups",
+        declared.build.groups.join(", "),
+        recorded.build.groups.join(", "),
+    );
+    compare(
+        "build.source_builds",
+        declared.build.source_builds.to_string(),
+        recorded.build.source_builds.to_string(),
+    );
+    compare(
+        "build.compile_bytecode",
+        declared.build.compile_bytecode.to_string(),
+        recorded.build.compile_bytecode.to_string(),
+    );
+    compare(
+        "bytecode",
+        declared.bytecode.mode.as_str().to_owned(),
+        recorded.bytecode.mode.as_str().to_owned(),
     );
 
     found
@@ -5261,6 +5734,7 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
             ]
             .into_iter()
             .filter_map(|(name, ms)| ms.map(|ms| format!("{name} {}", describe_ms(Some(ms)))))
+            .chain((!group.limits.is_empty()).then(|| group.limits.describe()))
             .collect::<Vec<_>>();
 
             format!(
@@ -5343,6 +5817,10 @@ fn describe_mounts(mounts: &[MountSpec]) -> String {
 
             if let Some(handoff) = mount.handoff {
                 flags.push(format!("handoff {handoff}"));
+            }
+
+            if !mount.limits.is_empty() {
+                flags.push(mount.limits.describe());
             }
 
             let flags = if flags.is_empty() {
@@ -5478,6 +5956,7 @@ mod tests {
                 mode: muru_edge::access::Mode::Errors,
                 slow: std::time::Duration::from_millis(250),
                 exclude: vec!["/static/*".to_owned(), "/healthz".to_owned()],
+                format: muru_edge::access::Format::Json,
             }
         );
 
@@ -5587,6 +6066,93 @@ mod tests {
                 ("deploy", "shop@r2".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn a_release_tables_handoff_and_build_keys_come_before_the_sources() {
+        let source =
+            std::env::temp_dir().join(format!("muru-config-handoff-build-{}", std::process::id()));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("pyproject.toml"),
+            "[tool.muru]\nentrypoint = 'shop.wsgi:application'\nhandoff = 'asgi'\n\
+             [tool.muru.build]\nsource_builds = true\ncompile_bytecode = false\n",
+        )
+        .unwrap();
+        let release = |keys: &str| {
+            format!(
+                "[app.shop.release.r1]\nsource = '{}'\npython = '/usr/bin/python3'\n{keys}",
+                source.display()
+            )
+        };
+        let resolve = |text: &str| {
+            let document = Document::parse(text).unwrap();
+            let table = &document.app["shop"].release["r1"];
+            resolve_declared(
+                "shop",
+                table,
+                &source.display().to_string(),
+                &crate::provision::Provisioning::off(),
+            )
+            .unwrap()
+        };
+
+        // The table's keys are the release's, whatever the source says.
+
+        let declared = release(
+            "handoff = 'wsgi'\n[app.shop.release.r1.build]\nsource_builds = false\ncompile_bytecode = true\n",
+        );
+        let spec = resolve(&declared);
+        assert_eq!(spec.handoff, Some(muru_config::Handoff::Wsgi));
+        assert!(!spec.build.source_builds);
+        assert!(spec.build.compile_bytecode);
+
+        // A table that leaves them out takes the source's.
+
+        let spec = resolve(&release(""));
+        assert_eq!(spec.handoff, Some(muru_config::Handoff::Asgi));
+        assert!(spec.build.source_builds);
+        assert!(!spec.build.compile_bytecode);
+
+        // Recorded from the table, the same table is unchanged, and one
+        // that says otherwise is refused, naming each key that differs.
+
+        let store = Store::in_memory().unwrap();
+        store.ensure_app("shop").unwrap();
+        store
+            .create_release("shop", "r1", &resolve(&declared))
+            .unwrap();
+        let planned = |text: &str| {
+            plan(
+                &store,
+                &Document::parse(text).unwrap(),
+                false,
+                &Defined::default(),
+                &crate::provision::Provisioning::off(),
+            )
+        };
+
+        let same = planned(&declared);
+        assert!(same.errors.is_empty(), "{:?}", same.errors);
+        assert!(same.changes.is_empty(), "{:?}", same.changes);
+        assert_eq!(same.unchanged, 1);
+
+        let changed = planned(&release(""));
+        assert_eq!(changed.errors.len(), 1, "{:?}", changed.errors);
+
+        for difference in [
+            "handoff asgi, recorded wsgi",
+            "build.source_builds true, recorded false",
+            "build.compile_bytecode false, recorded true",
+        ] {
+            assert!(
+                changed.errors[0].contains(difference),
+                "{}",
+                changed.errors[0]
+            );
+        }
+
+        std::fs::remove_dir_all(&source).unwrap();
     }
 
     #[test]

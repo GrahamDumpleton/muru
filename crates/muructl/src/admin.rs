@@ -17,9 +17,53 @@ use muru_controller::locations::{Locations, Options};
 use muru_proto::admin::v1 as pb;
 use tokio_stream::StreamExt;
 
-/// Where the daemon keeps things, as section 13.8 lets a command line say.
+/// Where a running instance is found, as section 13.8 lets a command line
+/// say: what every command that talks to one takes.
 #[derive(Args, Clone, Default)]
-pub struct LocationArgs {
+pub struct InstanceArgs {
+    /// The runtime directory: the admin socket and the release run directories.
+    #[arg(long, global = true, value_name = "DIR")]
+    run_dir: Option<PathBuf>,
+
+    /// Use the system locations (/etc/muru, /var/lib/muru and so on)
+    /// whoever runs the command.
+    #[arg(long, global = true)]
+    system: bool,
+}
+
+impl InstanceArgs {
+    /// Resolve the locations for these options and the environment.
+    pub fn resolve(&self) -> Locations {
+        Locations::resolve(&Options {
+            run_dir: self.run_dir.clone(),
+            system: self.system,
+            ..Options::default()
+        })
+    }
+
+    /// The same options, for a muructl command run on this one's behalf.
+    pub fn as_arguments(&self) -> Vec<String> {
+        let mut arguments = Vec::new();
+
+        if let Some(path) = &self.run_dir {
+            arguments.push("--run-dir".to_owned());
+            arguments.push(path.display().to_string());
+        }
+
+        if self.system {
+            arguments.push("--system".to_owned());
+        }
+
+        arguments
+    }
+}
+
+/// The daemon's own files, as section 13.8 lets a command line say: taken
+/// by the commands that start or are the daemon and by those that read
+/// its files, and by no other, since a command that only talks to a
+/// running daemon reads none of them.
+#[derive(Args, Clone, Default)]
+pub struct DaemonFileArgs {
     /// The daemon configuration file.
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
@@ -28,10 +72,6 @@ pub struct LocationArgs {
     #[arg(long, global = true, value_name = "DIR")]
     state_dir: Option<PathBuf>,
 
-    /// The runtime directory: the admin socket and the release run directories.
-    #[arg(long, global = true, value_name = "DIR")]
-    run_dir: Option<PathBuf>,
-
     /// The log directory.
     #[arg(long, global = true, value_name = "DIR")]
     log_dir: Option<PathBuf>,
@@ -39,33 +79,16 @@ pub struct LocationArgs {
     /// The cache directory.
     #[arg(long, global = true, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
-
-    /// Use the system locations (/etc/muru, /var/lib/muru and so on)
-    /// whoever runs the command.
-    #[arg(long, global = true)]
-    system: bool,
 }
 
-impl LocationArgs {
-    /// Resolve the locations for these options and the environment.
-    pub fn resolve(&self) -> Locations {
-        Locations::resolve(&Options {
-            config: self.config.clone(),
-            state_dir: self.state_dir.clone(),
-            run_dir: self.run_dir.clone(),
-            log_dir: self.log_dir.clone(),
-            cache_dir: self.cache_dir.clone(),
-            system: self.system,
-        })
-    }
-
+impl DaemonFileArgs {
     /// The same options, for a daemon started in the background.
-    fn as_arguments(&self) -> Vec<String> {
+    pub fn as_arguments(&self) -> Vec<String> {
         let mut arguments = Vec::new();
+
         for (flag, value) in [
             ("--config", &self.config),
             ("--state-dir", &self.state_dir),
-            ("--run-dir", &self.run_dir),
             ("--log-dir", &self.log_dir),
             ("--cache-dir", &self.cache_dir),
         ] {
@@ -75,10 +98,43 @@ impl LocationArgs {
             }
         }
 
-        if self.system {
-            arguments.push("--system".to_owned());
-        }
+        arguments
+    }
+}
 
+/// Where the daemon keeps everything: what the commands that start or
+/// are the daemon take.
+#[derive(Args, Clone, Default)]
+pub struct LocationArgs {
+    #[command(flatten)]
+    instance: InstanceArgs,
+
+    #[command(flatten)]
+    files: DaemonFileArgs,
+}
+
+impl LocationArgs {
+    /// Resolve the locations for these options and the environment. The
+    /// daemon's configuration variable under the name it had before is
+    /// refused, since a daemon that passed it over would start with no
+    /// configuration and say nothing.
+    pub fn resolve(&self) -> anyhow::Result<Locations> {
+        muru_controller::locations::check_renamed().map_err(anyhow::Error::msg)?;
+
+        Ok(Locations::resolve(&Options {
+            config: self.files.config.clone(),
+            state_dir: self.files.state_dir.clone(),
+            run_dir: self.instance.run_dir.clone(),
+            log_dir: self.files.log_dir.clone(),
+            cache_dir: self.files.cache_dir.clone(),
+            system: self.instance.system,
+        }))
+    }
+
+    /// The same options, for a daemon started in the background.
+    fn as_arguments(&self) -> Vec<String> {
+        let mut arguments = self.files.as_arguments();
+        arguments.extend(self.instance.as_arguments());
         arguments
     }
 }
@@ -101,7 +157,7 @@ pub struct SocketArgs {
     socket: Option<PathBuf>,
 
     #[command(flatten)]
-    locations: LocationArgs,
+    locations: InstanceArgs,
 }
 
 impl SocketArgs {
@@ -117,9 +173,50 @@ impl SocketArgs {
         arguments
     }
 
-    /// The location options alone, for `muructl up`.
+    /// The daemon's log, for a command of the daemon's own that names
+    /// it: where the instance's options and the daemon's files put it.
+    fn daemon_log(&self, files: &DaemonFileArgs) -> PathBuf {
+        Locations::resolve(&Options {
+            run_dir: self.locations.run_dir.clone(),
+            system: self.locations.system,
+            log_dir: files.log_dir.clone(),
+            state_dir: files.state_dir.clone(),
+            ..Options::default()
+        })
+        .daemon_log()
+    }
+
+    /// The options that find the instance, for `muructl up`.
     pub fn location_arguments(&self) -> Vec<String> {
         self.locations.as_arguments()
+    }
+
+    /// The socket of whatever serves the project now (section 9.12): a
+    /// muructl serve in the run directory, of this project when one is
+    /// `named`, else a development run started from it. One that no
+    /// longer answers is passed over.
+    pub fn serving(&self, project: &Path, named: bool) -> Option<PathBuf> {
+        let answers = |socket: &Path| std::os::unix::net::UnixStream::connect(socket).is_ok();
+
+        let serve_dir = std::env::var_os("MURU_RUN_DIR").map_or_else(
+            || PathBuf::from(crate::serve::DEFAULT_RUN_DIR),
+            PathBuf::from,
+        );
+        let serve_socket = serve_dir.join(crate::serve::ADMIN_SOCKET);
+
+        let serve = std::fs::read(serve_dir.join("serve.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<crate::run_admin::RunInfo>(&bytes).ok())
+            .filter(|info| !named || info.project == project);
+
+        if serve.is_some() && answers(&serve_socket) {
+            return Some(serve_socket);
+        }
+
+        crate::run_admin::runs(&self.locations.resolve().run.path)
+            .into_iter()
+            .find(|run| run.project == project && answers(&run.socket))
+            .map(|run| run.socket)
     }
 
     /// The socket to connect to (design specification section 13.8): as
@@ -206,6 +303,10 @@ pub enum DaemonCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        /// The daemon's own files, as it was started with them.
+        #[command(flatten)]
+        files: DaemonFileArgs,
     },
 
     /// Re-read the daemon's configuration file and apply what changed:
@@ -214,6 +315,10 @@ pub enum DaemonCommand {
     Reload {
         #[command(flatten)]
         socket: SocketArgs,
+
+        /// The daemon's own files, as it was started with them.
+        #[command(flatten)]
+        files: DaemonFileArgs,
 
         #[command(flatten)]
         output: JsonArgs,
@@ -230,12 +335,20 @@ pub enum DaemonCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        /// The daemon's own files, as it was started with them.
+        #[command(flatten)]
+        files: DaemonFileArgs,
     },
 
     /// Show the daemon's status.
     Status {
         #[command(flatten)]
         socket: SocketArgs,
+
+        /// The daemon's own files, as it was started with them.
+        #[command(flatten)]
+        files: DaemonFileArgs,
 
         #[command(flatten)]
         output: JsonArgs,
@@ -303,7 +416,7 @@ fn upgrade_arguments() -> Vec<std::ffi::OsString> {
 
 /// Run the daemon in the foreground.
 pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
-    let locations = args.locations.resolve();
+    let locations = args.locations.resolve()?;
 
     // The file is read the same way here and on every reload, with the
     // command line's settings laid over it.
@@ -357,7 +470,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
 /// Start the daemon in the background: a detached `muructl daemon run`
 /// writing to the daemon log, waited for until its socket answers.
 pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
-    let locations = args.locations.resolve();
+    let locations = args.locations.resolve()?;
     locations
         .check_run_dir()
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -469,6 +582,7 @@ async fn status_within(path: &Path, bound: Duration) -> Option<pb::Status> {
 /// logged its exit, cannot hold the command past `timeout`.
 pub async fn daemon_stop(
     socket: SocketArgs,
+    files: DaemonFileArgs,
     shutdown: bool,
     timeout: Duration,
 ) -> anyhow::Result<()> {
@@ -530,13 +644,17 @@ pub async fn daemon_stop(
         "the daemon (pid {}) did not exit within {} seconds; see {}",
         status.pid,
         timeout.as_secs(),
-        socket.locations.resolve().daemon_log().display()
+        socket.daemon_log(&files).display()
     )
 }
 
 /// Re-execute the daemon from the installed binary and wait until it
 /// answers again with the edge replaced.
-pub async fn daemon_upgrade(socket: SocketArgs, timeout: Duration) -> anyhow::Result<()> {
+pub async fn daemon_upgrade(
+    socket: SocketArgs,
+    files: DaemonFileArgs,
+    timeout: Duration,
+) -> anyhow::Result<()> {
     let path = socket.socket()?;
     let mut client = client::connect(&path).await?;
     let before = client
@@ -592,7 +710,7 @@ pub async fn daemon_upgrade(socket: SocketArgs, timeout: Duration) -> anyhow::Re
             "the daemon (pid {}) did not answer again within {} seconds; see {}",
             before.pid,
             timeout.as_secs(),
-            socket.locations.resolve().daemon_log().display()
+            socket.daemon_log(&files).display()
         ),
     }
 }
@@ -1699,6 +1817,10 @@ fn print_status(response: &pb::DebugResponse) {
         header += &format!(" {:<9} {:<12}", "LOOP", "LOOP-OLDEST");
     }
 
+    if sides.sync {
+        header += &format!(" {:<7} {:<12}", "SYNC", "SYNC-OLDEST");
+    }
+
     println!("{header} {:<7} {:<7} {:<7} STATE", "RSS", "USS", "ROUTED");
 
     for row in &rows {
@@ -1720,6 +1842,11 @@ fn print_status(response: &pb::DebugResponse) {
         if sides.event_loop {
             let (busy, oldest) = cells(&row.event_loop);
             line += &format!(" {busy:<9} {oldest:<12}");
+        }
+
+        if sides.sync {
+            let (busy, oldest) = cells(&row.sync);
+            line += &format!(" {busy:<7} {oldest:<12}");
         }
 
         println!(
@@ -2377,6 +2504,159 @@ pub async fn up(args: DaemonRunArgs) -> anyhow::Result<()> {
     daemon_start(args).await
 }
 
+/// A release's own settings, as `deploy` and `render` both take them,
+/// so that the two cannot come to differ.
+#[derive(Args)]
+pub struct ReleaseArgs {
+    /// The application as module:callable, else from the source's [tool.muru] table.
+    #[arg(long)]
+    pub(crate) entrypoint: Option<String>,
+
+    /// The interface the entrypoint speaks: auto, wsgi or asgi.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) interface: Option<muru_config::Interface>,
+
+    /// The interpreter: a path, or a version request such as 3.13 that
+    /// the daemon resolves with uv (default: the source's .venv, else
+    /// its own request).
+    #[arg(long)]
+    pub(crate) python: Option<PathBuf>,
+
+    /// When the daemon builds the release's environment from uv.lock:
+    /// auto (the default) when the source has a lock and no .venv, always
+    /// when it has a lock, never.
+    #[arg(long, value_name = "MODE")]
+    pub(crate) build: Option<String>,
+
+    /// An extra the built environment includes; repeatable.
+    #[arg(long = "build-extra", value_name = "NAME")]
+    pub(crate) build_extra: Vec<String>,
+
+    /// A dependency group the built environment includes; repeatable.
+    #[arg(long = "build-group", value_name = "NAME")]
+    pub(crate) build_group: Vec<String>,
+
+    /// Where the release's bytecode goes: redirect (the default, a
+    /// directory of its own under the state directory), source (beside
+    /// the source, as Python does) or off.
+    #[arg(long, value_name = "MODE")]
+    pub(crate) bytecode: Option<String>,
+
+    /// Worker processes.
+    #[arg(long)]
+    pub(crate) processes: Option<u32>,
+
+    /// Application threads per worker.
+    #[arg(long)]
+    pub(crate) threads: Option<u32>,
+
+    /// Threads for synchronous code called from an ASGI application.
+    #[arg(long, value_name = "N")]
+    pub(crate) sync_threads: Option<u32>,
+
+    /// Requests an ASGI worker's event loop takes at once.
+    #[arg(long, value_name = "N")]
+    pub(crate) concurrency: Option<u32>,
+
+    /// The preload mode: auto, true or false.
+    #[arg(long, value_name = "MODE")]
+    pub(crate) preload: Option<muru_config::Preload>,
+
+    /// The hooks module.
+    #[arg(long)]
+    pub(crate) hooks: Option<String>,
+
+    /// The entrypoint is a factory returning the application.
+    #[arg(long)]
+    pub(crate) factory: bool,
+
+    /// Replace a worker after this many requests, with jitter.
+    #[arg(long, value_name = "N")]
+    pub(crate) max_requests: Option<u64>,
+
+    /// Replace a worker after this long, for example 1h, with jitter.
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    pub(crate) max_lifetime: Option<Duration>,
+
+    /// A host timeout as NAME=DURATION: soft (interrupt a request that
+    /// runs this long; off), hard (replace a worker whose request runs
+    /// this long; off), hard_drain_grace (10s), shutdown (5s),
+    /// websocket_drain_grace (how long a stopping worker keeps its open
+    /// WebSockets; 0s), loop_stall (replace an ASGI worker whose event
+    /// loop stalls this long; 10s) or gil_stall (replace a worker in
+    /// which no thread has run Python for this long; 30s). Repeatable.
+    #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
+    pub(crate) timeouts: Vec<(String, Duration)>,
+
+    /// A memory setting as KEY=VALUE: measure (uss, pss or rss),
+    /// soft_limit (for example 800MB), soft_for (2m), reclaim_first
+    /// (true), hard_limit (1200MB) or check_interval (5s). Repeatable.
+    #[arg(long = "memory", value_name = "KEY=VALUE", value_parser = crate::parse_memory_setting)]
+    pub(crate) memory: Vec<(String, String)>,
+
+    /// An environment variable for the workers as NAME=VALUE, over the
+    /// source's [tool.muru.env] table. Repeatable.
+    #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env_setting)]
+    pub(crate) env: Vec<(String, String)>,
+
+    /// A secret for the workers as NAME=STORE:KEY, delivered as the
+    /// variable, or NAME=STORE:KEY:file for a file named by NAME_FILE.
+    /// Repeatable.
+    #[arg(long = "secret", value_name = "NAME=STORE:KEY[:file]", value_parser = parse_secret_setting)]
+    pub(crate) secrets: Vec<(String, String, String, bool)>,
+
+    /// Run an HTTP server of this profile instead of workers: gunicorn,
+    /// uvicorn, granian, mod_wsgi-express, uwsgi or generic, with its
+    /// command after `--`.
+    #[arg(long, value_name = "PROFILE")]
+    pub(crate) server: Option<muru_config::ServerProfile>,
+
+    /// How a managed server's instances bind: unix (the default) or port.
+    #[arg(long, value_name = "MODE")]
+    pub(crate) bind: Option<muru_config::ServerBind>,
+
+    /// How many instances of a managed server's command run (default 1).
+    #[arg(long, value_name = "N")]
+    pub(crate) instances: Option<u32>,
+
+    /// The path probed until a managed server's instance answers 2xx or
+    /// 3xx; any answer makes it ready without one.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) readiness: Option<String>,
+
+    /// How long a managed server's instances get to be ready (default 60s).
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    pub(crate) readiness_timeout: Option<Duration>,
+
+    /// The signal that stops a managed server's instance gracefully
+    /// (TERM, INT, QUIT, HUP, USR1, USR2 or WINCH); required by the
+    /// generic profile, the other profiles know their server's.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) stop_signal: Option<String>,
+
+    /// A directory a path in an X-Muru-Sendfile response header must lie
+    /// in for the edge to serve the file; repeatable (default the table's).
+    #[arg(long = "sendfile-root", value_name = "DIR")]
+    pub(crate) sendfile_roots: Vec<String>,
+
+    /// A second response header honoured as X-Muru-Sendfile is, such as
+    /// X-Sendfile.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) sendfile_header: Option<String>,
+
+    /// A directory of the application's own files the edge serves under
+    /// a path prefix, as PREFIX=DIR with DIR relative to the source, over
+    /// the source's [[tool.muru.static]] entries by prefix. Repeatable.
+    #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = crate::parse_static_setting)]
+    pub(crate) static_dirs: Vec<(String, String)>,
+
+    /// The command of a managed server, after `--`, with `{bind}` where
+    /// it takes its address; without `{bind}` the profile adds the
+    /// server's own flags.
+    #[arg(last = true, value_name = "COMMAND")]
+    command: Vec<String>,
+}
+
 /// What `deploy` takes.
 #[derive(Args)]
 pub struct DeployArgs {
@@ -2386,67 +2666,8 @@ pub struct DeployArgs {
     /// The source directory (default: the current directory).
     source: Option<PathBuf>,
 
-    /// The application as module:callable, else from the source's [tool.muru] table.
-    #[arg(long)]
-    entrypoint: Option<String>,
-
-    /// The interface the entrypoint speaks: auto, wsgi or asgi.
-    #[arg(long, value_name = "NAME")]
-    interface: Option<muru_config::Interface>,
-
-    /// The interpreter: a path, or a version request such as 3.13 that
-    /// the daemon resolves with uv (default: the source's .venv, else its
-    /// own request, else the previous release's).
-    #[arg(long)]
-    python: Option<PathBuf>,
-
-    /// When the daemon builds the release's environment from uv.lock:
-    /// auto (the default) when the source has a lock and no .venv, always
-    /// when it has a lock, never.
-    #[arg(long, value_name = "MODE")]
-    build: Option<String>,
-
-    /// An extra the built environment includes; repeatable.
-    #[arg(long = "build-extra", value_name = "NAME")]
-    build_extra: Vec<String>,
-
-    /// A dependency group the built environment includes; repeatable.
-    #[arg(long = "build-group", value_name = "NAME")]
-    build_group: Vec<String>,
-
-    /// Where the release's bytecode goes: redirect (the default, a
-    /// directory of its own under the state directory), source (beside
-    /// the source, as Python does) or off.
-    #[arg(long, value_name = "MODE")]
-    bytecode: Option<String>,
-
-    /// Worker processes.
-    #[arg(long)]
-    processes: Option<u32>,
-
-    /// Application threads per worker.
-    #[arg(long)]
-    threads: Option<u32>,
-
-    /// Threads for synchronous code called from an ASGI application.
-    #[arg(long, value_name = "N")]
-    sync_threads: Option<u32>,
-
-    /// Requests an ASGI worker's event loop takes at once.
-    #[arg(long, value_name = "N")]
-    concurrency: Option<u32>,
-
-    /// The preload mode: auto, true or false.
-    #[arg(long, value_name = "MODE")]
-    preload: Option<muru_config::Preload>,
-
-    /// The hooks module.
-    #[arg(long)]
-    hooks: Option<String>,
-
-    /// The entrypoint is a factory returning the application.
-    #[arg(long)]
-    factory: bool,
+    #[command(flatten)]
+    settings: ReleaseArgs,
 
     /// The release id (default: generated, r1, r2, ...).
     #[arg(long, value_name = "ID")]
@@ -2483,97 +2704,16 @@ pub struct DeployArgs {
     #[arg(long, value_name = "N")]
     retain_workers: Option<u32>,
 
-    /// Replace a worker after this many requests, with jitter.
-    #[arg(long, value_name = "N")]
-    max_requests: Option<u64>,
-
-    /// Replace a worker after this long, for example 1h, with jitter.
-    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
-    max_lifetime: Option<Duration>,
-
-    /// A host timeout as NAME=DURATION: soft (interrupt a request that
-    /// runs this long; off), hard (replace a worker whose request runs
-    /// this long; off), hard_drain_grace (10s), shutdown (5s),
-    /// websocket_drain_grace (how long a stopping worker keeps its open
-    /// WebSockets; 0s), loop_stall (replace an ASGI worker whose event
-    /// loop stalls this long; 10s) or gil_stall (replace a worker in
-    /// which no thread has run Python for this long; 30s). Repeatable.
-    #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
-    timeouts: Vec<(String, Duration)>,
-
-    /// A memory setting as KEY=VALUE: measure (uss, pss or rss),
-    /// soft_limit (for example 800MB), soft_for (2m), reclaim_first
-    /// (true), hard_limit (1200MB) or check_interval (5s). Repeatable.
-    #[arg(long = "memory", value_name = "KEY=VALUE", value_parser = crate::parse_memory_setting)]
-    memory: Vec<(String, String)>,
-
-    /// An environment variable for the workers as NAME=VALUE, over the
-    /// source's [tool.muru.env] table. Repeatable.
-    #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env_setting)]
-    env: Vec<(String, String)>,
-
-    /// A secret for the workers as NAME=STORE:KEY, delivered as the
-    /// variable, or NAME=STORE:KEY:file for a file named by NAME_FILE.
-    /// Repeatable.
-    #[arg(long = "secret", value_name = "NAME=STORE:KEY[:file]", value_parser = parse_secret_setting)]
-    secrets: Vec<(String, String, String, bool)>,
-
-    /// Run an HTTP server of this profile instead of workers: gunicorn,
-    /// uvicorn, granian, mod_wsgi-express, uwsgi or generic, with its
-    /// command after `--`.
-    #[arg(long, value_name = "PROFILE")]
-    server: Option<muru_config::ServerProfile>,
-
-    /// How a managed server's instances bind: unix (the default) or port.
-    #[arg(long, value_name = "MODE")]
-    bind: Option<muru_config::ServerBind>,
-
-    /// How many instances of a managed server's command run (default 1).
-    #[arg(long, value_name = "N")]
-    instances: Option<u32>,
-
-    /// The path probed until a managed server's instance answers 2xx or
-    /// 3xx; any answer makes it ready without one.
-    #[arg(long, value_name = "PATH")]
-    readiness: Option<String>,
-
-    /// How long a managed server's instances get to be ready (default 60s).
-    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
-    readiness_timeout: Option<Duration>,
-
-    /// The signal that stops a managed server's instance gracefully
-    /// (TERM, INT, QUIT, HUP, USR1, USR2 or WINCH); required by the
-    /// generic profile, the other profiles know their server's.
-    #[arg(long, value_name = "NAME")]
-    stop_signal: Option<String>,
-
-    /// A directory a path in an X-Muru-Sendfile response header must lie
-    /// in for the edge to serve the file; repeatable (default the table's).
-    #[arg(long = "sendfile-root", value_name = "DIR")]
-    sendfile_roots: Vec<String>,
-
-    /// A second response header honoured as X-Muru-Sendfile is, such as
-    /// X-Sendfile.
-    #[arg(long, value_name = "NAME")]
-    sendfile_header: Option<String>,
-
-    /// A directory of the application's own files the edge serves under
-    /// a path prefix, as PREFIX=DIR with DIR relative to the source, over
-    /// the source's [[tool.muru.static]] entries by prefix. Repeatable.
-    #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = crate::parse_static_setting)]
-    static_dirs: Vec<(String, String)>,
+    /// Report what the deploy would do, with where each of the release's
+    /// settings would come from, and change nothing.
+    #[arg(long)]
+    dry_run: bool,
 
     #[command(flatten)]
     socket: SocketArgs,
 
     #[command(flatten)]
     output: JsonArgs,
-
-    /// The command of a managed server, after `--`, with `{bind}` where
-    /// it takes its address; without `{bind}` the profile adds the
-    /// server's own flags.
-    #[arg(last = true, value_name = "COMMAND")]
-    command: Vec<String>,
 }
 
 /// Parse NAME=VALUE for --env.
@@ -2668,7 +2808,7 @@ pub async fn secret(command: SecretCommand) -> anyhow::Result<()> {
         }
         | SecretCommand::Remove {
             store, locations, ..
-        } => (store.clone(), locations.resolve()),
+        } => (store.clone(), locations.resolve()?),
     };
 
     let document = read_config(&locations.config.path)?;
@@ -2822,8 +2962,138 @@ fn absolute_interpreter(python: &Path, base: Option<&Path>) -> String {
     base.join(python).display().to_string()
 }
 
-/// Deploy a release.
-pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
+impl ReleaseArgs {
+    /// What cannot be asked for together.
+    pub(crate) fn check(&self) -> anyhow::Result<()> {
+        if self.server.is_none() && !self.command.is_empty() {
+            anyhow::bail!("a command after -- needs --server PROFILE");
+        }
+
+        Ok(())
+    }
+
+    /// These settings as the deploy request that carries them, for the
+    /// application and its source, with the interpreter as the caller
+    /// has it written. What says how the deploy is carried out is left
+    /// for the caller to set. No flag sets the handoff or the build's
+    /// source_builds and compile_bytecode: a deploy takes them from the
+    /// source's settings, and only a release's table in an applied file
+    /// gives them.
+    pub(crate) fn request(self, app: &str, source: &str, python: String) -> pb::DeployRequest {
+        pb::DeployRequest {
+            app: app.to_owned(),
+            source: source.to_owned(),
+            kind: self.server.map(|_| "http".to_owned()).unwrap_or_default(),
+            profile: self
+                .server
+                .map(|profile| profile.as_str().to_owned())
+                .unwrap_or_default(),
+            command: self.command.clone(),
+            bind: self
+                .bind
+                .map(|bind| bind.as_str().to_owned())
+                .unwrap_or_default(),
+            instances: self.instances,
+            readiness_path: self.readiness.unwrap_or_default(),
+            readiness_timeout_ms: self
+                .readiness_timeout
+                .map(|timeout| timeout.as_millis() as u64),
+            stop_signal: self.stop_signal.unwrap_or_default(),
+            entrypoint: self.entrypoint.unwrap_or_default(),
+            interface: self
+                .interface
+                .map(|value| value.as_str().to_owned())
+                .unwrap_or_default(),
+            python,
+            build_when: self.build.unwrap_or_default(),
+            build_extras: self.build_extra,
+            build_groups: self.build_group,
+            bytecode: self.bytecode.unwrap_or_default(),
+            handoff: String::new(),
+            build_source_builds: None,
+            build_compile_bytecode: None,
+            processes: self.processes,
+            threads: self.threads,
+            sync_threads: self.sync_threads,
+            concurrency: self.concurrency,
+            preload: self
+                .preload
+                .map(|value| value.as_str().to_owned())
+                .unwrap_or_default(),
+            hooks: self.hooks.unwrap_or_default(),
+            factory: self.factory.then_some(true),
+            factory_phase: String::new(),
+            release: String::new(),
+            wait: true,
+            hold: false,
+            override_freeze: false,
+            fresh: false,
+            reflection: None,
+            grpc_web_origins: Vec::new(),
+            retain_ms: None,
+            retain_workers: None,
+            max_requests: self.max_requests,
+            max_lifetime_ms: self
+                .max_lifetime
+                .map(|lifetime| lifetime.as_millis() as u64),
+            soft_timeout_ms: timeout_ms(&self.timeouts, "soft"),
+            accel_redirect: None,
+            cgi_local_redirect: None,
+            sendfile_roots: self.sendfile_roots,
+            sendfile_header: self.sendfile_header,
+            static_dirs: self
+                .static_dirs
+                .iter()
+                .map(|(path, dir)| pb::StaticDir {
+                    path: path.clone(),
+                    dir: dir.clone(),
+                })
+                .collect(),
+            hard_timeout_ms: timeout_ms(&self.timeouts, "hard"),
+            hard_drain_grace_ms: timeout_ms(&self.timeouts, "hard_drain_grace"),
+            shutdown_timeout_ms: timeout_ms(&self.timeouts, "shutdown"),
+            websocket_drain_grace_ms: timeout_ms(&self.timeouts, "websocket_drain_grace"),
+            loop_stall_timeout_ms: timeout_ms(&self.timeouts, "loop_stall"),
+            gil_stall_timeout_ms: timeout_ms(&self.timeouts, "gil_stall"),
+            memory_measure: memory_setting(&self.memory, "measure").unwrap_or_default(),
+            memory_soft_limit: memory_setting(&self.memory, "soft_limit")
+                .and_then(|text| muru_config::parse_size(&text).ok()),
+            memory_soft_for_ms: memory_setting(&self.memory, "soft_for")
+                .and_then(|text| muru_config::parse_duration(&text).ok())
+                .map(|duration| duration.as_millis() as u64),
+            memory_reclaim_first: memory_setting(&self.memory, "reclaim_first")
+                .map(|text| text == "true"),
+            memory_hard_limit: memory_setting(&self.memory, "hard_limit")
+                .and_then(|text| muru_config::parse_size(&text).ok()),
+            memory_check_interval_ms: memory_setting(&self.memory, "check_interval")
+                .and_then(|text| muru_config::parse_duration(&text).ok())
+                .map(|duration| duration.as_millis() as u64),
+            env: self
+                .env
+                .iter()
+                .map(|(name, value)| pb::EnvEntry {
+                    name: name.clone(),
+                    value: value.clone(),
+                    ..Default::default()
+                })
+                .chain(
+                    self.secrets
+                        .iter()
+                        .map(|(name, store, key, as_file)| pb::EnvEntry {
+                            name: name.clone(),
+                            secret_store: store.clone(),
+                            secret_key: key.clone(),
+                            as_file: *as_file,
+                            ..Default::default()
+                        }),
+                )
+                .collect(),
+        }
+    }
+}
+
+/// Deploy a release, or with --dry-run report what deploying it would do.
+pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
     let source = args
         .source
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -2831,125 +3101,53 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         .canonicalize()
         .with_context(|| format!("{} does not exist", source.display()))?;
 
-    if args.server.is_none() && !args.command.is_empty() {
-        anyhow::bail!("a command after -- needs --server PROFILE");
+    if let Some(note) = crate::passed_over_note(&source) {
+        eprintln!("muru: {note}");
     }
 
+    args.settings.check()?;
     let mut client = client::connect(&args.socket.socket()?).await?;
+    let python = args
+        .settings
+        .python
+        .as_deref()
+        .map(|path| absolute_interpreter(path, None))
+        .unwrap_or_default();
 
     let request = pb::DeployRequest {
-        app: args.app.clone(),
-        source: source.display().to_string(),
-        kind: args.server.map(|_| "http".to_owned()).unwrap_or_default(),
-        profile: args
-            .server
-            .map(|profile| profile.as_str().to_owned())
-            .unwrap_or_default(),
-        command: args.command.clone(),
-        bind: args
-            .bind
-            .map(|bind| bind.as_str().to_owned())
-            .unwrap_or_default(),
-        instances: args.instances,
-        readiness_path: args.readiness.unwrap_or_default(),
-        readiness_timeout_ms: args
-            .readiness_timeout
-            .map(|timeout| timeout.as_millis() as u64),
-        stop_signal: args.stop_signal.unwrap_or_default(),
-        entrypoint: args.entrypoint.unwrap_or_default(),
-        interface: args
-            .interface
-            .map(|value| value.as_str().to_owned())
-            .unwrap_or_default(),
-        python: args
-            .python
-            .map(|path| absolute_interpreter(&path, None))
-            .unwrap_or_default(),
-        build_when: args.build.unwrap_or_default(),
-        build_extras: args.build_extra,
-        build_groups: args.build_group,
-        bytecode: args.bytecode.unwrap_or_default(),
-        processes: args.processes,
-        threads: args.threads,
-        sync_threads: args.sync_threads,
-        concurrency: args.concurrency,
-        preload: args
-            .preload
-            .map(|value| value.as_str().to_owned())
-            .unwrap_or_default(),
-        hooks: args.hooks.unwrap_or_default(),
-        factory: args.factory.then_some(true),
-        factory_phase: String::new(),
         release: args.release.unwrap_or_default(),
         wait: !args.no_wait,
         hold: args.hold,
         override_freeze: args.override_freeze,
         fresh: args.fresh,
-        reflection: None,
-        grpc_web_origins: Vec::new(),
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
         retain_workers: args.retain_workers,
-        max_requests: args.max_requests,
-        max_lifetime_ms: args
-            .max_lifetime
-            .map(|lifetime| lifetime.as_millis() as u64),
-        soft_timeout_ms: timeout_ms(&args.timeouts, "soft"),
-        accel_redirect: None,
-        cgi_local_redirect: None,
-        sendfile_roots: args.sendfile_roots,
-        sendfile_header: args.sendfile_header,
-        static_dirs: args
-            .static_dirs
-            .iter()
-            .map(|(path, dir)| pb::StaticDir {
-                path: path.clone(),
-                dir: dir.clone(),
-            })
-            .collect(),
-        hard_timeout_ms: timeout_ms(&args.timeouts, "hard"),
-        hard_drain_grace_ms: timeout_ms(&args.timeouts, "hard_drain_grace"),
-        shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),
-        websocket_drain_grace_ms: timeout_ms(&args.timeouts, "websocket_drain_grace"),
-        loop_stall_timeout_ms: timeout_ms(&args.timeouts, "loop_stall"),
-        gil_stall_timeout_ms: timeout_ms(&args.timeouts, "gil_stall"),
-        memory_measure: memory_setting(&args.memory, "measure").unwrap_or_default(),
-        memory_soft_limit: memory_setting(&args.memory, "soft_limit")
-            .and_then(|text| muru_config::parse_size(&text).ok()),
-        memory_soft_for_ms: memory_setting(&args.memory, "soft_for")
-            .and_then(|text| muru_config::parse_duration(&text).ok())
-            .map(|duration| duration.as_millis() as u64),
-        memory_reclaim_first: memory_setting(&args.memory, "reclaim_first")
-            .map(|text| text == "true"),
-        memory_hard_limit: memory_setting(&args.memory, "hard_limit")
-            .and_then(|text| muru_config::parse_size(&text).ok()),
-        memory_check_interval_ms: memory_setting(&args.memory, "check_interval")
-            .and_then(|text| muru_config::parse_duration(&text).ok())
-            .map(|duration| duration.as_millis() as u64),
-        env: args
-            .env
-            .iter()
-            .map(|(name, value)| pb::EnvEntry {
-                name: name.clone(),
-                value: value.clone(),
-                ..Default::default()
-            })
-            .chain(
-                args.secrets
-                    .iter()
-                    .map(|(name, store, key, as_file)| pb::EnvEntry {
-                        name: name.clone(),
-                        secret_store: store.clone(),
-                        secret_key: key.clone(),
-                        as_file: *as_file,
-                        ..Default::default()
-                    }),
-            )
-            .collect(),
+        ..args
+            .settings
+            .request(&args.app, &source.display().to_string(), python)
     };
+
+    if args.dry_run {
+        let plan = client
+            .plan_deploy(request)
+            .await
+            .map_err(explain)?
+            .into_inner();
+
+        if args.output.json {
+            print_answer(&plan)?;
+        } else {
+            print_deploy_plan(&plan);
+        }
+
+        return Ok(i32::from(!plan.refusals.is_empty()));
+    }
+
     let release = client.deploy(request).await.map_err(explain)?.into_inner();
 
     if args.output.json {
-        return print_answer(&release);
+        print_answer(&release)?;
+        return Ok(0);
     }
 
     if args.no_wait {
@@ -2972,7 +3170,92 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             }
         );
     }
-    Ok(())
+
+    Ok(0)
+}
+
+/// A deploy's plan as people read it: the release, each setting with
+/// the layer it would come from, and what happens around it.
+fn print_deploy_plan(plan: &pb::DeployPlan) {
+    if !plan.refusals.is_empty() {
+        println!("muru: the deploy would be refused:");
+
+        for refusal in &plan.refusals {
+            println!("  {refusal}");
+        }
+
+        return;
+    }
+
+    println!(
+        "muru: plan (nothing changed): release {}@{}, {}",
+        plan.app, plan.release, plan.description
+    );
+
+    if plan.new_app {
+        println!("  the application {} would be created", plan.app);
+    }
+
+    if !plan.settings.is_empty() {
+        let lines: Vec<(String, &str)> = plan
+            .settings
+            .iter()
+            .map(|setting| {
+                (
+                    format!("{} = {}", setting.key, setting.value),
+                    setting.layer.as_str(),
+                )
+            })
+            .collect();
+        let width = lines
+            .iter()
+            .map(|(line, _)| line.len())
+            .filter(|length| *length <= 44)
+            .max()
+            .unwrap_or(0);
+
+        for (line, layer) in lines {
+            println!("  {line:<width$}  ({layer})");
+        }
+    }
+
+    if !plan.settings_from.is_empty() {
+        println!(
+            "  settings nothing else gives come from {}@{}; --fresh takes none",
+            plan.app, plan.settings_from
+        );
+    }
+
+    if plan.builds {
+        println!("  an environment would be built from the source's uv.lock");
+    }
+
+    match (plan.hold, plan.serving.is_empty()) {
+        (true, true) => println!(
+            "  the release would start held, and {} would serve nothing until a rollout",
+            plan.app
+        ),
+        (true, false) => println!(
+            "  the release would start held, and {}@{} would go on serving",
+            plan.app, plan.serving
+        ),
+        (false, true) => println!("  the release would serve once it is ready"),
+        (false, false) if plan.retain_ms == 0 => println!(
+            "  the release would take over from {}@{}, which would stop once it has drained",
+            plan.app, plan.serving
+        ),
+        (false, false) => println!(
+            "  the release would take over from {}@{}, which would stay warm for {} with {} to a group",
+            plan.app,
+            plan.serving,
+            muru_config::format_duration(Duration::from_millis(plan.retain_ms)),
+            match plan.retain_workers {
+                0 => "its host alone".to_owned(),
+                1 => "1 worker".to_owned(),
+                count => format!("{count} workers"),
+            }
+        ),
+    }
 }
 
 /// The rollout subcommands (section 9.3).
@@ -3593,8 +3876,16 @@ fn print_scale_status(status: &pb::ScaleStatus) {
         let measured = |value: Option<f64>, unit: &str| {
             value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
         };
+
+        // Section 6.14: the wait for a thread of requests handed from
+        // ASGI to WSGI, for a group that handed any over.
+
+        let handoff = group
+            .handoff_queue_wait_p95_ms
+            .map(|wait| format!(", handoff wait p95 {wait:.0} ms"))
+            .unwrap_or_default();
         println!(
-            "  workers: cpu {}, gc {}, gil wait p95 {}, loop lag p95 {}",
+            "  workers: cpu {}, gc {}, gil wait p95 {}, loop lag p95 {}{handoff}",
             measured(group.worker_cpu.map(|cpu| cpu * 100.0), "%"),
             measured(group.gc_share.map(|share| share * 100.0), "%"),
             measured(group.gil_wait_p95_ms, " ms"),
@@ -4210,11 +4501,17 @@ async fn list_overlays(socket: &SocketArgs, json: bool) -> anyhow::Result<()> {
 /// The `muructl maintenance` subcommands (section 4.12).
 #[derive(Subcommand)]
 pub enum MaintenanceCommand {
-    /// Serve the application's maintenance page at the edge: 503
-    /// maintenance, except for what its exemptions let through.
+    /// Serve the maintenance page at the edge for an application, or
+    /// with --host for every route of a virtual host: 503 maintenance,
+    /// except for what its exemptions let through.
     On {
         /// The application.
-        app: String,
+        #[arg(required_unless_present = "host", conflicts_with = "host")]
+        app: Option<String>,
+
+        /// The virtual host, instead of an application.
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
 
         #[command(flatten)]
         socket: SocketArgs,
@@ -4223,10 +4520,16 @@ pub enum MaintenanceCommand {
         output: JsonArgs,
     },
 
-    /// Serve the application as usual again.
+    /// Serve the application, or with --host the virtual host, as usual
+    /// again.
     Off {
         /// The application.
-        app: String,
+        #[arg(required_unless_present = "host", conflicts_with = "host")]
+        app: Option<String>,
+
+        /// The virtual host, instead of an application.
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
 
         #[command(flatten)]
         socket: SocketArgs,
@@ -4238,28 +4541,47 @@ pub enum MaintenanceCommand {
 
 /// Turn maintenance mode on or off.
 pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
-    let (app, on, socket, json) = match command {
+    let (app, host, on, socket, json) = match command {
         MaintenanceCommand::On {
             app,
+            host,
             socket,
             output,
-        } => (app, true, socket, output.json),
+        } => (app, host, true, socket, output.json),
         MaintenanceCommand::Off {
             app,
+            host,
             socket,
             output,
-        } => (app, false, socket, output.json),
+        } => (app, host, false, socket, output.json),
     };
 
     let mut client = client::connect(&socket.socket()?).await?;
     let status = client
-        .set_maintenance(pb::SetMaintenanceRequest { app, on })
+        .set_maintenance(pb::SetMaintenanceRequest {
+            app: app.unwrap_or_default(),
+            host: host.unwrap_or_default(),
+            on,
+        })
         .await
         .map_err(explain)?
         .into_inner();
 
     if json {
         return print_answer(&status);
+    }
+
+    if !status.host.is_empty() {
+        if status.on {
+            println!(
+                "muru: host {} is in maintenance: clients get 503 maintenance until `muructl maintenance off --host {}`",
+                status.host, status.host
+            );
+        } else {
+            println!("muru: host {} serves as usual again", status.host);
+        }
+
+        return Ok(());
     }
 
     if status.on {
@@ -4388,6 +4710,56 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             });
         }
 
+        // Section 4.12: the edge serves the host's maintenance page.
+
+        if host.maintenance {
+            names.push_str(" [maintenance]");
+        }
+
+        // Sections 4.3, 4.6 and 11.2: what the host sets for its routes.
+
+        if host.canonical_redirect {
+            names.push_str(&format!(" [redirects to {}]", host.canonical));
+        }
+
+        if !host.max_body_size.is_empty() {
+            names.push_str(&format!(" [max body {}]", host.max_body_size));
+        }
+
+        if !host.timeouts.is_empty() {
+            names.push_str(&format!(" [{}]", timeouts_note(&host.timeouts)));
+        }
+
+        if !host.access_log.is_empty() {
+            names.push_str(&format!(" [access log {}]", host.access_log));
+        }
+
+        if !host.access_log_file.is_empty() || !host.access_log_format.is_empty() {
+            let own = [
+                host.access_log_format.as_str(),
+                host.access_log_file.as_str(),
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" in ");
+            names.push_str(&format!(" [access records {own}]"));
+        }
+
+        if !host.compression.is_empty() {
+            names.push_str(&format!(" [compression {}]", host.compression));
+        }
+
+        // Section 4.7: its rules for headers.
+
+        if !host.request_headers.is_empty() {
+            names.push_str(&format!(" [request headers: {}]", host.request_headers));
+        }
+
+        if !host.response_headers.is_empty() {
+            names.push_str(&format!(" [response headers: {}]", host.response_headers));
+        }
+
         println!(
             "{:<16} {:<8} {:<10} {names}",
             host.name,
@@ -4401,6 +4773,16 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// A host's or a route's own request timeouts as one note, in the order
+/// of the keys.
+fn timeouts_note(timeouts: &std::collections::BTreeMap<String, String>) -> String {
+    timeouts
+        .iter()
+        .map(|(key, value)| format!("{key} {value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The upstream subcommands (section 4.13).
@@ -4570,6 +4952,24 @@ pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
 
         if !route.max_body_size.is_empty() {
             target.push_str(&format!(" [max body {}]", route.max_body_size));
+        }
+
+        if !route.timeouts.is_empty() {
+            target.push_str(&format!(" [{}]", timeouts_note(&route.timeouts)));
+        }
+
+        if !route.compression.is_empty() {
+            target.push_str(&format!(" [compression {}]", route.compression));
+        }
+
+        // Section 4.7: its rules for headers.
+
+        if !route.request_headers.is_empty() {
+            target.push_str(&format!(" [request headers: {}]", route.request_headers));
+        }
+
+        if !route.response_headers.is_empty() {
+            target.push_str(&format!(" [response headers: {}]", route.response_headers));
         }
 
         if !route.upload.is_empty() {
@@ -5102,6 +5502,26 @@ pub struct ApplyArgs {
     #[arg(long)]
     override_freeze: bool,
 
+    /// Start the releases the apply adds but leave traffic where it is,
+    /// for a preview with the Muru-Preview header or a rollout.
+    #[arg(long)]
+    hold: bool,
+
+    /// Return as soon as the releases the apply adds are recorded,
+    /// without waiting for them to serve.
+    #[arg(long)]
+    no_wait: bool,
+
+    /// How long a release the apply replaces stays warm for an instant
+    /// rollback (default 30m; 0 stops it as soon as it has drained).
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    retain: Option<Duration>,
+
+    /// The workers each group of a release the apply replaces keeps
+    /// while it stays warm (default 1; 0 keeps the host alone).
+    #[arg(long, value_name = "N")]
+    retain_workers: Option<u32>,
+
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -5122,6 +5542,10 @@ pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
             dry_run: args.dry_run,
             prune: args.prune,
             override_freeze: args.override_freeze,
+            hold: args.hold,
+            no_wait: args.no_wait,
+            retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
+            retain_workers: args.retain_workers,
         })
         .await
         .map_err(explain)?
@@ -5283,7 +5707,7 @@ pub async fn config_show(
     }
 
     if !export.layers.is_empty() {
-        println!("# The releases' settings, and the layer each came from:");
+        println!("# The releases' settings and the routes' limits, and the layer each came from:");
 
         for line in &export.layers {
             println!("#   {line}");
@@ -5350,6 +5774,7 @@ fn resolve_paths(document: &mut muru_config::Document, base: &Path) {
     for app in document.app.values_mut() {
         for release in app.release.values_mut() {
             resolve(&mut release.source);
+            resolve(&mut release.cwd);
 
             if let Some(python) = &release.python {
                 release.python = Some(absolute_interpreter(Path::new(python), Some(base)));
@@ -5617,13 +6042,16 @@ pub async fn events(
     Ok(())
 }
 
-/// What `muructl exec` takes: a release and the command to run with it.
+/// What `muructl exec` takes: a release, or the project here, and the
+/// command to run with it.
 #[derive(Args)]
 pub struct RunExecArgs {
     /// The application, or app@release; the current release when only
-    /// the application is named.
+    /// the application is named. With none, the project in the current
+    /// directory: through a muructl run or muructl serve of it when one
+    /// is up, else by this command itself.
     #[arg(value_name = "APP[@RELEASE]")]
-    target: String,
+    target: Option<String>,
 
     /// The command and its arguments, after `--`, run without a shell;
     /// `python` is the release's interpreter.
@@ -5637,11 +6065,16 @@ pub struct RunExecArgs {
 
     #[command(flatten)]
     socket: SocketArgs,
+
+    #[command(flatten)]
+    project: crate::project_commands::ProjectArgs,
 }
 
-/// Run a one-off command with a release and exit with its status.
+/// Run a one-off command with a release, or for the project here, and
+/// exit with its status.
 pub async fn exec(args: RunExecArgs) -> anyhow::Result<i32> {
-    let (app, release) = target_release(&args.target)?;
+    let place = Place::find(args.target.as_deref(), &args.socket, &args.project)?;
+    let (app, release) = place.target()?;
     let request = pb::RunCommandRequest {
         app,
         release,
@@ -5649,39 +6082,139 @@ pub async fn exec(args: RunExecArgs) -> anyhow::Result<i32> {
         ..Default::default()
     };
 
-    run_command(request, &args.socket, args.json).await
+    run_command(request, &place, args.json).await
+}
+
+/// Where a command runs (section 9.12): through an admin socket, the
+/// daemon's for a named application and a development run's or muructl
+/// serve's for the project here, or by this command itself.
+enum Place<'a> {
+    /// Through an admin socket, with the application and release named.
+    Socket {
+        /// The socket.
+        socket: PathBuf,
+        /// The application and release, as given.
+        target: Option<&'a str>,
+    },
+    /// By this command, for the project the flags find.
+    Own(&'a crate::project_commands::ProjectArgs),
+}
+
+impl<'a> Place<'a> {
+    /// With an application named, the daemon; with none, the socket
+    /// given, else a muructl serve or development run of the project
+    /// that answers, else this command itself.
+    fn find(
+        target: Option<&'a str>,
+        socket: &SocketArgs,
+        project: &'a crate::project_commands::ProjectArgs,
+    ) -> anyhow::Result<Self> {
+        if let Some(target) = target {
+            if let Some(flag) = project.given() {
+                anyhow::bail!(
+                    "{flag} finds the project a command runs for when no application is \
+                     named; {target} runs with its release's own code, under the daemon"
+                );
+            }
+
+            return Ok(Self::Socket {
+                socket: socket.socket()?,
+                target: Some(target),
+            });
+        }
+
+        if let Some(given) = &socket.socket {
+            return Ok(Self::Socket {
+                socket: given.clone(),
+                target: None,
+            });
+        }
+
+        Ok(
+            match socket.serving(&project.project(), project.chdir.is_some()) {
+                Some(socket) => Self::Socket {
+                    socket,
+                    target: None,
+                },
+                None => Self::Own(project),
+            },
+        )
+    }
+
+    /// The application and release to ask for: those named, or none,
+    /// which a run takes as the application it serves.
+    fn target(&self) -> anyhow::Result<(String, String)> {
+        match self {
+            Self::Socket {
+                target: Some(target),
+                ..
+            } => target_release(target),
+            _ => Ok((String::new(), String::new())),
+        }
+    }
+
+    /// The commands declared there.
+    async fn commands(&self) -> anyhow::Result<pb::ListCommandsResponse> {
+        match self {
+            Self::Socket { socket, .. } => {
+                let (app, release) = self.target()?;
+                let mut client = client::connect(socket).await?;
+                Ok(client
+                    .list_commands(pb::ListCommandsRequest { app, release })
+                    .await
+                    .map_err(explain)?
+                    .into_inner())
+            }
+            Self::Own(project) => {
+                crate::project_commands::listed(&project.project(), project.file().as_deref())
+                    .map_err(anyhow::Error::msg)
+            }
+        }
+    }
 }
 
 /// The `muructl command` subcommands.
 #[derive(Subcommand)]
 pub enum CommandCommand {
     /// List the commands a release declares, with their inputs and each
-    /// one's last run.
-    List {
-        /// The application, or app@release; the current release when
-        /// only the application is named.
-        #[arg(value_name = "APP[@RELEASE]")]
-        target: String,
+    /// one's last run; or, with no application, those of the project in
+    /// the current directory.
+    List(Box<CommandListArgs>),
 
-        #[command(flatten)]
-        socket: SocketArgs,
-
-        #[command(flatten)]
-        output: JsonArgs,
-    },
-
-    /// Run a command the release declares, with its inputs, and exit with
-    /// its status.
+    /// Run a declared command, with its inputs, and exit with its status:
+    /// a release's under the daemon, or, with no application, one of the
+    /// project in the current directory.
+    #[command(allow_missing_positional = true)]
     Run(Box<CommandRunArgs>),
+}
+
+/// What `muructl command list` takes.
+#[derive(Args)]
+pub struct CommandListArgs {
+    /// The application, or app@release; the current release when only
+    /// the application is named. With none, the project here.
+    #[arg(value_name = "APP[@RELEASE]")]
+    target: Option<String>,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    project: crate::project_commands::ProjectArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
 }
 
 /// What `muructl command run` takes.
 #[derive(Args)]
 pub struct CommandRunArgs {
     /// The application, or app@release; the current release when only
-    /// the application is named.
+    /// the application is named. With none, the project in the current
+    /// directory: through a muructl run or muructl serve of it when one
+    /// is up, else by this command itself.
     #[arg(value_name = "APP[@RELEASE]")]
-    target: String,
+    target: Option<String>,
 
     /// The command's name.
     name: String,
@@ -5691,7 +6224,7 @@ pub struct CommandRunArgs {
     inputs: Vec<(String, String)>,
 
     /// An input's value from one of the daemon's secret stores, so it
-    /// never passes through this command.
+    /// never passes through this command; for a named application only.
     #[arg(long = "secret-input", value_name = "NAME=STORE/KEY", value_parser = parse_input)]
     secret_inputs: Vec<(String, String)>,
 
@@ -5706,6 +6239,9 @@ pub struct CommandRunArgs {
 
     #[command(flatten)]
     socket: SocketArgs,
+
+    #[command(flatten)]
+    project: crate::project_commands::ProjectArgs,
 }
 
 /// Parse NAME=VALUE for --input and --secret-input.
@@ -5721,21 +6257,25 @@ fn parse_input(text: &str) -> Result<(String, String), String> {
     Ok((name.to_owned(), value.to_owned()))
 }
 
-/// List the commands a release declares.
-pub async fn command_list(target: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let (app, release) = target_release(&target)?;
-    let mut client = client::connect(&socket.socket()?).await?;
-    let listed = client
-        .list_commands(pb::ListCommandsRequest { app, release })
-        .await
-        .map_err(explain)?
-        .into_inner();
+/// List the commands a release declares, or the project here does.
+pub async fn command_list(args: CommandListArgs) -> anyhow::Result<()> {
+    let project = &args.project;
+    let place = Place::find(args.target.as_deref(), &args.socket, project)?;
+    let listed = place.commands().await?;
 
-    if json {
+    if args.output.json {
         return print_answer(&listed);
     }
 
-    println!("{}@{}", listed.app, listed.release);
+    if listed.release.is_empty() {
+        println!(
+            "{}, the project in {}",
+            listed.app,
+            project.project().display()
+        );
+    } else {
+        println!("{}@{}", listed.app, listed.release);
+    }
 
     if listed.commands.is_empty() {
         println!("  declares no commands");
@@ -5818,11 +6358,12 @@ pub async fn command_list(target: String, socket: SocketArgs, json: bool) -> any
 
 /// Run a declared command and exit with its status. A required input
 /// not given is asked for when standard input is a terminal, a secret one
-/// without echo; otherwise the daemon refuses the run and says which.
+/// without echo; otherwise the run is refused, saying which.
 pub async fn command_run(args: CommandRunArgs) -> anyhow::Result<i32> {
     use std::io::{IsTerminal as _, Read as _};
 
-    let (app, release) = target_release(&args.target)?;
+    let place = Place::find(args.target.as_deref(), &args.socket, &args.project)?;
+    let (app, release) = place.target()?;
     let mut inputs: std::collections::BTreeMap<String, String> = args.inputs.into_iter().collect();
     let secret_inputs: std::collections::BTreeMap<String, String> =
         args.secret_inputs.into_iter().collect();
@@ -5837,15 +6378,7 @@ pub async fn command_run(args: CommandRunArgs) -> anyhow::Result<i32> {
             value.trim_end_matches(['\n', '\r']).to_owned(),
         );
     } else if std::io::stdin().is_terminal() && !args.json {
-        let mut client = client::connect(&args.socket.socket()?).await?;
-        let listed = client
-            .list_commands(pb::ListCommandsRequest {
-                app: app.clone(),
-                release: release.clone(),
-            })
-            .await
-            .map_err(explain)?
-            .into_inner();
+        let listed = place.commands().await?;
         let declared = listed
             .commands
             .iter()
@@ -5874,7 +6407,7 @@ pub async fn command_run(args: CommandRunArgs) -> anyhow::Result<i32> {
         ..Default::default()
     };
 
-    run_command(request, &args.socket, args.json).await
+    run_command(request, &place, args.json).await
 }
 
 /// Ask for an input's value on the terminal, without echo for a secret
@@ -5925,18 +6458,21 @@ fn target_release(target: &str) -> anyhow::Result<(String, String)> {
     }
 }
 
-/// Run a command through the daemon, printing its output as it arrives,
+/// Run a command where it belongs, printing its output as it arrives,
 /// standard error to standard error, and return its exit status. A
 /// command that fails says how on standard error, as muructl's other
 /// errors do.
 async fn run_command(
     request: pb::RunCommandRequest,
-    socket: &SocketArgs,
+    place: &Place<'_>,
     json: bool,
 ) -> anyhow::Result<i32> {
-    use std::io::Write as _;
+    let socket = match place {
+        Place::Socket { socket, .. } => socket,
+        Place::Own(project) => return run_own(request, project, json).await,
+    };
 
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(socket).await?;
     let mut stream = client
         .run_command(request)
         .await
@@ -5944,27 +6480,181 @@ async fn run_command(
         .into_inner();
 
     while let Some(output) = stream.next().await {
-        let output = output.map_err(explain)?;
-
-        if json {
-            println!("{}", serde_json::to_string(&output)?);
-        } else if output.finished {
-            if output.exit_code != 0 {
-                eprintln!("muru: the command {}", output.message);
-            }
-        } else if output.stderr {
-            eprintln!("{}", output.line);
-        } else {
-            println!("{}", output.line);
-        }
-
-        if output.finished {
-            std::io::stdout().flush()?;
-            return Ok(output.exit_code);
+        if let Some(code) = show_output(&output.map_err(explain)?, json)? {
+            return Ok(code);
         }
     }
 
     anyhow::bail!("the daemon stopped answering before the command ended")
+}
+
+/// Print a message of a command's stream, and give muructl's exit status
+/// when it is the last. Output that cannot be written, to a terminal that
+/// has gone or a pipe nothing reads, is an error rather than a panic.
+fn show_output(output: &pb::CommandOutput, json: bool) -> anyhow::Result<Option<i32>> {
+    use std::io::Write as _;
+
+    let mut stdout = std::io::stdout().lock();
+
+    if json {
+        writeln!(stdout, "{}", serde_json::to_string(output)?)?;
+    } else if output.finished {
+        if !output.ok {
+            writeln!(std::io::stderr(), "muru: the command {}", output.message)?;
+        }
+    } else if output.stderr {
+        writeln!(std::io::stderr(), "{}", output.line)?;
+    } else {
+        writeln!(stdout, "{}", output.line)?;
+    }
+
+    if output.finished {
+        stdout.flush()?;
+        return Ok(Some(exit_status(output)));
+    }
+
+    Ok(None)
+}
+
+/// muructl's exit status for how a command ended: the command's own, or
+/// 1 for a command that was stopped and exited with 0 all the same.
+fn exit_status(output: &pb::CommandOutput) -> i32 {
+    if !output.ok && output.exit_code == 0 {
+        1
+    } else {
+        output.exit_code
+    }
+}
+
+/// Run a command of the project here in this process (section 9.12):
+/// nothing else is running to ask, as in a Kubernetes Job. The command
+/// gets what muructl serve and muructl run would serve the application
+/// with. SIGINT, SIGTERM or SIGHUP stops it as a caller going away does
+/// under the daemon, and so does output muructl can no longer write; a
+/// second signal kills it at once.
+async fn run_own(
+    request: pb::RunCommandRequest,
+    project: &crate::project_commands::ProjectArgs,
+    json: bool,
+) -> anyhow::Result<i32> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let request = muru_controller::commands::CommandRequest::from_message(request)
+        .map_err(anyhow::Error::msg)?;
+    let context = crate::project_commands::own(project).await?;
+    let prepared =
+        crate::project_commands::prepare(&context, request).map_err(anyhow::Error::msg)?;
+
+    // The signals are taken before the command starts, so none that comes
+    // once it has is missed.
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    let (signalled, signals) = tokio::sync::mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        loop {
+            let signal = tokio::select! {
+                _ = interrupt.recv() => libc::SIGINT,
+                _ = terminate.recv() => libc::SIGTERM,
+                _ = hangup.recv() => libc::SIGHUP,
+            };
+
+            if signalled.send(signal).is_err() {
+                return;
+            }
+        }
+    });
+
+    let running = muru_controller::commands::run(
+        prepared,
+        std::sync::Arc::new(muru_controller::commands::Unrecorded),
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    relay(running, signals, |message| show_output(message, json)).await
+}
+
+/// What ended relaying a command's output before the command ended.
+enum Interrupted {
+    /// muructl got this signal.
+    Signal(i32),
+    /// Its output could not be written.
+    Unwritable(anyhow::Error),
+}
+
+/// Relay a running command's output with `show` and give muructl's exit
+/// status. A signal, or output `show` cannot write, stops the command as
+/// at its timeout; the output is read on to the last message, which comes
+/// once the command has ended and been reaped, so muructl exits only after
+/// it. Another signal kills the command's session at once.
+async fn relay(
+    running: muru_controller::commands::Running,
+    mut signals: tokio::sync::mpsc::UnboundedReceiver<i32>,
+    mut show: impl FnMut(&pb::CommandOutput) -> anyhow::Result<Option<i32>>,
+) -> anyhow::Result<i32> {
+    let muru_controller::commands::Running {
+        mut output,
+        stopper,
+    } = running;
+
+    let interrupted = loop {
+        tokio::select! {
+            message = output.recv() => {
+                let Some(message) = message else {
+                    anyhow::bail!("the command's end was not reported");
+                };
+
+                match show(&message) {
+                    Ok(Some(code)) => return Ok(code),
+                    Ok(None) => {}
+                    Err(error) => {
+                        break Interrupted::Unwritable(
+                            error.context("writing the command's output"),
+                        );
+                    }
+                }
+            }
+            Some(signal) = signals.recv() => break Interrupted::Signal(signal),
+        }
+    };
+
+    let why = match interrupted {
+        Interrupted::Signal(libc::SIGINT) => "muructl got SIGINT",
+        Interrupted::Signal(libc::SIGHUP) => "muructl got SIGHUP",
+        Interrupted::Signal(_) => "muructl got SIGTERM",
+        Interrupted::Unwritable(_) => "muructl could not write its output",
+    };
+
+    stopper.stop(why);
+
+    loop {
+        tokio::select! {
+            message = output.recv() => {
+                let Some(message) = message else {
+                    anyhow::bail!("the command's end was not reported");
+                };
+
+                // After a signal the output is shown while it can be: after
+                // SIGHUP the terminal may be gone, and that does not stop
+                // muructl waiting for the command. Output that could not be
+                // written is not tried again.
+
+                if matches!(interrupted, Interrupted::Signal(_)) {
+                    let _ = show(&message);
+                }
+
+                if message.finished {
+                    return match interrupted {
+                        Interrupted::Signal(signal) => Ok(128 + signal),
+                        Interrupted::Unwritable(error) => Err(error),
+                    };
+                }
+            }
+            Some(_) = signals.recv() => stopper.kill(),
+        }
+    }
 }
 
 /// What `muructl logs` takes: a release's output, or the access log,
@@ -5992,6 +6682,11 @@ pub struct LogsArgs {
     /// The access log the edge writes, instead of a release's output.
     #[arg(long)]
     access: bool,
+
+    /// With --access, the records of one virtual host: from the file it
+    /// names for them, or else those in the access log that name it.
+    #[arg(long, value_name = "HOST", requires = "access")]
+    host: Option<String>,
 
     /// Print each line as JSON: a release's output as the admin API's
     /// log lines, access log records as the JSON lines they are kept as.
@@ -6036,6 +6731,35 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
     };
 
     let mut client = client::connect(&args.socket.socket()?).await?;
+
+    // Section 11.2: a virtual host's records are in the file it names
+    // for them, or else among the access log's, where each JSON record
+    // names its virtual host.
+
+    let mut own_file = false;
+
+    if let Some(name) = &args.host {
+        let hosts = client
+            .list_hosts(pb::ListHostsRequest {})
+            .await
+            .map_err(explain)?
+            .into_inner()
+            .hosts;
+        let host = hosts
+            .iter()
+            .find(|host| host.name == *name)
+            .ok_or_else(|| anyhow::anyhow!("no virtual host named {name}"))?;
+        own_file = !host.access_log_file.is_empty();
+
+        if !own_file && host.access_log_format == "combined" {
+            anyhow::bail!(
+                "host {name} writes its records to access.log in the combined format, which \
+                 does not name the host; give the host an access_log_file to keep them apart"
+            );
+        }
+    }
+
+    let named = args.host.as_deref().filter(|_| !own_file);
     let mut stream = client
         .tail_logs(pb::TailLogsRequest {
             app,
@@ -6043,6 +6767,7 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
             follow: args.follow,
             lines: args.lines,
             access: args.access,
+            host: args.host.clone().filter(|_| own_file).unwrap_or_default(),
         })
         .await
         .map_err(explain)?
@@ -6053,6 +6778,17 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
 
     while let Some(line) = stream.next().await {
         let line = line.map_err(explain)?;
+
+        if let Some(name) = named {
+            let of_host = serde_json::from_str::<serde_json::Value>(&line.line)
+                .ok()
+                .and_then(|record| Some(record.get("virtual_host")?.as_str()? == name))
+                .unwrap_or(false);
+
+            if !of_host {
+                continue;
+            }
+        }
 
         match (args.access, args.json) {
             (true, false) => println!("{}", format_access_line(&line.line, !args.no_timestamps)),
@@ -6234,6 +6970,71 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 #[cfg(test)]
 mod tests {
     use super::metric_samples;
+
+    #[tokio::test]
+    async fn output_that_cannot_be_written_stops_the_command_and_waits_for_it() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let cleaned = dir.path().join("cleaned");
+        let script = format!(
+            "trap 'sleep 0.5; echo done > {}; exit 0' TERM; while :; do echo tick; sleep 0.1; done",
+            cleaned.display()
+        );
+        let running = muru_controller::commands::run(
+            muru_controller::commands::Prepared {
+                app: "shop".to_owned(),
+                release: String::new(),
+                label: "exec".to_owned(),
+                argv: vec!["sh".to_owned(), "-c".to_owned(), script],
+                env: Vec::new(),
+                cwd: dir.path().to_owned(),
+                identity: None,
+                log: None,
+                timeout: None,
+                declared: None,
+                exclusive: false,
+                inputs: String::new(),
+                secrets: None,
+            },
+            std::sync::Arc::new(muru_controller::commands::Unrecorded),
+        )
+        .expect("started");
+        let (_signalled, signals) = tokio::sync::mpsc::unbounded_channel();
+
+        // The first line cannot be written, as to a pipe nothing reads.
+
+        let mut tried = 0;
+        let relayed = super::relay(running, signals, |_| {
+            tried += 1;
+            Err(anyhow::anyhow!("Broken pipe (os error 32)"))
+        })
+        .await;
+
+        let error = relayed.expect_err("the output could not be written");
+        assert!(format!("{error:#}").contains("Broken pipe"), "{error:#}");
+        assert_eq!(
+            tried, 1,
+            "output that could not be written is not tried again"
+        );
+        assert!(
+            cleaned.exists(),
+            "the command was stopped with SIGTERM, and waited for"
+        );
+    }
+
+    #[test]
+    fn muructl_exits_with_the_status_or_1_for_a_stopped_command_that_exited_with_0() {
+        let ending = |exit_code, ok| super::pb::CommandOutput {
+            finished: true,
+            exit_code,
+            ok,
+            ..Default::default()
+        };
+
+        assert_eq!(super::exit_status(&ending(0, true)), 0);
+        assert_eq!(super::exit_status(&ending(3, false)), 3);
+        assert_eq!(super::exit_status(&ending(143, false)), 143);
+        assert_eq!(super::exit_status(&ending(0, false)), 1);
+    }
 
     #[test]
     fn metric_samples_carry_names_types_labels_and_values() {

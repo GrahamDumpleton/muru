@@ -93,8 +93,8 @@ enough for production on Docker, Compose, Podman and Kubernetes.
    Issue: [#128](https://github.com/muruhq/muru/issues/128).
 
 Later additions to the goal: live reload of mounted configuration and
-certificates, debugging in a locked-down pod, `muructl exec` for
-migrations and one-off commands, and a generated Kubernetes manifest.
+certificates, debugging in a locked-down pod, and a generated
+Kubernetes manifest.
 
 ### Production readiness and 1.0
 
@@ -159,24 +159,20 @@ taken up between the steps of the major goals, in no fixed order.
   ([#134](https://github.com/muruhq/muru/issues/134)), several
   edge processes and edge pools
   ([#132](https://github.com/muruhq/muru/issues/132)),
-  connection handling under pressure and per listener
+  connection handling under pressure
   ([#154](https://github.com/muruhq/muru/issues/154),
-  [#155](https://github.com/muruhq/muru/issues/155),
   [#156](https://github.com/muruhq/muru/issues/156)),
-  compression per host and route and request decompression
-  ([#152](https://github.com/muruhq/muru/issues/152),
-  [#153](https://github.com/muruhq/muru/issues/153)), wildcard
-  and regular expression host names and host-level settings
-  ([#170](https://github.com/muruhq/muru/issues/170),
-  [#171](https://github.com/muruhq/muru/issues/171)), static
+  request decompression
+  ([#153](https://github.com/muruhq/muru/issues/153)), wildcard
+  and regular expression host names
+  ([#170](https://github.com/muruhq/muru/issues/170)), static
   file listings and a metadata cache
   ([#172](https://github.com/muruhq/muru/issues/172),
   [#174](https://github.com/muruhq/muru/issues/174)), Unix
   socket listeners
-  ([#157](https://github.com/muruhq/muru/issues/157)), proxy
-  settings per listener and client certificate headers
-  ([#316](https://github.com/muruhq/muru/issues/316),
-  [#317](https://github.com/muruhq/muru/issues/317)), 100 Continue
+  ([#157](https://github.com/muruhq/muru/issues/157)), client
+  certificate headers
+  ([#317](https://github.com/muruhq/muru/issues/317)), 100 Continue
   over HTTP/2 ([#319](https://github.com/muruhq/muru/issues/319)).
 
 - **Logging, events and OpenTelemetry:** daemon-wide logging defaults

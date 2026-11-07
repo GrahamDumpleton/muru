@@ -10,11 +10,12 @@ before it accepts requests and again when it drains.
 from __future__ import annotations
 
 import asyncio
+import math
 import sys
 import threading
 import traceback
 from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from muru._context import _request_id
@@ -41,17 +42,91 @@ SHUTDOWN_TIMEOUT = 10.0
 
 HEARTBEAT_INTERVAL = 0.5
 
+# Section 6.6: the pools synchronous code runs on, by their place in the
+# runtime's list: the loop's own, anyio's worker threads and asgiref's
+# one shared thread for thread-sensitive calls.
+
+POOL_LOOP = 0
+POOL_ANYIO = 1
+POOL_ASGIREF = 2
+
+# The thread limit anyio starts with, which the worker's replaces.
+
+ANYIO_DEFAULT_THREADS = 40
+
 
 def heartbeat(loop: asyncio.AbstractEventLoop) -> None:
-    """Make the loop beat for the native watchdog from now until it stops."""
+    """Make the loop beat for the native watchdog from now until it stops.
+
+    Each beat also tells the runtime how busy the pools for synchronous
+    code are that it cannot count by itself (section 6.6).
+    """
 
     from muru import _native
 
     def beat() -> None:
         _native.loop_beat()
+
+        if _current is not None and _current.loop is loop:
+            _current.sample_sync_pools()
+
         loop.call_later(HEARTBEAT_INTERVAL, beat)
 
     loop.call_soon_threadsafe(beat)
+
+
+def _name_thread() -> None:
+    """Tell the runtime the calling thread's name.
+
+    A reader from outside the worker (section 11.7) sees a thread by its
+    identifier alone, and the runtime's bookkeeping is where it finds
+    the names.
+    """
+
+    from muru import _native
+
+    _native.name_thread(threading.current_thread().name)
+
+
+class SyncPool(ThreadPoolExecutor):
+    """A pool the event loop runs synchronous code on (section 6.6).
+
+    Each call is noted with the runtime while a thread of the pool runs
+    it, with the request it was made in, so the pool's busy threads and
+    the request each one serves can be seen from outside (section 11.7).
+    `pool` says which pool it is to the runtime: the loop's own, or the
+    one thread asgiref keeps for thread-sensitive calls.
+    """
+
+    def __init__(self, max_workers: int, thread_name_prefix: str, pool: int = POOL_LOOP) -> None:
+        super().__init__(
+            max_workers=max_workers,
+            thread_name_prefix=thread_name_prefix,
+            initializer=_name_thread,
+        )
+        self.pool = pool
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
+        """Queue a call, as the executor does, noting it while it runs."""
+
+        # The request is read here, in the context of the task making
+        # the call: the thread that runs it has a context of its own
+        # unless the caller copied one.
+
+        from muru import _native
+
+        request = _request_id.get()
+        pool = self.pool
+
+        def held(*args: Any, **kwargs: Any) -> Any:
+            _native.sync_entered(request, pool)
+
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _native.sync_left(request, pool)
+
+        return super().submit(held, *args, **kwargs)
 
 
 class Loop:
@@ -62,15 +137,108 @@ class Loop:
         self.thread = threading.Thread(target=self._run, name="muru-loop", daemon=True)
         self.started = threading.Event()
 
-        # Section 6.6: sync_to_async and asyncio.to_thread run on a bounded
-        # pool of their own, separate from any WSGI threads.
+        # Section 6.6: asyncio.to_thread, and anything else that uses the
+        # loop's default executor, runs on a bounded pool of the loop's
+        # own, separate from any WSGI threads.
 
-        executor = ThreadPoolExecutor(
-            max_workers=max(1, sync_threads), thread_name_prefix="muru-sync"
-        )
+        self.sync_threads = max(1, sync_threads)
+        executor = SyncPool(max_workers=self.sync_threads, thread_name_prefix="muru-sync")
         self.loop.set_default_executor(executor)
 
+        # The other places synchronous code runs, once adopted: anyio's
+        # thread limiter, and whether asgiref's shared thread is noted.
+
+        self.anyio_limiter: Any = None
+        self.asgiref = False
+
+    def adopt_sync_pools(self) -> None:
+        """Bring the other places synchronous code runs under the worker (section 6.6).
+
+        anyio, which Starlette and FastAPI run synchronous endpoints
+        through, has worker threads of its own, 40 by default: its limit
+        becomes the worker's sync threads. asgiref runs thread-sensitive
+        calls outside a request's own context on one shared thread, which
+        is replaced by one whose calls are noted. Called once the loop
+        runs and the applications are loaded, before any lifespan
+        startup, so a limit the application sets there stands.
+        """
+
+        self._adopt_asgiref()
+        done = threading.Event()
+
+        def adopt() -> None:
+            try:
+                self._adopt_anyio()
+            finally:
+                done.set()
+
+        self.loop.call_soon_threadsafe(adopt)
+        done.wait(STARTUP_TIMEOUT)
+
+    def _adopt_asgiref(self) -> None:
+        owner = getattr(sys.modules.get("asgiref.sync"), "SyncToAsync", None)
+        executor = getattr(owner, "single_thread_executor", None)
+
+        # An executor that is not the one expected, or one whose thread
+        # has run a call already, is left as it is: thread-sensitive code
+        # must keep the thread it has used.
+
+        if (
+            owner is None
+            or not isinstance(executor, ThreadPoolExecutor)
+            or isinstance(executor, SyncPool)
+            or getattr(executor, "_threads", None)
+        ):
+            return
+
+        owner.single_thread_executor = SyncPool(
+            max_workers=1, thread_name_prefix="muru-sync-asgiref", pool=POOL_ASGIREF
+        )
+        self.asgiref = True
+
+    def _adopt_anyio(self) -> None:
+        """Set anyio's thread limit to the worker's; on the loop's thread."""
+
+        if self.anyio_limiter is not None or "anyio" not in sys.modules:
+            return
+
+        try:
+            from anyio import to_thread
+
+            limiter = to_thread.current_default_thread_limiter()
+
+            if limiter.total_tokens == ANYIO_DEFAULT_THREADS:
+                limiter.total_tokens = self.sync_threads
+        except Exception:
+            # An anyio this does not know is left as it is.
+
+            return
+
+        self.anyio_limiter = limiter
+
+    def sample_sync_pools(self) -> None:
+        """Tell the runtime how busy anyio's threads are; on the loop's thread.
+
+        anyio imported since the worker started is adopted here, and
+        asgiref's shared thread, whose calls the runtime is told of one
+        by one, is declared.
+        """
+
+        from muru import _native
+
+        self._adopt_anyio()
+        limiter = self.anyio_limiter
+
+        if limiter is not None:
+            total = limiter.total_tokens
+            threads = 0 if total == math.inf else int(total)
+            _native.sync_pool(POOL_ANYIO, threads, int(limiter.borrowed_tokens))
+
+        if self.asgiref:
+            _native.sync_pool(POOL_ASGIREF, 1)
+
     def _run(self) -> None:
+        _name_thread()
         asyncio.set_event_loop(self.loop)
         self.loop.call_soon(self.started.set)
 

@@ -110,6 +110,12 @@ memory = { hard_limit = "2GB" }
 max_requests = 200
 ```
 
+A group's `timeouts` table also takes the request timeouts the edge
+enforces, `queue_timeout`, `request_deadline`, `body_idle_timeout` and
+`response_idle_timeout`, and the group takes `max_body_size`, for the
+requests its workers serve, as [timeouts](timeouts.md#with-the-application)
+describes.
+
 Each key a group leaves out is the release's: its `timeouts` and
 `memory` tables and its `max_requests` and `max_lifetime`, or the
 `--timeout`, `--memory`, `--max-requests` and `--max-lifetime` settings

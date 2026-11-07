@@ -61,7 +61,8 @@ $ muructl release show shop@r9 --json
 | `muructl host list` | `{"hosts": [...]}` |
 | `muructl route list` | `{"routes": [...]}` |
 | `muructl upstream list` | `{"upstreams": [...]}` |
-| `muructl deploy` | The new release, as `release show` prints it; with `--no-wait`, as recorded |
+| `muructl deploy` | The new release, as `release show` prints it; with `--no-wait`, as recorded; with `--dry-run`, the plan: `app`, `release`, `new_app`, `description`, `settings` (each with `key`, `value` and `layer`), `builds`, `serving`, `settings_from`, `hold`, `retain_ms`, `retain_workers` and `refusals` |
+| `muructl render` | The document `muructl apply` takes: `{"app": {NAME: {"release": {ID: {...}}}}}`, the release's table with the keys of the daemon's format |
 | `muructl rollback` | The release traffic went back to |
 | `muructl drain` | The release drained |
 | `muructl rollout canary` | The rollout as it started, or with `--wait` as it finished: `id`, `app`, `candidate`, `baseline`, `state`, `step`, `percent`, `message`, its `steps` and its gates |
@@ -79,8 +80,8 @@ $ muructl release show shop@r9 --json
 | `muructl overlay activate` | The outcome: `message` |
 | `muructl overlay end` | The outcome: `message` |
 | `muructl overlay promote` | The outcome: `message` |
-| `muructl maintenance on` | `app`, `on` and `since_unix_ms` |
-| `muructl maintenance off` | `app`, `on` and `since_unix_ms` (0) |
+| `muructl maintenance on` | `app`, or `host` with `--host`, `on` and `since_unix_ms` |
+| `muructl maintenance off` | `app`, or `host` with `--host`, `on` and `since_unix_ms` (0) |
 | `muructl dashboard login` | The sign-in link: `url`, `code`, `expires_in_s`, and with `--token` the `token` |
 | `muructl apply` | The report: `errors`, `warnings`, `notes`, `changes`, `unchanged`, `applied`. Each change has `action`, `subject`, `detail` and, once applied, `outcome`, which for a release that failed is `failed:` and the reason |
 | `muructl config diff` | The report, as `apply` prints it |
@@ -90,9 +91,9 @@ $ muructl release show shop@r9 --json
 | `muructl secret list` | `{"store": ..., "keys": [...]}`; values are never shown |
 | `muructl events` | `{"events": [...]}`, each with `sequence`, `time_unix_ms`, `type`, `subject`, `level`, `message`; with `--follow`, one event per line |
 | `muructl logs` | One line per log line: a release's output as `{"app", "release", "line"}`, the access log (`--access`) as the records it keeps |
-| `muructl command list` | `app`, `release` and `commands`, each with `name`, `description`, `run` or `call`, `inputs` (`name`, `description`, `required`, `default`, `pattern`, `secret`), `timeout`, `exclusive` and its `last_run` (`release`, `started_unix_ms`, `duration_ms`, `exit_code`, `ok`, `message`) |
+| `muructl command list` | `app`, `release` and `commands`, each with `name`, `description`, `run` or `call`, `inputs` (`name`, `description`, `required`, `default`, `pattern`, `secret`), `timeout`, `exclusive` and its `last_run` (`release`, `started_unix_ms`, `duration_ms`, `exit_code`, `ok`, `message`), which only the daemon keeps. `release` is empty for a project's commands listed with nothing serving it |
 | `muructl command run` | As `muructl exec` prints it |
-| `muructl exec` | One object per line of output, with `release`, `line` and `stderr`, then one with `finished` true, the `exit_code` and the ending as a `message` |
+| `muructl exec` | One object per line of output, with `release`, `line` and `stderr`, then one with `finished` true, the `exit_code`, `ok`, true when the command exited with 0 and was not stopped, and the ending as a `message`. `release` is empty for a command `muructl` runs itself |
 | `muructl logs reopen` | What reopened its files: `edge`, `hosts` |
 | `muructl metrics` | `{"samples": [...]}`, each with `name`, `type` (as its family declares, else `untyped`), `labels` and `value`; a value JSON cannot hold (`NaN`, `+Inf`) is kept as text |
 | `muructl websockets` | `open`, `endpoints` by application and pattern, and with `--list` each open `sockets` entry |
