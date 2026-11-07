@@ -376,6 +376,28 @@ def test_a_route_and_a_promotion_reach_the_edge_in_one_snapshot(
     assert json.loads(response.body)["release"] == "r2"
 
 
+def test_an_apply_waits_for_the_one_under_way(daemon: Daemon, tmp_path: Path) -> None:
+    # Issue #453: applies happen one after another. A --no-wait apply
+    # finishes in the daemon, and one given meanwhile waits for it and is
+    # planned against what it left: shop@r1 serves by then, so `serving`
+    # naming it promotes nothing.
+
+    first = tmp_path / "first.toml"
+    first.write_text(release("shop", "r1"))
+    second = tmp_path / "second.toml"
+    second.write_text(ROUTED + "[app.shop]\nserving = 'r1'\n\n" + release("shop", "r1"))
+
+    early = apply(daemon, first, "--no-wait")
+    assert early.returncode == 0, early.stdout + early.stderr
+    waiting = apply(daemon, second)
+    assert waiting.returncode == 0, waiting.stdout + waiting.stderr
+    assert "muru: another apply was under way; this one waited for it to end" in waiting.stdout
+    assert "promote" not in waiting.stdout and "deploy" not in waiting.stdout, waiting.stdout
+    assert "create-route    route shop /" in waiting.stdout, waiting.stdout
+    response = daemon.request("/", host="shop.test")
+    assert json.loads(response.body)["release"] == "r1"
+
+
 def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path: Path) -> None:
     config = tmp_path / "shop.toml"
     config.write_text(release("shop", "r1") + release("shop", "r2"))

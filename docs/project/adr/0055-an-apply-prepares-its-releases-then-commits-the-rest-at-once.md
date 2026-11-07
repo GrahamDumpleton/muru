@@ -87,12 +87,15 @@ a running release is drained before its record goes.
 - Bad: with `--no-wait` the client does not learn the outcome, which an
   event records.
 
-- Bad: two applies at once are not ordered; each is planned against
-  desired state as it stood.
+- Good: applies happen one after another, each planned against what
+  the one before it left (issue #453).
 
 ## More information
 
 Section 10.10 says what the apply guarantees and what it does not;
 section 10.4 describes the plan. Issue #439 records the gap this
 closes, and issue #452 the saved plans split out of it. ADR 0054
-describes how files name the release that serves.
+describes how files name the release that serves. Issue #453 ordered
+applies, which this record first left unordered: one given while another
+is under way waits for it, rather than being refused, so that jobs that
+apply at the same moment all land without having to try again.

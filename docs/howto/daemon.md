@@ -307,6 +307,11 @@ muru: nothing applied:
   create-route    route shop /             not applied
 ```
 
+Applies happen one at a time. An apply given while another is under way,
+including one given `--no-wait` that the daemon is still finishing,
+waits for it to end and is then planned against what it left, and its
+report says so. A dry run does not wait.
+
 Four flags say how the releases an apply adds are deployed, as they do
 on `muructl deploy`:
 

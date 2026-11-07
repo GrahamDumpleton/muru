@@ -169,6 +169,7 @@ An apply is validated as a whole, and files with an error apply nothing. It is t
 What the apply guarantees:
 
 - Routes and traffic change all at once or not at all, so a change that adds a host, a route and a release cannot leave a route pointing at a host that does not exist or at a release the apply added that has not started.
+- Applies happen one after another. An apply given while another is under way, a --no-wait one the daemon is still finishing included, waits for it to end and is then planned against the desired state it left, and its report says it waited.
 - A daemon restart cannot leave half of the configuration written. Before the commit's transaction only the prepare phase's records are written, and after it all of the rest is. The daemon builds its first snapshot from desired state when it starts again.
 
 What it does not guarantee:
@@ -179,7 +180,7 @@ What it does not guarantee:
 - The prepare phase pushes a snapshot as each held release starts, so that it can be previewed. None changes where a request without the preview header goes.
 - The drains and removals after the commit are not in its transaction. One that fails is a failed change in the report, and the apply exits 1.
 - With --no-wait the apply answers once the releases are recorded, and the daemon carries out the rest. The `config.applied` or `config.apply_failed` event says how it ended.
-- Two applies at once are each atomic, but are not ordered: the second is planned against desired state as it was before the first commits.
+- A dry run and a diff do not wait for an apply under way, so they may plan against desired state that apply has yet to commit.
 
 ## 10.11 An MCP server for coding agents
 

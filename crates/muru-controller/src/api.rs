@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use muru_proto::admin::v1 as pb;
@@ -38,7 +39,10 @@ pub async fn serve(
         )
     })?;
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
-    let service = AdminServer::new(Service { handle });
+    let service = AdminServer::new(Service {
+        handle,
+        applying: Arc::default(),
+    });
 
     // The server stops taking connections when told and finishes the
     // responses in flight, so the answer to a Shutdown call is flushed
@@ -57,6 +61,9 @@ pub async fn serve(
 
 struct Service {
     handle: Handle,
+    /// Held by the apply under way, from its plan until it ends, so that
+    /// applies happen one after another (section 10.10).
+    applying: Arc<tokio::sync::Mutex<()>>,
 }
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send>>;
@@ -1544,6 +1551,24 @@ impl Admin for Service {
             Err(error) => return Ok(Response::new(parse_failure(error))),
         };
 
+        // Section 10.10: an apply waits for the one under way to end, and
+        // is then planned against what that one left. A dry run changes
+        // nothing and does not wait.
+
+        let mut waited = false;
+
+        let applying = if request.dry_run {
+            None
+        } else {
+            Some(match self.applying.clone().try_lock_owned() {
+                Ok(applying) => applying,
+                Err(_) => {
+                    waited = true;
+                    self.applying.clone().lock_owned().await
+                }
+            })
+        };
+
         let defined = self
             .handle
             .info
@@ -1582,6 +1607,12 @@ impl Admin for Service {
         }
 
         let mut report = report_message(&plan);
+
+        if waited {
+            report
+                .notes
+                .push("another apply was under way; this one waited for it to end".to_owned());
+        }
 
         // Section 10.4: how the releases the apply adds are deployed, and
         // what becomes of each release one of them, or a promotion, takes
@@ -1659,9 +1690,13 @@ impl Admin for Service {
 
             let service = Service {
                 handle: self.handle.clone(),
+                applying: self.applying.clone(),
             };
 
+            // The apply holds the lock until the daemon has finished it.
+
             tokio::spawn(async move {
+                let _applying = applying;
                 service
                     .complete(&plan, &mut report, prepared, &deploying, tls)
                     .await;
