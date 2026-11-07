@@ -2300,13 +2300,9 @@ pub fn traffic_releases(route: &RouteTable) -> Vec<(String, String)> {
 
 /// Desired state as a document: each application with the release that
 /// serves it, which its `serving` names, and the releases its routes'
-/// traffic names, or with every release, and the hosts and routes.
-/// Applying it back changes nothing.
-pub fn export(
-    store: &Store,
-    app: Option<&str>,
-    all_releases: bool,
-) -> Result<Document, StoreError> {
+/// traffic names, and the hosts and routes. Applying it back changes
+/// nothing.
+pub fn export(store: &Store, app: Option<&str>) -> Result<Document, StoreError> {
     let apps = match app {
         Some(name) => vec![store.app(name)?],
         None => store.apps()?,
@@ -2315,8 +2311,6 @@ pub fn export(
     let mut document = Document::default();
 
     for app in apps {
-        let mut releases = store.releases(Some(&app.name))?;
-        releases.sort_by_key(|release| release_order(&release.id));
         let mut table = AppTable {
             serving: app.current.clone(),
             user: app.user.clone(),
@@ -2329,12 +2323,11 @@ pub fn export(
             ..AppTable::default()
         };
 
-        for release in releases {
-            let serves = app.current.as_deref() == Some(release.id.as_str());
-
-            if all_releases || serves {
-                table.release.insert(release.id, table_from(&release.spec));
-            }
+        if let Some(current) = &app.current {
+            let release = store.release(&app.name, current)?;
+            table
+                .release
+                .insert(current.clone(), table_from(&release.spec));
         }
 
         document.app.insert(app.name, table);
@@ -6149,7 +6142,7 @@ mod tests {
     fn an_export_applies_back_without_changes() {
         let source = source_dir();
         let store = store_with_shop(&source);
-        let document = export(&store, None, false).unwrap();
+        let document = export(&store, None).unwrap();
         let text = document.to_toml().unwrap();
         assert!(text.contains("[app.shop.release.r1]"), "{text}");
 
@@ -6170,7 +6163,7 @@ mod tests {
     fn an_applications_access_log_choice_is_planned_stored_and_exported() {
         let source = source_dir();
         let store = store_with_shop(&source);
-        let mut document = export(&store, None, false).unwrap();
+        let mut document = export(&store, None).unwrap();
         let app = document.app.get_mut("shop").unwrap();
         app.access_log = Some("errors".to_owned());
         app.slow = Some("250ms".to_owned());
@@ -6204,7 +6197,7 @@ mod tests {
             panic!("{:?}", change.action);
         };
         store.set_app_access_log("shop", access_log).unwrap();
-        assert_eq!(export(&store, None, false).unwrap(), document);
+        assert_eq!(export(&store, None).unwrap(), document);
         assert!(planned(&document).changes.is_empty());
 
         // It is laid over the node's filter key by key.
@@ -6235,7 +6228,7 @@ mod tests {
     fn a_release_records_the_layer_each_setting_came_from() {
         let source = source_dir();
         let store = store_with_shop(&source);
-        let document = export(&store, None, false).unwrap();
+        let document = export(&store, None).unwrap();
         let lines = release_layers(&store, &document).unwrap();
         let line = |key: &str| {
             lines
@@ -6285,7 +6278,7 @@ mod tests {
         let store = store_with_shop(&source);
         store.set_app_releases("shop", None, Some("r1")).unwrap();
 
-        let text = export(&store, None, false).unwrap().to_toml().unwrap();
+        let text = export(&store, None).unwrap().to_toml().unwrap();
         let back = Document::parse(&text).unwrap();
         assert!(back.app.contains_key("shop"), "{text}");
         assert!(back.app["shop"].release.is_empty(), "{text}");
@@ -6811,31 +6804,30 @@ mod tests {
             .set_app_releases("shop", Some("r2"), Some("r1"))
             .unwrap();
 
-        let serving = export(&store, None, false).unwrap();
+        let serving = export(&store, None).unwrap();
         assert_eq!(serving.app["shop"].serving.as_deref(), Some("r2"));
         assert_eq!(
             serving.app["shop"].release.keys().collect::<Vec<_>>(),
             ["r2"]
         );
-        let text = export(&store, None, true).unwrap().to_toml().unwrap();
+        let text = serving.to_toml().unwrap();
         assert!(text.contains("serving = \"r2\""), "{text}");
 
-        // Applied back, every release exported changes nothing; applied
-        // to a node without them, r2 serves and r1 is held.
+        // Applied back it changes nothing, and r1, which no route names,
+        // is left out; applied to a node without them, r2 serves.
 
-        let every = Document::parse(&text).unwrap();
-        let back = plan_with(&store, &every, true, false);
+        let exported = Document::parse(&text).unwrap();
+        let back = plan_with(&store, &exported, false, false);
         assert!(
             back.errors.is_empty() && back.changes.is_empty(),
             "{back:?}"
         );
-        assert_eq!(back.unchanged, 2);
-        let elsewhere = plan_with(&Store::in_memory().unwrap(), &every, false, false);
+        assert_eq!(back.unchanged, 1);
+        let elsewhere = plan_with(&Store::in_memory().unwrap(), &exported, false, false);
         assert_eq!(
             steps(&elsewhere),
             vec![
                 ("create-app", "shop".to_owned(), false),
-                ("deploy", "shop@r1".to_owned(), true),
                 ("deploy", "shop@r2".to_owned(), false),
             ]
         );
@@ -6896,7 +6888,7 @@ mod tests {
         store.put_host("shop", &routes.host["shop"]).unwrap();
         store.put_route(&routes.route[0]).unwrap();
         store.delete_app("blog").unwrap();
-        let exported = export(&store, None, false).unwrap();
+        let exported = export(&store, None).unwrap();
         let back = plan_with(&store, &exported, true, false);
         assert!(
             back.errors.is_empty() && back.changes.is_empty(),
@@ -6927,7 +6919,7 @@ mod tests {
         // Issue #440: r1 serves, and r2 and r3 come along because the
         // routes name them.
 
-        let exported = export(&store, None, false).unwrap();
+        let exported = export(&store, None).unwrap();
         assert_eq!(exported.app["shop"].serving.as_deref(), Some("r1"));
         assert_eq!(
             exported.app["shop"].release.keys().collect::<Vec<_>>(),

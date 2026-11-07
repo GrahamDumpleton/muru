@@ -340,13 +340,12 @@ version. It writes the release that serves each application, every key
 spelled out, and the application's `serving` key naming it, and the
 releases its routes' splits and client classes name, so applying the
 file back to the daemon it came from changes nothing and, applied to
-another node, it starts those releases held; `--all-releases` writes
-every release, `--app NAME` one application, and `--json` the same
-document as JSON. A [rollout](rollouts.md) under way is not part of the
-file; with
-`--resolve-rollouts` it is written as where it stands, the candidate
-declared beside the serving release and the application's routes
-splitting traffic between them at the candidate's current share.
+another node, it starts those releases held. A release neither is left
+out. `--app NAME` writes one application, and `--json` the same document
+as JSON. A [rollout](rollouts.md) under way is not part of the file;
+with `--resolve-rollouts` it is written as where it stands, the
+candidate declared beside the serving release and the application's
+routes splitting traffic between them at the candidate's current share.
 `muructl config diff -f FILE` compares a file with desired state in
 both directions, listing what the file would add and what the daemon
 holds that the file does not, with exit code 2 when they differ.

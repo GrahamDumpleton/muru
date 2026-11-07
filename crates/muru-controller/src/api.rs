@@ -1725,8 +1725,7 @@ impl Admin for Service {
     ) -> Result<Response<pb::ExportConfigResponse>, Status> {
         let request = request.into_inner();
         let app = (!request.app.is_empty()).then_some(request.app.as_str());
-        let mut document =
-            config::export(&self.handle.store, app, request.all_releases).map_err(not_found)?;
+        let mut document = config::export(&self.handle.store, app).map_err(not_found)?;
 
         if request.resolve_rollouts {
             config::resolve_rollouts(&self.handle.store, &mut document).map_err(internal)?;

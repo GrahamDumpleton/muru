@@ -346,14 +346,12 @@ def test_export_applies_back_without_changes(daemon: Daemon, tmp_path: Path) -> 
     assert apply(daemon, config).stdout.strip() == "muru: no changes (1 object as declared)"
     assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
 
-    # By default only the serving release is written; --all-releases
-    # writes every release, and --json the same document as JSON.
+    # Only the serving release is written, and --json writes the same
+    # document as JSON.
 
     daemon.deploy("shop", SHOP, "--threads", "1")
     current = tomllib.loads(daemon.muructl("config", "export").stdout)
     assert list(current["app"]["shop"]["release"]) == ["r2"]
-    every = tomllib.loads(daemon.muructl("config", "export", "--all-releases").stdout)
-    assert list(every["app"]["shop"]["release"]) == ["r1", "r2"]
     as_json = json.loads(daemon.muructl("config", "export", "--json").stdout)
     assert as_json["app"]["shop"]["release"]["r2"]["threads"] == 1
 

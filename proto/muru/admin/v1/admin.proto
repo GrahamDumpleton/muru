@@ -777,7 +777,6 @@ message ConfigChange {
 
 message ExportConfigRequest {
   string app = 1;                   // one application, else all
-  bool all_releases = 2;            // every release, not only the one that serves and those its routes' traffic names
   bool effective = 3;               // routes as the active overlays leave them (section 9.10)
   bool resolve_rollouts = 4;        // each rollout under way as where it stands (section 10.4)
 }

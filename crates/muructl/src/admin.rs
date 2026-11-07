@@ -5569,11 +5569,6 @@ pub enum ConfigCommand {
         #[arg(long, value_name = "NAME")]
         app: Option<String>,
 
-        /// Every release of each application, not only the one that serves
-        /// and those its routes' traffic names.
-        #[arg(long)]
-        all_releases: bool,
-
         /// Write each rollout under way as where it stands: its candidate
         /// declared, and the application's routes splitting traffic at
         /// its current share.
@@ -5623,7 +5618,6 @@ pub enum ConfigCommand {
 /// Export desired state, with a header naming where it came from.
 pub async fn config_export(
     app: Option<String>,
-    all_releases: bool,
     resolve_rollouts: bool,
     json: bool,
     socket: SocketArgs,
@@ -5632,7 +5626,6 @@ pub async fn config_export(
     let export = client
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
-            all_releases,
             effective: false,
             resolve_rollouts,
         })
@@ -5671,7 +5664,6 @@ pub async fn config_show(
     let export = client
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
-            all_releases: false,
             effective,
             resolve_rollouts: false,
         })
