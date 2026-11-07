@@ -263,6 +263,15 @@ path = "/"
         {"release": "shop@r1", "state": "ready", "serving": "yes"},
     ]
 
+    # Issue #440: the export writes r2 as well, since the split names it,
+    # so it applies back without a change.
+
+    staged_export = daemon.muructl("config", "export").stdout
+    assert list(tomllib.loads(staged_export)["app"]["shop"]["release"]) == ["r1", "r2"]
+    exported = tmp_path / "export.toml"
+    exported.write_text(staged_export)
+    assert apply(daemon, exported).stdout.strip() == "muru: no changes (4 objects as declared)"
+
     # Naming r2 promotes it, after the routes are written, and the
     # export says which release serves.
 

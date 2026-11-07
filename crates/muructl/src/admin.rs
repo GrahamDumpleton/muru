@@ -5569,7 +5569,8 @@ pub enum ConfigCommand {
         #[arg(long, value_name = "NAME")]
         app: Option<String>,
 
-        /// Every release of each application, not only the one that serves.
+        /// Every release of each application, not only the one that serves
+        /// and those its routes' traffic names.
         #[arg(long)]
         all_releases: bool,
 

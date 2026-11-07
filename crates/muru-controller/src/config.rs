@@ -2239,9 +2239,36 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     }
 }
 
+/// The releases a route's traffic names, as (app, release): its split's
+/// and its client classes' releases of the route's application, or of a
+/// static route's fallback application, leaving out upstreams.
+pub fn traffic_releases(route: &RouteTable) -> Vec<(String, String)> {
+    let app = if route.app.is_empty() {
+        route
+            .fallback
+            .as_ref()
+            .and_then(|fallback| fallback.app.as_deref())
+    } else {
+        Some(route.app.as_str())
+    };
+
+    let (Some(app), Some(traffic)) = (app, &route.traffic) else {
+        return Vec::new();
+    };
+
+    traffic
+        .split
+        .keys()
+        .chain(traffic.classes.values())
+        .filter(|id| !id.starts_with(muru_edge::routing::UPSTREAM_PREFIX))
+        .map(|id| (app.to_owned(), id.clone()))
+        .collect()
+}
+
 /// Desired state as a document: each application with the release that
-/// serves it, which its `serving` names, or with every release, and the
-/// hosts and routes. Applying it back changes nothing.
+/// serves it, which its `serving` names, and the releases its routes'
+/// traffic names, or with every release, and the hosts and routes.
+/// Applying it back changes nothing.
 pub fn export(
     store: &Store,
     app: Option<&str>,
@@ -2289,6 +2316,24 @@ pub fn export(
     for route in routes {
         if app.is_none_or(|name| route.app == name) {
             document.route.push(route);
+        }
+    }
+
+    // A release a route's traffic names is written too, or the file
+    // would not apply; where it is applied, `serving` leaves it held.
+
+    let named: BTreeSet<(String, String)> =
+        document.route.iter().flat_map(traffic_releases).collect();
+
+    for (name, id) in named {
+        let Some(table) = document.app.get_mut(&name) else {
+            continue;
+        };
+
+        if !table.release.contains_key(&id)
+            && let Ok(release) = store.release(&name, &id)
+        {
+            table.release.insert(id, table_from(&release.spec));
         }
     }
 
@@ -6697,6 +6742,66 @@ mod tests {
                 ("create-app", "shop".to_owned(), false),
                 ("deploy", "shop@r1".to_owned(), true),
                 ("deploy", "shop@r2".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_export_writes_the_releases_its_routes_traffic_names() {
+        let source = source_dir();
+        let store = store_with_two(&source);
+        let spec = store.release("shop", "r1").unwrap().spec;
+        store.create_release("shop", "r3", &spec).unwrap();
+        let routed = Document::parse(
+            "[host.shop]\nnames = ['shop.test']\n\
+             [[route]]\nhost = 'shop'\napp = 'shop'\npath = '/'\n\
+             traffic = { split = { r1 = 100, r2 = 0 } }\n\
+             [[route]]\nhost = 'shop'\napp = 'shop'\npath = '/beta'\n\
+             traffic = { classes = { beta = 'r3' } }\n",
+        )
+        .unwrap();
+        store.put_host("shop", &routed.host["shop"]).unwrap();
+
+        for route in &routed.route {
+            store.put_route(route).unwrap();
+        }
+
+        // Issue #440: r1 serves, and r2 and r3 come along because the
+        // routes name them.
+
+        let exported = export(&store, None, false).unwrap();
+        assert_eq!(exported.app["shop"].serving.as_deref(), Some("r1"));
+        assert_eq!(
+            exported.app["shop"].release.keys().collect::<Vec<_>>(),
+            ["r1", "r2", "r3"]
+        );
+
+        // Applied to a node without them, r1 serves and the others are
+        // held.
+
+        let defined = Defined {
+            client_classes: vec!["beta".to_owned()],
+            ..Defined::default()
+        };
+        let elsewhere = plan(
+            &Store::in_memory().unwrap(),
+            &exported,
+            false,
+            false,
+            &defined,
+            &crate::provision::Provisioning::off(),
+        );
+        assert!(elsewhere.errors.is_empty(), "{:?}", elsewhere.errors);
+        let deploys: Vec<_> = steps(&elsewhere)
+            .into_iter()
+            .filter(|(action, _, _)| *action == "deploy")
+            .collect();
+        assert_eq!(
+            deploys,
+            vec![
+                ("deploy", "shop@r1".to_owned(), false),
+                ("deploy", "shop@r2".to_owned(), true),
+                ("deploy", "shop@r3".to_owned(), true),
             ]
         );
     }

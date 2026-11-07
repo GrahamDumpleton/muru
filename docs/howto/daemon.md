@@ -331,10 +331,12 @@ changes planned, and 1 for errors.
 `muructl config export` writes desired state as a file of this form, with
 a header naming the daemon's version, the node, the time and the state
 version. It writes the release that serves each application, every key
-spelled out, and the application's `serving` key naming it, so applying
-the file back to the daemon it came from changes nothing;
-`--all-releases` writes every release, `--app NAME` one application, and
-`--json` the same document as JSON. A
+spelled out, and the application's `serving` key naming it, and the
+releases its routes' splits and client classes name, so applying the
+file back to the daemon it came from changes nothing and, applied to
+another node, it starts those releases held; `--all-releases` writes
+every release, `--app NAME` one application, and `--json` the same
+document as JSON. A
 [rollout](rollouts.md) under way is not part of the file; with
 `--resolve-rollouts` it is written as where it stands, the candidate
 declared beside the serving release and the application's routes
