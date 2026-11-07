@@ -13,7 +13,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use muru_edge::metrics::Sample;
 
-use crate::model::RolloutGates;
+use crate::model::{Rollout, RolloutGates};
 
 /// How often each release's probes are requested.
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(5);
@@ -259,6 +259,26 @@ pub fn judge(candidate: &Counters, baseline: &Counters, gates: &RolloutGates) ->
     }
 
     Verdict::Pass
+}
+
+/// Why promoting a release of an application by hand is refused while
+/// the application's rollout is under way, as `rollout`: the promotion
+/// would move the traffic the rollout is moving, past its gates. The
+/// rollout's own commands end it, promoting its candidate or not.
+pub fn promotion_refused(rollout: Option<&Rollout>, app: &str, id: &str) -> Option<String> {
+    let candidate = &rollout?.candidate;
+
+    Some(if candidate == id {
+        format!(
+            "a rollout of {app}@{id} is under way; give it all the traffic with `muructl rollout \
+             promote {app}`"
+        )
+    } else {
+        format!(
+            "a rollout of {app}@{candidate} is under way; end it with `muructl rollout promote \
+             {app}` or `muructl rollout abort {app}` before promoting {app}@{id}"
+        )
+    })
 }
 
 /// The client the daemon sends probes with.
@@ -522,5 +542,40 @@ mod tests {
         assert!(check_probe("http://127.0.0.1:8080/health").is_ok());
         assert!(check_probe("/health").is_err());
         assert!(check_probe("ftp://example.com/").is_err());
+    }
+
+    #[test]
+    fn a_promotion_by_hand_waits_for_the_rollout_under_way() {
+        let rollout = Rollout {
+            app: "shop".to_owned(),
+            id: "1".to_owned(),
+            candidate: "r2".to_owned(),
+            baseline: "r1".to_owned(),
+            steps: Vec::new(),
+            gates: gates(),
+            approve_each_step: false,
+            state: crate::model::RolloutState::Running,
+            step: 0,
+            step_started_unix_ms: 0,
+            message: String::new(),
+            created_unix_ms: 0,
+            updated_unix_ms: 0,
+        };
+
+        assert_eq!(promotion_refused(None, "shop", "r3"), None);
+        assert_eq!(
+            promotion_refused(Some(&rollout), "shop", "r3").as_deref(),
+            Some(
+                "a rollout of shop@r2 is under way; end it with `muructl rollout promote shop` or \
+                 `muructl rollout abort shop` before promoting shop@r3"
+            )
+        );
+        assert_eq!(
+            promotion_refused(Some(&rollout), "shop", "r2").as_deref(),
+            Some(
+                "a rollout of shop@r2 is under way; give it all the traffic with `muructl rollout \
+                 promote shop`"
+            )
+        );
     }
 }

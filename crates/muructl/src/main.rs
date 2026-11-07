@@ -987,17 +987,10 @@ fn main() -> anyhow::Result<()> {
         Command::Config { command } => match command {
             admin::ConfigCommand::Export {
                 app,
-                all_releases,
                 resolve_rollouts,
                 json,
                 socket,
-            } => runtime.block_on(admin::config_export(
-                app,
-                all_releases,
-                resolve_rollouts,
-                json,
-                socket,
-            )),
+            } => runtime.block_on(admin::config_export(app, resolve_rollouts, json, socket)),
             admin::ConfigCommand::Show {
                 app,
                 effective,

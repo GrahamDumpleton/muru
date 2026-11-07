@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -210,6 +211,100 @@ def test_how_the_releases_an_apply_adds_are_deployed(daemon: Daemon, tmp_path: P
     assert daemon.releases("shop")[0]["release"] == "shop@r3"
 
 
+def test_serving_stages_a_release_and_promotes_it(daemon: Daemon, tmp_path: Path) -> None:
+    # Issue #420: a release declared beside the one serves, with a split
+    # giving it 0%, is started held and takes no request without the
+    # preview header, while requests run through the apply. Issue #449:
+    # one that nothing names is recorded and left stopped.
+
+    routed = """[host.shop]
+names = ["shop.test"]
+default = true
+
+[[route]]
+host = "shop"
+app = "shop"
+path = "/"
+"""
+    config = tmp_path / "shop.toml"
+    config.write_text(routed + release("shop", "r1"))
+    assert apply(daemon, config).returncode == 0
+    answers: list[str] = []
+    stop = threading.Event()
+
+    def ask() -> None:
+        while not stop.is_set():
+            response = daemon.request("/", host="shop.test")
+            answers.append(json.loads(response.body)["release"] if response.status == 200 else "")
+
+    asking = threading.Thread(target=ask)
+    asking.start()
+
+    try:
+        config.write_text(
+            routed
+            + "traffic = { split = { r1 = 100, r2 = 0 } }\n\n"
+            + "[app.shop]\nserving = 'r1'\n\n"
+            + release("shop", "r1")
+            + release("shop", "r2", threads=1)
+            + release("shop", "r3", threads=2)
+        )
+        staged = apply(daemon, config)
+        time.sleep(0.5)
+    finally:
+        stop.set()
+        asking.join()
+
+    assert staged.returncode == 0, staged.stdout + staged.stderr
+    assert "ready and held: not serving" in staged.stdout
+    assert "deploy          shop@r3                  recorded and stopped" in staged.stdout
+    assert answers and set(answers) == {"r1"}, answers
+    preview = daemon.request("/", host="shop.test", headers={"Muru-Preview": "r2"})
+    assert json.loads(preview.body)["release"] == "r2"
+    assert daemon.releases("shop") == [
+        {"release": "shop@r3", "state": "stopped", "serving": ""},
+        {"release": "shop@r2", "state": "ready", "serving": ""},
+        {"release": "shop@r1", "state": "ready", "serving": "yes"},
+    ]
+
+    # Issue #440: the export writes r2 as well, since the split names it,
+    # so it applies back without a change.
+
+    staged_export = daemon.muructl("config", "export").stdout
+    assert list(tomllib.loads(staged_export)["app"]["shop"]["release"]) == ["r1", "r2"]
+    exported = tmp_path / "export.toml"
+    exported.write_text(staged_export)
+    assert apply(daemon, exported).stdout.strip() == "muru: no changes (4 objects as declared)"
+
+    # Naming r2 promotes it, after the routes are written, and the
+    # export says which release serves.
+
+    declared = (
+        release("shop", "r1") + release("shop", "r2", threads=1) + release("shop", "r3", threads=2)
+    )
+    config.write_text(routed + "\n[app.shop]\nserving = 'r2'\n\n" + declared)
+    planned = apply(daemon, config, "--dry-run")
+    assert [line.split()[:2] for line in planned.stdout.splitlines()[1:3]] == [
+        ["update-route", "route"],
+        ["promote", "shop@r2"],
+    ], planned.stdout
+    promoted = apply(daemon, config)
+    assert promoted.returncode == 0, promoted.stdout + promoted.stderr
+    assert "promote         shop@r2                  ready and serving" in promoted.stdout
+    assert json.loads(daemon.request("/", host="shop.test").body)["release"] == "r2"
+    exported = tomllib.loads(daemon.muructl("config", "export").stdout)
+    assert exported["app"]["shop"]["serving"] == "r2"
+
+    # Naming the stopped r3 starts and promotes it.
+
+    config.write_text(routed + "\n[app.shop]\nserving = 'r3'\n\n" + declared)
+    started = apply(daemon, config)
+    assert "promote         shop@r3                  ready and serving" in started.stdout, (
+        started.stdout
+    )
+    assert json.loads(daemon.request("/", host="shop.test").body)["release"] == "r3"
+
+
 def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path: Path) -> None:
     config = tmp_path / "shop.toml"
     config.write_text(release("shop", "r1") + release("shop", "r2"))
@@ -222,24 +317,25 @@ def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path
     assert kept.stdout.strip() == "muru: no changes (1 object as declared)"
     assert [row["release"] for row in daemon.releases("shop")] == ["shop@r2", "shop@r1"]
 
+    # r1, which nothing serves or names, was left stopped, so it is
+    # removed without a drain.
+
     pruned = apply(daemon, config, "--prune")
     assert pruned.returncode == 0, pruned.stdout + pruned.stderr
-    assert pruned.stdout.splitlines()[1].split() == [
-        "remove-release",
-        "shop@r1",
-        "stopped",
-        "and",
-        "removed",
-    ]
+    assert pruned.stdout.splitlines()[1].split() == ["remove-release", "shop@r1", "removed"]
     assert daemon.releases("shop") == [{"release": "shop@r2", "state": "ready", "serving": "yes"}]
 
-    # An empty file with --prune removes the application itself.
+    # An empty file with --prune removes the application itself, its
+    # running release drained and stopped first.
 
     config.write_text("# nothing declared\n")
     emptied = apply(daemon, config, "--prune")
     assert emptied.returncode == 0, emptied.stdout + emptied.stderr
-    actions = [line.split()[:2] for line in emptied.stdout.splitlines()[1:]]
-    assert actions == [["remove-release", "shop@r2"], ["remove-app", "shop"]]
+    outcomes = [line.split(None, 2) for line in emptied.stdout.splitlines()[1:]]
+    assert outcomes == [
+        ["remove-release", "shop@r2", "stopped and removed"],
+        ["remove-app", "shop", "removed"],
+    ]
     assert daemon.muructl("app", "list").stdout.strip() == "no applications"
     assert daemon.get("/").status == 503
 
@@ -262,14 +358,12 @@ def test_export_applies_back_without_changes(daemon: Daemon, tmp_path: Path) -> 
     assert apply(daemon, config).stdout.strip() == "muru: no changes (1 object as declared)"
     assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
 
-    # By default only the serving release is written; --all-releases
-    # writes every release, and --json the same document as JSON.
+    # Only the serving release is written, and --json writes the same
+    # document as JSON.
 
     daemon.deploy("shop", SHOP, "--threads", "1")
     current = tomllib.loads(daemon.muructl("config", "export").stdout)
     assert list(current["app"]["shop"]["release"]) == ["r2"]
-    every = tomllib.loads(daemon.muructl("config", "export", "--all-releases").stdout)
-    assert list(every["app"]["shop"]["release"]) == ["r1", "r2"]
     as_json = json.loads(daemon.muructl("config", "export", "--json").stdout)
     assert as_json["app"]["shop"]["release"]["r2"]["threads"] == 1
 

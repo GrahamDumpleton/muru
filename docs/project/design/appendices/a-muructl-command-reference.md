@@ -29,7 +29,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Daemon | muructl edge run | Internal, started by the daemon | 2.3 |
 | Configuration | muructl apply -f FILE or DIR | Apply declarative configuration. Flags: --dry-run, --check, --json, --save-plan FILE, --plan FILE, --prune, --override-freeze, and for the releases it adds --hold, --no-wait, --retain, --retain-workers | 10.4 |
 | Configuration | muructl render APP [SOURCE] | Write the release a command line describes as a table of the daemon's format, without a daemon. Flags: the release settings muructl deploy takes, --release ID (default r1), --full (every setting, with where it came from), --json | 10.4 |
-| Configuration | muructl config export | Export desired state. Flags: --app, --split, --all-releases, --resolve-rollouts, --redact, --param, --format | 10.4 |
+| Configuration | muructl config export | Export desired state. Flags: --app, --split, --resolve-rollouts, --redact, --param, --format | 10.4 |
 | Configuration | muructl config diff -f FILE | Compare a file with desired state | 10.4 |
 | Configuration | muructl config show RELEASE --effective | Merged settings with their sources | 3.3 |
 | Configuration | muructl config schema | Print the JSON Schema for configuration files | 10.3 |

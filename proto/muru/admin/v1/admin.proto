@@ -765,6 +765,7 @@ message ConfigReport {
   uint32 unchanged = 4;             // releases already as declared
   bool applied = 5;                 // the changes were carried out
   repeated string notes = 6;        // what else the apply did: certificates renewed
+  string snapshot_error = 7;        // after an apply: why the edge did not take the new snapshot, which fails the apply
 }
 
 message ConfigChange {
@@ -776,7 +777,6 @@ message ConfigChange {
 
 message ExportConfigRequest {
   string app = 1;                   // one application, else all
-  bool all_releases = 2;            // every release, not only the one that serves
   bool effective = 3;               // routes as the active overlays leave them (section 9.10)
   bool resolve_rollouts = 4;        // each rollout under way as where it stands (section 10.4)
 }

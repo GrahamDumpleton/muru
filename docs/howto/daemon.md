@@ -274,16 +274,19 @@ changes a default.
 ### What an apply does
 
 An apply creates the applications the files name, deploys each declared
-release the daemon does not have (in id order, so the last declared
-release of an application is the one that serves), creates or updates
-the hosts and routes, and leaves anything already recorded as declared
-alone. Releases are immutable: a
-declared release whose settings differ from the recorded ones is an
-error, and the file is applied only when it has no errors at all. Unknown
-keys, invalid names, a missing source directory and a source without an
-entrypoint are errors too. `[[listener]]` entries and the `[limits]`
-table belong in the daemon's own configuration file; in an applied file
-they are reported as warnings and not applied.
+release the daemon does not have (the last of an application's in id
+order to serve, unless the application's [`serving`
+key](#which-release-serves) names another, and the others held when a
+route names them, else left stopped), creates or updates the hosts and
+routes, and leaves anything already recorded as declared alone. Id order puts ids of the form `rN` first, by number, so
+`r10` comes after `r9`, and every other id after them, by name: files
+adding `r9` and `2026-11-06` serve `2026-11-06`. Releases are
+immutable: a declared release whose settings differ from the recorded
+ones is an error, and the file is applied only when it has no errors at
+all. Unknown keys, invalid names, a missing source directory and a
+source without an entrypoint are errors too. `[[listener]]` entries and
+the `[limits]` table belong in the daemon's own configuration file; in
+an applied file they are reported as warnings and not applied.
 
 Four flags say how the releases an apply adds are deployed, as they do
 on `muructl deploy`:
@@ -301,9 +304,9 @@ muructl rollout bluegreen shop@2026-11-06
 ```
 
 A held release takes no traffic and is reached with the `Muru-Preview`
-header, until a [rollout](rollouts.md) moves traffic to it. `--hold`
-holds every release the apply adds, in every application, and the plan
-and the report say `held` of each:
+header, until a [rollout](rollouts.md) or a promotion moves traffic to
+it. `--hold` holds every release the apply adds, in every application,
+and the plan and the report say `held` of each:
 
 ```console
 $ muructl apply -f config/ --hold --dry-run
@@ -314,28 +317,36 @@ muru: plan (nothing changed)
 
 An application whose first release is held serves nothing until a
 rollout. To hold the releases of one application and not another's,
-apply their files separately: without `--prune` an apply leaves alone
-what its files do not mention.
+give it a `serving` key naming the release that serves now, which keeps
+the others out of traffic without the flag: held where a route names
+them, else stopped.
 
 `--dry-run` prints the plan and changes nothing. For each release that
 would take over from one that serves, it says how long that one stays
-warm. `--prune` also removes
-the routes, hosts, releases and applications the files do not contain,
-in that order: a running release drains and stops first. `--json` writes
-the report as JSON. The
-exit code is 0 when there is nothing to do or everything applied, 2 for
-a dry run with changes planned, and 1 for errors.
+warm. `--prune` also removes the routes, hosts, releases and
+applications the files do not contain, in that order: a running release
+drains and stops first. The release that serves each application after
+the apply must be declared, or the apply is refused, since `--prune`
+would remove it, and so must every release a route the files keep names
+in its traffic, and every application such a route sends requests to. `--json` writes the report as JSON. The exit code is 0
+when there is nothing to do or everything applied, 2 for a dry run with
+changes planned, and 1 for errors, for a change that failed, and for a
+snapshot the edge did not take, which the report names: the changes
+were made, and the edge serves what it had until a later snapshot
+reaches it.
 
 `muructl config export` writes desired state as a file of this form, with
 a header naming the daemon's version, the node, the time and the state
 version. It writes the release that serves each application, every key
-spelled out, so applying the file back to the daemon it came from changes
-nothing; `--all-releases` writes every release, `--app NAME` one
-application, and `--json` the same document as JSON. A
-[rollout](rollouts.md) under way is not part of the file; with
-`--resolve-rollouts` it is written as where it stands, the candidate
-declared beside the serving release and the application's routes
-splitting traffic between them at the candidate's current share.
+spelled out, and the application's `serving` key naming it, and the
+releases its routes' splits and client classes name, so applying the
+file back to the daemon it came from changes nothing and, applied to
+another node, it starts those releases held. A release neither is left
+out. `--app NAME` writes one application, and `--json` the same document
+as JSON. A [rollout](rollouts.md) under way is not part of the file;
+with `--resolve-rollouts` it is written as where it stands, the
+candidate declared beside the serving release and the application's
+routes splitting traffic between them at the candidate's current share.
 `muructl config diff -f FILE` compares a file with desired state in
 both directions, listing what the file would add and what the daemon
 holds that the file does not, with exit code 2 when they differ.
@@ -359,6 +370,68 @@ $ muructl config show shop --effective
 #   shop@r3: sync_threads = 8 (default)
 ...
 ```
+
+### Which release serves
+
+An application's `serving` key names the release that serves its
+traffic. Declaring a new release beside it stages that release:
+
+```toml
+[app.shop]
+serving = "r1"
+
+[app.shop.release.r1]
+source = "/srv/shop/r1"
+
+[app.shop.release.r2]
+source = "/srv/shop/r2"
+```
+
+Applied while r1 serves, this records r2 and leaves it stopped, since
+nothing serves it or names it. A route whose traffic split or client
+classes in the same files name r2, even at 0%, starts it held instead:
+it does not take the application's traffic, and serves only that share
+and requests that name it with the `Muru-Preview` header. So does an
+[overlay](overlays.md) in the same files that pins r2, splits to it or
+waits for it with `release_ready`, so that the overlay can activate. A
+stopped release is started by a rollout, a promotion or a split that
+names it later; a preview alone does not start it. `--hold` starts
+every release the apply adds held.
+
+Changing the key to `serving = "r2"` and applying the files again
+promotes r2, starting it if it is stopped: all of the application's
+traffic moves to it, and r1 drains and stays warm as `--retain` and
+`--retain-workers` say. The promotion comes after the apply has written
+the hosts and routes, so a split in the same files that still names r1
+keeps it running. The plan says what happens to each release, `serving`,
+`held` or `stopped` for one it adds:
+
+```console
+$ muructl apply -f config/ --dry-run
+muru: plan (nothing changed)
+  promote         shop@r2                  serving in place of shop@r1
+  2 objects as declared
+muru: shop@r1 stays warm for 1800s with 1 worker to a group, when shop@r2 takes its place
+```
+
+The key names a declared release or one the daemon already has; naming
+neither is an error. Without the key, the last release the apply adds,
+in id order, serves, and the others it adds are held or left stopped
+as above. `--hold` with a key that would move traffic is an error,
+since the flag leaves traffic where it is.
+
+While a [rollout](rollouts.md) is under way, the rollout moves the
+traffic. The key may name its baseline or its candidate, and the apply
+promotes nothing. Naming the baseline also warns that once the rollout
+promotes the candidate, applying the same files again promotes the
+baseline back: change the key to the candidate before the rollout ends
+to keep its outcome. Naming any other release is an error until the
+rollout ends, or `muructl rollout promote` or `muructl rollout abort`
+ends it. Once a rollout has rolled back, by its gates or by an abort,
+naming its candidate is an error too, since the apply would promote it
+past its gates: name another release, or promote it by hand with
+`muructl rollout bluegreen`, after which the files and the daemon
+agree.
 
 ## Building the environment on the node
 

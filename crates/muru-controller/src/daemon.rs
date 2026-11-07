@@ -115,6 +115,9 @@ pub struct CertificateChanges {
     /// Hosts kept on the certificate they had, with why the files were
     /// refused.
     pub kept: Vec<(String, String)>,
+    /// Why the edge did not take the renewed certificates, when it did
+    /// not.
+    pub refused: Option<String>,
 }
 
 /// An upgrade the daemon is about to carry out (section 13.4).
@@ -301,6 +304,9 @@ pub enum Command {
         app: String,
         /// The release.
         id: String,
+        /// How long the release that served stays warm, and with how
+        /// many workers.
+        retain: Retention,
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Release, String>>,
     },
@@ -3913,8 +3919,25 @@ impl Daemon {
             Command::ControlRollout { app, action, done } => {
                 let _ = done.send(self.control_rollout(&app, action).await);
             }
-            Command::PromoteRelease { app, id, done } => {
-                let _ = done.send(self.promote_release(&app, &id).await);
+            Command::PromoteRelease {
+                app,
+                id,
+                retain,
+                done,
+            } => {
+                // Section 9.3: a promotion by hand waits for the rollout
+                // under way to end; the rollout's own promotion does not
+                // come this way.
+
+                let rollout = self.store.active_rollout(&app).ok().flatten();
+
+                let outcome = match crate::rollouts::promotion_refused(rollout.as_ref(), &app, &id)
+                {
+                    Some(why) => Err(why),
+                    None => self.promote_release(&app, &id, retain).await,
+                };
+
+                let _ = done.send(outcome);
             }
             Command::SetScale {
                 app,
@@ -3961,12 +3984,13 @@ impl Daemon {
                 let _ = done.send(self.push_snapshot().await);
             }
             Command::RefreshCertificates { done } => {
-                let changes = self.refresh_certificates(true);
+                let mut changes = self.refresh_certificates(true);
 
                 if !changes.renewed.is_empty()
                     && let Err(error) = self.push_snapshot().await
                 {
                     tracing::warn!(%error, "pushing the renewed certificates failed");
+                    changes.refused = Some(error);
                 }
 
                 let _ = done.send(changes);
@@ -6077,7 +6101,7 @@ impl Daemon {
 
         match state {
             RolloutState::Promoted => {
-                self.promote_release(&rollout.app, &rollout.candidate)
+                self.promote_release(&rollout.app, &rollout.candidate, Retention::default())
                     .await?;
                 record(rollout, &self.store)?;
                 self.push_snapshot().await?;
@@ -6116,8 +6140,14 @@ impl Daemon {
 
     /// Blue/green (section 9.2): all of the application's traffic to the
     /// release now, which is started if it is not running, and the release
-    /// that served drains unless a policy names it.
-    async fn promote_release(&mut self, app: &str, id: &str) -> Result<Release, String> {
+    /// that served drains unless a policy names it, kept warm as `retain`
+    /// says.
+    async fn promote_release(
+        &mut self,
+        app: &str,
+        id: &str,
+        retain: Retention,
+    ) -> Result<Release, String> {
         let record = self.store.app(app).map_err(|error| error.to_string())?;
         let current = record.current.clone();
 
@@ -6137,7 +6167,7 @@ impl Daemon {
                 .referenced_releases()
                 .contains(&(app.to_owned(), previous.clone()))
         {
-            self.drain(app, &previous, Retention::default()).await;
+            self.drain(app, &previous, retain).await;
         }
 
         self.store

@@ -42,6 +42,11 @@
           },
           "type": "array"
         },
+        "serving": {
+          "description": "The release that serves the application's traffic, a declared one or one the daemon has. The other releases an apply adds are started held, and naming a release the daemon has promotes it.",
+          "type": "string",
+          "x-default": "the last release in id order an apply adds, else the one that serves"
+        },
         "slow": {
           "description": "How slow one of the application's requests is to be written under `access_log = \"errors\"`.",
           "type": "string",

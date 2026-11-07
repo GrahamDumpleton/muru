@@ -297,6 +297,16 @@ def test_rollouts_pause_resume_approve_promote_and_abort(daemon: Daemon, tmp_pat
         "rollout", "canary", "shop@r3", "--steps", "50", "--hold", "60s", "--min-requests", "1000"
     )
     assert releases_seen(daemon, 30, "third") == {"r2", "r3"}
+
+    # Issue #446: a promotion by hand waits for the rollout to end.
+
+    for target, complaint in [
+        ("shop@r1", "end it with `muructl rollout promote shop` or `muructl rollout abort shop`"),
+        ("shop@r3", "give it all the traffic with `muructl rollout promote shop`"),
+    ]:
+        refused = daemon.muructl("rollout", "bluegreen", target, check=False)
+        assert refused.returncode != 0 and complaint in refused.stderr, refused.stderr
+
     aborted = daemon.muructl("rollout", "abort", "shop").stdout
     assert "rolled_back: aborted by hand at 50%" in aborted, aborted
     wait_for_states(

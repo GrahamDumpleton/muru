@@ -237,6 +237,7 @@ async fn carry_out(
                 Command::PromoteRelease {
                     app: app.clone(),
                     id: release.clone(),
+                    retain: crate::daemon::Retention::default(),
                     done,
                 },
                 done_rx
