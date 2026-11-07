@@ -419,7 +419,11 @@ promotes the candidate, applying the same files again promotes the
 baseline back: change the key to the candidate before the rollout ends
 to keep its outcome. Naming any other release is an error until the
 rollout ends, or `muructl rollout promote` or `muructl rollout abort`
-ends it.
+ends it. Once a rollout has rolled back, by its gates or by an abort,
+naming its candidate is an error too, since the apply would promote it
+past its gates: name another release, or promote it by hand with
+`muructl rollout bluegreen`, after which the files and the daemon
+agree.
 
 ## Building the environment on the node
 

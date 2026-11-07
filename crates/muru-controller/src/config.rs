@@ -645,6 +645,25 @@ fn plan_app(
 
     let serving = serving.filter(|serving| moves && !added.contains(serving))?;
 
+    // Section 9.3: a release whose latest rollout rolled back failed its
+    // gates or was aborted, and the files do not promote it past them.
+
+    let rolled_back = store
+        .rollouts(Some(name))
+        .unwrap_or_default()
+        .into_iter()
+        .rfind(|rollout| rollout.candidate == serving)
+        .filter(|rollout| rollout.state == crate::model::RolloutState::RolledBack);
+
+    if let Some(rollout) = rolled_back {
+        plan.errors.push(format!(
+            "{name}: serving names {serving}, whose rollout rolled back ({}); name another \
+             release, or promote it by hand with `muructl rollout bluegreen {name}@{serving}`",
+            rollout.message
+        ));
+        return None;
+    }
+
     Some(Change {
         detail: match &current {
             Some(current) => format!("serving in place of {name}@{current}"),
@@ -6595,34 +6614,100 @@ mod tests {
         );
     }
 
+    /// A rollout of shop's candidate against r1, in this state.
+    fn shop_rollout(
+        id: &str,
+        candidate: &str,
+        state: crate::model::RolloutState,
+        message: &str,
+    ) -> crate::model::Rollout {
+        crate::model::Rollout {
+            app: "shop".to_owned(),
+            id: id.to_owned(),
+            candidate: candidate.to_owned(),
+            baseline: "r1".to_owned(),
+            steps: Vec::new(),
+            gates: crate::model::RolloutGates {
+                max_error_rate: 0.01,
+                max_p95_ms: None,
+                max_p99_ms: None,
+                max_worker_faults: 0,
+                max_queue_wait_p95_ms: None,
+                probes: Vec::new(),
+                min_requests: 10,
+            },
+            approve_each_step: false,
+            state,
+            step: 0,
+            step_started_unix_ms: 0,
+            message: message.to_owned(),
+            created_unix_ms: id.parse().unwrap_or(0),
+            updated_unix_ms: 0,
+        }
+    }
+
+    #[test]
+    fn serving_does_not_promote_a_rolled_back_candidate() {
+        let source = source_dir();
+        let store = store_with_two(&source);
+        let document = shop_releases(&source, &["r1", "r2"], "serving = 'r2'");
+        let rolled_back = crate::model::RolloutState::RolledBack;
+        store
+            .put_rollout(&shop_rollout(
+                "1",
+                "r2",
+                rolled_back,
+                "gate failed at 10%: errors",
+            ))
+            .unwrap();
+
+        // Issue #448: r2's rollout rolled back, so the files refuse to
+        // promote it.
+
+        let refused = plan_with(&store, &document, false, false);
+        assert_eq!(
+            refused.errors,
+            vec![
+                "shop: serving names r2, whose rollout rolled back (gate failed at 10%: errors); \
+                 name another release, or promote it by hand with `muructl rollout bluegreen \
+                 shop@r2`"
+            ]
+        );
+
+        // A later rollout of r2 that promoted it is its latest, and
+        // another release's rollback says nothing of r2.
+
+        let promoted = crate::model::RolloutState::Promoted;
+        store
+            .put_rollout(&shop_rollout("2", "r2", promoted, ""))
+            .unwrap();
+        store
+            .put_rollout(&shop_rollout(
+                "3",
+                "r3",
+                rolled_back,
+                "aborted by hand at 50%",
+            ))
+            .unwrap();
+        let allowed = plan_with(&store, &document, false, false);
+        assert!(allowed.errors.is_empty(), "{:?}", allowed.errors);
+        assert_eq!(
+            steps(&allowed),
+            vec![("promote", "shop@r2".to_owned(), false)]
+        );
+    }
+
     #[test]
     fn a_rollout_under_way_leaves_serving_to_its_baseline_or_candidate() {
         let source = source_dir();
         let store = store_with_two(&source);
         store
-            .put_rollout(&crate::model::Rollout {
-                app: "shop".to_owned(),
-                id: "1".to_owned(),
-                candidate: "r2".to_owned(),
-                baseline: "r1".to_owned(),
-                steps: Vec::new(),
-                gates: crate::model::RolloutGates {
-                    max_error_rate: 0.01,
-                    max_p95_ms: None,
-                    max_p99_ms: None,
-                    max_worker_faults: 0,
-                    max_queue_wait_p95_ms: None,
-                    probes: Vec::new(),
-                    min_requests: 10,
-                },
-                approve_each_step: false,
-                state: crate::model::RolloutState::Running,
-                step: 0,
-                step_started_unix_ms: 0,
-                message: String::new(),
-                created_unix_ms: 0,
-                updated_unix_ms: 0,
-            })
+            .put_rollout(&shop_rollout(
+                "1",
+                "r2",
+                crate::model::RolloutState::Running,
+                "",
+            ))
             .unwrap();
 
         // The candidate: the rollout moves traffic to it, and a release

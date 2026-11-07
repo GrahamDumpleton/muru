@@ -119,8 +119,10 @@ and changing it changes no release.
   and nothing warns after one.
 
 - Bad: a rollout that rolls back leaves its candidate named, if the files
-  were changed to name it, and the next apply promotes it without the
-  gates.
+  were changed to name it. The next apply refuses to promote a release
+  whose latest rollout rolled back, so a job applying the files fails
+  until they name another release or a person promotes it by hand with
+  `muructl rollout bluegreen`, after which the files agree (issue #448).
 
 - Bad: files without the key still let the release an apply adds serve
   before a split in the same files is written.
@@ -131,4 +133,5 @@ Specification sections 9.2, 10.4 and 19.1. Issues #417 and #420; the
 apply's order and atomicity are issue #439. ADR 0052 rejected a hold key
 on a release's table. Issue #447 later held, without the key, every
 release an apply adds but the last in id order, so the plan's `serving
-until` detail went.
+until` detail went. Issue #448 refused promoting a rolled-back candidate,
+where the next apply had promoted it without its gates.
