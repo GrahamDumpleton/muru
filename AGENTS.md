@@ -281,14 +281,21 @@ with `--fix`; the formatters keep what it inserts.
   it. The maintainer moves issues to Next; take the Next issue with the
   lowest Order, never a `tracking` issue, move it to In Progress
   when its branch is made, and let `Closes #N` move it to In Review and
-  Done. The one exception to the maintainer choosing what goes to Next
-  is a problem in the tests or their harness rather than in Muru, a
-  flaky test above all: label it `testing` (with `bug` as well while
-  the cause is unknown) and, when it is small, put it straight into Next
-  with Goal Housekeeping, Priority P1 and an Order ahead of the rest, so
-  it is fixed in the next piece of work instead of waiting in Backlog;
-  a branch for other work may carry it. When work changes an issue's size, priority or what blocks it,
-  update the issue and its fields in the same step. `gh project field-list
+  Done. There are two exceptions to the maintainer choosing what goes
+  to Next. The first is a problem in the tests or their harness rather
+  than in Muru, a flaky test above all: label it `testing` (with `bug`
+  as well while the cause is unknown) and, when it is small, put it
+  straight into Next with Goal Housekeeping, Priority P1 and an Order
+  ahead of the rest, so it is fixed in the next piece of work instead
+  of waiting in Backlog; a branch for other work may carry it. The
+  second is a problem found while working on an issue already in Next
+  or In Progress that can be fixed on the same branch, above all one in
+  the same or related code, whether it is in Muru or in the tests: put
+  it into Next with an Order beside the issue that turned it up, and
+  fix it on that branch, so related problems are fixed together while
+  the code is fresh. A problem unrelated to the work still goes to
+  Backlog. When work changes an issue's size, priority or what blocks
+  it, update the issue and its fields in the same step. `gh project field-list
   1 --owner GrahamDumpleton` gives the field and option ids that
   `gh project item-edit` needs.
 

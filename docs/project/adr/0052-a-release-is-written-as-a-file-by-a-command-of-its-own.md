@@ -134,3 +134,5 @@ command that then used none of them.
 
 Specification sections 10.4 and 13.1, appendices A and B. Replaces the
 hidden conversion ADR 0051 kept. Issues #417, #419, #420 and #422.
+ADR 0054 gives an application a `serving` key naming the release that
+serves, which holds the other releases an apply adds without a flag.

@@ -72,6 +72,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | on_sigterm, delay, budget | `[shutdown]` | shutdown when the daemon is a container's main process and detach otherwise, 0s, 8s | 13.3 |
 | min_workers = 0 (scale to zero), host_idle_timeout | group; host_idle_timeout in the release's own scaling table | none, off | 7.4 |
 | priority (the order in which the node's budget admits scale-ups, highest first) | application | 0 | 7.4 |
+| serving (the release that serves the application's traffic; the others an apply adds are held) | application | the last release in id order an apply adds, else the one that serves | 10.4 |
 | max_requests, max_lifetime, max_surge | group | off, off, 1 | 7.7 |
 | memory.measure, soft_limit, soft_for, reclaim_first, hard_limit, check_interval, malloc_arena_max, allocator | group | uss, off, 2m, true, off, 5s, unset, system | 7.7 |
 | timeouts (soft_timeout, hard_timeout, hard_drain_grace, shutdown_timeout, loop_stall_timeout, gil_stall_timeout, idle_timeout) | release, group | off, off, 10s, 5s, 10s, 30s, 60s | 7.6 |
@@ -135,8 +136,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 
 | Category | Types (prefix dev.muru.) |
 | --- | --- |
-| Configuration | config.applied, route.changed, traffic_policy.changed, maintenance.changed, access_log.changed, access_log.reverted |
-| Releases | release.created, release.building, release.built, release.build_failed, release.state_changed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden, release.idle, release.woken |
+| Configuration | config.applied, config.apply_failed, route.changed, traffic_policy.changed, maintenance.changed, access_log.changed, access_log.reverted |
+| Releases | release.created, release.building, release.built, release.build_failed, release.state_changed, release.removed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden, release.idle, release.woken |
 | Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.oom_killed, worker.recycled, worker.timeout_killed, worker.loop_stalled, worker.gil_stalled, worker.restarted, server.started, server.exited, server.failed |
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired, schedule.over_budget |
 | Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened, clock.unsynchronised, clock.synchronised |

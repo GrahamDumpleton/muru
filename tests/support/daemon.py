@@ -186,6 +186,16 @@ class Daemon:
     def events(self) -> list[str]:
         return [line.split(None, 4)[3] for line in self.muructl("events").stdout.splitlines()]
 
+    def snapshot_version(self) -> int:
+        """The version of the snapshot the edge was last given, from the metrics."""
+
+        text = self.muructl("metrics").stdout
+        return next(
+            int(line.split()[1])
+            for line in text.splitlines()
+            if line.startswith("muru_snapshot_version ")
+        )
+
     def wait_for_routing(self, app: str, timeout: float = 20.0) -> None:
         """Wait until the host says the edge routes to every worker of the
         application's serving release.

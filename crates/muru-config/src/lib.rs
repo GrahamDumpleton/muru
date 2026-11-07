@@ -4475,6 +4475,15 @@ pub struct App {
     /// Releases by identifier.
     #[serde(default)]
     pub release: BTreeMap<String, Release>,
+    /// The release that serves the application's traffic, a declared one
+    /// or one the daemon has (section 10.4). The other releases an apply
+    /// adds are started held, and naming a release the daemon has
+    /// promotes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend(
+        "x-default" = "the last release in id order an apply adds, else the one that serves"
+    ))]
+    pub serving: Option<String>,
     /// Scheduled capacity (section 7.5).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedule: Vec<CapacitySchedule>,
@@ -4715,6 +4724,12 @@ impl Document {
 
             if app.priority.is_some() {
                 entry.priority = app.priority;
+            }
+
+            // Section 10.4: so does the release that serves.
+
+            if app.serving.is_some() {
+                entry.serving = app.serving;
             }
 
             // Section 11.2: so does the access log choice, key by key,

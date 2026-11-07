@@ -71,8 +71,9 @@ What needs a release:
 - being the application's serving release, which takes every request
   that nothing else claims;
 
-- being held, started with `--hold` and waiting for a rollout or a
-  promotion;
+- being held, started with `--hold`, or declared beside the serving
+  release with a route's traffic naming it, and waiting for a rollout or
+  a promotion;
 
 - being named in a route's traffic policy, even with a share of 0;
 

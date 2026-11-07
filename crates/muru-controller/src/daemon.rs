@@ -115,6 +115,9 @@ pub struct CertificateChanges {
     /// Hosts kept on the certificate they had, with why the files were
     /// refused.
     pub kept: Vec<(String, String)>,
+    /// Why the edge did not take the renewed certificates, when it did
+    /// not.
+    pub refused: Option<String>,
 }
 
 /// An upgrade the daemon is about to carry out (section 13.4).
@@ -301,6 +304,9 @@ pub enum Command {
         app: String,
         /// The release.
         id: String,
+        /// How long the release that served stays warm, and with how
+        /// many workers.
+        retain: Retention,
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Release, String>>,
     },
@@ -313,10 +319,26 @@ pub enum Command {
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Release, String>>,
     },
-    /// Push a fresh snapshot: the hosts or routes changed.
-    Reconfigure {
-        /// Where the acknowledgement goes.
-        done: oneshot::Sender<Result<(), String>>,
+    /// Section 10.10: start a recorded release held, for an apply's
+    /// prepare phase, unless it runs.
+    StartHeld {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// Answered with whether the release was started, or why it did
+        /// not start.
+        done: oneshot::Sender<Result<bool, String>>,
+    },
+    /// Section 10.10: an apply's commit phase.
+    CommitApply {
+        /// The apply's plan; the changes of the commit phase are made.
+        changes: Vec<crate::config::Change>,
+        /// How long a release that served before stays warm, and with
+        /// how many workers.
+        retain: Retention,
+        /// Answered with what the phase did, or why nothing was written.
+        done: oneshot::Sender<Result<crate::config::Committed, String>>,
     },
     /// Section 4.2: read the TLS hosts' certificate files again, for an
     /// apply that changed nothing else, and send the edge what changed.
@@ -508,6 +530,9 @@ struct GroupScaling {
     /// for, the count given and the limit, so each is one event.
     denied: Option<(u32, u32, crate::budget::Limit)>,
 }
+
+/// Releases, as (app, release).
+type ReleaseSet = BTreeSet<(String, String)>;
 
 /// What the API needs to talk to a running daemon.
 #[derive(Clone)]
@@ -3913,8 +3938,25 @@ impl Daemon {
             Command::ControlRollout { app, action, done } => {
                 let _ = done.send(self.control_rollout(&app, action).await);
             }
-            Command::PromoteRelease { app, id, done } => {
-                let _ = done.send(self.promote_release(&app, &id).await);
+            Command::PromoteRelease {
+                app,
+                id,
+                retain,
+                done,
+            } => {
+                // Section 9.3: a promotion by hand waits for the rollout
+                // under way to end; the rollout's own promotion does not
+                // come this way.
+
+                let rollout = self.store.active_rollout(&app).ok().flatten();
+
+                let outcome = match crate::rollouts::promotion_refused(rollout.as_ref(), &app, &id)
+                {
+                    Some(why) => Err(why),
+                    None => self.promote_release(&app, &id, retain).await,
+                };
+
+                let _ = done.send(outcome);
             }
             Command::SetScale {
                 app,
@@ -3945,28 +3987,24 @@ impl Daemon {
             Command::Drain { app, id, done } => {
                 let _ = done.send(self.drain_release(&app, &id).await);
             }
-            Command::Reconfigure { done } => {
-                // An apply may have changed the applied classes and
-                // limits.
-
-                match self.client_rules.policies(&self.store) {
-                    Ok(clients) => self.clients = clients,
-                    Err(error) => {
-                        tracing::warn!(%error, "the client classes stay as they were");
-                    }
-                }
-
-                self.reconcile_traffic().await;
-                self.refresh_certificates(true);
-                let _ = done.send(self.push_snapshot().await);
+            Command::StartHeld { app, id, done } => {
+                let _ = done.send(self.start_held(&app, &id).await);
+            }
+            Command::CommitApply {
+                changes,
+                retain,
+                done,
+            } => {
+                let _ = done.send(self.commit_apply(&changes, retain).await);
             }
             Command::RefreshCertificates { done } => {
-                let changes = self.refresh_certificates(true);
+                let mut changes = self.refresh_certificates(true);
 
                 if !changes.renewed.is_empty()
                     && let Err(error) = self.push_snapshot().await
                 {
                     tracing::warn!(%error, "pushing the renewed certificates failed");
+                    changes.refused = Some(error);
                 }
 
                 let _ = done.send(changes);
@@ -6077,7 +6115,7 @@ impl Daemon {
 
         match state {
             RolloutState::Promoted => {
-                self.promote_release(&rollout.app, &rollout.candidate)
+                self.promote_release(&rollout.app, &rollout.candidate, Retention::default())
                     .await?;
                 record(rollout, &self.store)?;
                 self.push_snapshot().await?;
@@ -6116,8 +6154,14 @@ impl Daemon {
 
     /// Blue/green (section 9.2): all of the application's traffic to the
     /// release now, which is started if it is not running, and the release
-    /// that served drains unless a policy names it.
-    async fn promote_release(&mut self, app: &str, id: &str) -> Result<Release, String> {
+    /// that served drains unless a policy names it, kept warm as `retain`
+    /// says.
+    async fn promote_release(
+        &mut self,
+        app: &str,
+        id: &str,
+        retain: Retention,
+    ) -> Result<Release, String> {
         let record = self.store.app(app).map_err(|error| error.to_string())?;
         let current = record.current.clone();
 
@@ -6137,12 +6181,129 @@ impl Daemon {
                 .referenced_releases()
                 .contains(&(app.to_owned(), previous.clone()))
         {
-            self.drain(app, &previous, Retention::default()).await;
+            self.drain(app, &previous, retain).await;
         }
 
         self.store
             .release(app, id)
             .map_err(|error| error.to_string())
+    }
+
+    /// Section 10.10: start a recorded release held, traffic left where
+    /// it is, for an apply's prepare phase. Answers whether it was
+    /// started: false when it ran already.
+    async fn start_held(&mut self, app: &str, id: &str) -> Result<bool, String> {
+        let key = (app.to_owned(), id.to_owned());
+
+        if self.running.get(&key).is_some_and(|running| {
+            running.retained_until.is_none() && running.sticky_until.is_none()
+        }) {
+            return Ok(false);
+        }
+
+        self.make_room_for(app, id).await?;
+        self.start(app, id).await?;
+
+        if let Some(running) = self.running.get_mut(&key) {
+            running.held = true;
+            running.sticky_until = None;
+        }
+
+        if let Err(error) = self.push_snapshot().await {
+            tracing::error!(%error, "pushing the snapshot for a held release failed");
+        }
+
+        self.mark_ready(app, id, "held: not serving");
+        Ok(true)
+    }
+
+    /// Section 10.10: an apply's commit phase. Its writes are made in one
+    /// transaction; the releases they make serve take the traffic and the
+    /// releases the routes name are started; then one snapshot gives the
+    /// edge all of it, and the releases that served before drain.
+    async fn commit_apply(
+        &mut self,
+        changes: &[crate::config::Change],
+        retain: Retention,
+    ) -> Result<crate::config::Committed, String> {
+        // Section 9.3: a promotion by hand waits for the rollout under
+        // way to end. The prepare phase left each release to serve
+        // running.
+
+        for (app, id) in changes.iter().filter_map(|change| change.action.serves()) {
+            let rollout = self.store.active_rollout(app).ok().flatten();
+
+            if let Some(why) = crate::rollouts::promotion_refused(rollout.as_ref(), app, id) {
+                return Err(why);
+            }
+
+            if !self.running.contains_key(&(app.to_owned(), id.to_owned())) {
+                return Err(format!("{app}@{id} stopped before it could serve"));
+            }
+        }
+
+        let mut committed = crate::config::commit(&self.store, changes)?;
+
+        for (app, id, _) in &committed.promoted {
+            self.serving.insert(app.clone(), id.clone());
+            self.default_app = Some(app.clone());
+
+            if let Some(running) = self.running.get_mut(&(app.clone(), id.clone())) {
+                running.held = false;
+            }
+        }
+
+        for (kind, subject, message) in &committed.events {
+            self.events.emit(kind, subject, "notice", message);
+        }
+
+        // The applied client classes and limits may have changed.
+
+        match self.client_rules.policies(&self.store) {
+            Ok(clients) => self.clients = clients,
+            Err(error) => {
+                tracing::warn!(%error, "the client classes stay as they were");
+            }
+        }
+
+        let started = self.start_referenced().await;
+        self.refresh_certificates(true);
+        committed.snapshot_error = self.push_snapshot().await.err();
+
+        for (app, id) in &started {
+            self.mark_ready(app, id, "");
+        }
+
+        for (app, id, previous) in committed.promoted.clone() {
+            let subject = format!("{app}@{id}");
+            self.mark_ready(&app, &id, "");
+
+            match &committed.snapshot_error {
+                None => self.events.emit(
+                    "traffic.switched",
+                    &subject,
+                    "notice",
+                    "traffic moved to the release",
+                ),
+                Some(error) => self.events.emit(
+                    "release.failed",
+                    &subject,
+                    "error",
+                    &format!("the edge could not take the release: {error}"),
+                ),
+            }
+
+            if let Some(previous) = previous.filter(|previous| previous != &id)
+                && !self
+                    .referenced_releases()
+                    .contains(&(app.clone(), previous.clone()))
+            {
+                self.drain(&app, &previous, retain).await;
+            }
+        }
+
+        self.drain_unreferenced().await;
+        Ok(committed)
     }
 
     /// Section 9.3: move every running rollout along. The current step is
@@ -6336,6 +6497,24 @@ impl Daemon {
     /// release that only a policy kept in traffic drains once no policy
     /// names it. Called after the configuration changes and at start.
     async fn reconcile_traffic(&mut self) {
+        let started = self.start_referenced().await;
+
+        if !started.is_empty() {
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot for a policy's releases failed");
+            }
+
+            for (app, id) in &started {
+                self.mark_ready(app, id, "");
+            }
+        }
+
+        self.drain_unreferenced().await;
+    }
+
+    /// The releases the route policies and the overlays' warm-ups name, as
+    /// (app, release), and of those the ones only a warm-up names.
+    fn traffic_referenced(&self) -> (ReleaseSet, ReleaseSet) {
         let mut referenced = self.referenced_releases();
         let warming: BTreeSet<(String, String)> = self
             .warm_ups
@@ -6345,6 +6524,14 @@ impl Daemon {
             .cloned()
             .collect();
         referenced.extend(warming.iter().cloned());
+        (referenced, warming)
+    }
+
+    /// Start the releases a policy or a warm-up names that do not run,
+    /// and return them; the caller pushes the snapshot that gives them
+    /// to the edge, and marks them ready.
+    async fn start_referenced(&mut self) -> Vec<(String, String)> {
+        let (referenced, warming) = self.traffic_referenced();
         let mut started = Vec::new();
 
         for (app, id) in &referenced {
@@ -6386,16 +6573,13 @@ impl Daemon {
             }
         }
 
-        if !started.is_empty() {
-            if let Err(error) = self.push_snapshot().await {
-                tracing::error!(%error, "pushing the snapshot for a policy's releases failed");
-            }
+        started
+    }
 
-            for (app, id) in &started {
-                self.mark_ready(app, id, "");
-            }
-        }
-
+    /// Drain the releases that only a policy kept in traffic, once no
+    /// policy names them.
+    async fn drain_unreferenced(&mut self) {
+        let (referenced, _) = self.traffic_referenced();
         let unreferenced: Vec<(String, String)> = self
             .running
             .iter()

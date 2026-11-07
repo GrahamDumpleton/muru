@@ -80,6 +80,14 @@ class Receiver:
         return [event["type"] for event in self.events()]
 
 
+def without_notes(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The events without release.state_changed, which notes how the
+    runtime library was found, a fetch from PyPI among them, and so
+    depends on the machine."""
+
+    return [event for event in events if event["type"] != "dev.muru.release.state_changed"]
+
+
 def sink_config(port: int, **extra: str) -> str:
     lines = [
         "[[events.sink]]",
@@ -112,7 +120,7 @@ def test_events_arrive_signed_in_order_and_filtered(tmp_path: Path, receiver: Re
     try:
         assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
         wait_for(lambda: "dev.muru.traffic.switched" in receiver.types())
-        events = receiver.events()
+        events = without_notes(receiver.events())
         assert [event["type"] for event in events] == [
             "dev.muru.release.created",
             "dev.muru.release.ready",
@@ -214,7 +222,8 @@ def test_a_receiver_outage_delays_nothing_but_delivery(tmp_path: Path, receiver:
         receiver.refuse = False
         wait_for(lambda: "dev.muru.events.sink.recovered" in receiver.types())
         types = receiver.types()
-        assert types[:2] == ["dev.muru.release.created", "dev.muru.release.ready"]
+        delivered = [event["type"] for event in without_notes(receiver.events())]
+        assert delivered[:2] == ["dev.muru.release.created", "dev.muru.release.ready"]
         assert "dev.muru.events.sink.failing" in types
         assert "events.sink.recovered" in daemon.events()
         assert len(types) == len(set(json.loads(body)["id"] for _, body in receiver.deliveries))

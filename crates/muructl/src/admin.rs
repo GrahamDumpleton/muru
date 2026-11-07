@@ -5497,13 +5497,14 @@ pub struct ApplyArgs {
     #[arg(long)]
     prune: bool,
 
-    /// Deploy releases of applications an overlay freezes;
+    /// Deploy or promote releases of applications an overlay freezes;
     /// recorded as an event.
     #[arg(long)]
     override_freeze: bool,
 
     /// Start the releases the apply adds but leave traffic where it is,
-    /// for a preview with the Muru-Preview header or a rollout.
+    /// for a preview with the Muru-Preview header or a rollout; refused
+    /// when an application's serving key would move its traffic.
     #[arg(long)]
     hold: bool,
 
@@ -5568,10 +5569,6 @@ pub enum ConfigCommand {
         #[arg(long, value_name = "NAME")]
         app: Option<String>,
 
-        /// Every release of each application, not only the one that serves.
-        #[arg(long)]
-        all_releases: bool,
-
         /// Write each rollout under way as where it stands: its candidate
         /// declared, and the application's routes splitting traffic at
         /// its current share.
@@ -5621,7 +5618,6 @@ pub enum ConfigCommand {
 /// Export desired state, with a header naming where it came from.
 pub async fn config_export(
     app: Option<String>,
-    all_releases: bool,
     resolve_rollouts: bool,
     json: bool,
     socket: SocketArgs,
@@ -5630,7 +5626,6 @@ pub async fn config_export(
     let export = client
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
-            all_releases,
             effective: false,
             resolve_rollouts,
         })
@@ -5669,7 +5664,6 @@ pub async fn config_show(
     let export = client
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
-            all_releases: false,
             effective,
             resolve_rollouts: false,
         })
@@ -5897,7 +5891,28 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
 
 /// Print a report as people read it.
 fn print_report(report: &pb::ConfigReport, dry_run: bool) {
-    if !report.errors.is_empty() {
+    // Section 10.10: an apply that stopped in its prepare phase says why
+    // and what became of each change.
+
+    let stopped = report
+        .changes
+        .iter()
+        .any(|change| !change.outcome.is_empty());
+
+    if !report.errors.is_empty() && stopped {
+        println!("muru: nothing applied:");
+
+        for error in &report.errors {
+            println!("  {error}");
+        }
+
+        for change in &report.changes {
+            println!(
+                "  {:<15} {:<24} {}",
+                change.action, change.subject, change.outcome
+            );
+        }
+    } else if !report.errors.is_empty() {
         println!("muru: nothing applied; the configuration has errors:");
 
         for error in &report.errors {
@@ -5946,12 +5961,20 @@ fn print_report(report: &pb::ConfigReport, dry_run: bool) {
     for warning in &report.warnings {
         println!("muru: warning: {warning}");
     }
+
+    if !report.snapshot_error.is_empty() {
+        println!(
+            "muru: the changes were made, but the edge did not take the new snapshot: {}",
+            report.snapshot_error
+        );
+    }
 }
 
 /// Section 10.4: 0 for no changes, 2 for changes planned, 1 for errors;
-/// after an apply, 1 when any change failed.
+/// after an apply, 1 when any change failed or the edge did not take the
+/// new snapshot.
 fn exit_code(report: &pb::ConfigReport, planning: bool) -> i32 {
-    if !report.errors.is_empty() {
+    if !report.errors.is_empty() || !report.snapshot_error.is_empty() {
         return 1;
     }
 
@@ -7068,5 +7091,29 @@ up 1 1700000000000
         assert_eq!(samples[0]["labels"]["path"], "a\"b\\c\nd");
         assert_eq!(samples[0]["labels"]["x"], "1");
         assert_eq!(samples[0]["value"], "NaN");
+    }
+
+    #[test]
+    fn an_apply_the_edge_did_not_take_exits_1() {
+        let applied = super::pb::ConfigReport {
+            applied: true,
+            changes: vec![super::pb::ConfigChange {
+                action: "update-route".to_owned(),
+                subject: "route shop /".to_owned(),
+                detail: String::new(),
+                outcome: "updated".to_owned(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(super::exit_code(&applied, false), 0);
+
+        // Issue #441: every change was made, and the edge refused the
+        // snapshot that carries them.
+
+        let refused = super::pb::ConfigReport {
+            snapshot_error: "the edge refused the snapshot: no".to_owned(),
+            ..applied
+        };
+        assert_eq!(super::exit_code(&refused, false), 1);
     }
 }

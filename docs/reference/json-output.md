@@ -83,7 +83,7 @@ $ muructl release show shop@r9 --json
 | `muructl maintenance on` | `app`, or `host` with `--host`, `on` and `since_unix_ms` |
 | `muructl maintenance off` | `app`, or `host` with `--host`, `on` and `since_unix_ms` (0) |
 | `muructl dashboard login` | The sign-in link: `url`, `code`, `expires_in_s`, and with `--token` the `token` |
-| `muructl apply` | The report: `errors`, `warnings`, `notes`, `changes`, `unchanged`, `applied`. Each change has `action`, `subject`, `detail` and, once applied, `outcome`, which for a release that failed is `failed:` and the reason |
+| `muructl apply` | The report: `errors`, `warnings`, `notes`, `changes`, `unchanged`, `applied` and `snapshot_error`, why the edge did not take the snapshot that carries the changes, which fails the apply. Each change has `action`, `subject`, `detail` and, once applied, `outcome`, which for a release that failed is `failed:` and the reason |
 | `muructl config diff` | The report, as `apply` prints it |
 | `muructl config export` | The desired state as a JSON document rather than TOML |
 | `muructl config show` | `document` (TOML), with `--effective` also `attributions` and `layers`, and where it came from: `version`, `node`, `time_unix_ms`, `state_version` |

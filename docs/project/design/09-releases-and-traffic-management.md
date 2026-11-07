@@ -54,7 +54,7 @@ Superseded releases stay warm for a retention window (default 30 minutes, or the
 | Per-route policies | Different routes of one application on different releases |
 | Shadow traffic (later) | Mirror safe requests to a candidate and discard its responses |
 
-- **Details fixed by the implementation.** An A/B cohort by header or cookie is a client class (section 4.14) whose rule matches them, given a release by a route's `traffic.classes`, which comes before a sticky cookie and the split; a cohort by bucket range is a `split` with a `salt` of its own for the experiment. Per-route policies are each route's own `traffic` table: a split giving one release 100 keeps a route on it while the application's other routes follow the serving release.
+- **Details fixed by the implementation.** An A/B cohort by header or cookie is a client class (section 4.14) whose rule matches them, given a release by a route's `traffic.classes`, which comes before a sticky cookie and the split; a cohort by bucket range is a `split` with a `salt` of its own for the experiment. Per-route policies are each route's own `traffic` table: a split giving one release 100 keeps a route on it while the application's other routes follow the serving release. A blue/green promotion by hand, by `muructl rollout bluegreen`, the dashboard, the API or an apply, is refused while a rollout of the application is under way, naming `muructl rollout promote` and `muructl rollout abort`, which end it explicitly; it would otherwise move the traffic the rollout is moving, past its gates. The rollout's own promotion of its candidate is not refused.
 
 ## 9.3 Canary gates
 

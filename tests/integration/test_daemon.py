@@ -45,8 +45,14 @@ def test_deploy_serves_and_records_the_release(daemon: Daemon) -> None:
     # A worker's own events come from its host, which the daemon hears
     # only once it has attached to it, so one may arrive after the
     # release's; the release's events are in order among themselves.
+    # release.state_changed notes how the runtime library was found, a
+    # fetch from PyPI among them, which depends on the machine.
 
-    releases = [kind for kind in daemon.events() if not kind.startswith("worker.")]
+    releases = [
+        kind
+        for kind in daemon.events()
+        if not kind.startswith("worker.") and kind != "release.state_changed"
+    ]
     assert releases[-3:] == ["release.created", "release.ready", "traffic.switched"]
 
 
@@ -442,34 +448,23 @@ def test_a_new_edge_replaces_a_worker_that_cannot_answer_it(daemon: Daemon) -> N
     assert json.loads(daemon.get("/").body)["pid"] != frozen
 
 
-def snapshot_version(daemon: Daemon) -> int:
-    """The version of the snapshot the edge was last given, from the metrics."""
-
-    text = daemon.muructl("metrics").stdout
-    return next(
-        int(line.split()[1])
-        for line in text.splitlines()
-        if line.startswith("muru_snapshot_version ")
-    )
-
-
 def test_a_deploy_pushes_one_snapshot(daemon: Daemon) -> None:
     """The host's first announcement on its control connection, taken just
     after the deploy answers, repeats the sockets the daemon already routes
     by, so it is acknowledged without another push: an apply the edge did
     not need, and one that replaced a worker busy at that moment."""
 
-    before = snapshot_version(daemon)
+    before = daemon.snapshot_version()
     assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
     daemon.wait_for_routing("shop")
-    assert snapshot_version(daemon) == before + 1
+    assert daemon.snapshot_version() == before + 1
 
     # A worker the host replaces is a change the edge must hear about.
 
     pid = json.loads(daemon.get("/").body)["pid"]
     daemon.muructl("restart", "shop", "--pid", str(pid))
     daemon.wait_for_routing("shop")
-    assert snapshot_version(daemon) == before + 2
+    assert daemon.snapshot_version() == before + 2
 
 
 def test_superseded_release_is_retained_and_rollback_is_instant(daemon: Daemon) -> None:

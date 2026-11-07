@@ -203,8 +203,9 @@ group, and each worker, for what `muructl` would do:
   pages](#looking-into-the-workers), restarting it, with `force` to kill
   it at once as `muructl restart --force` does.
 
-Deploys and rollouts stay with `muructl`, and a release an overlay
-freezes is not promoted from the page.
+Deploys and rollouts stay with `muructl`. A release an overlay freezes
+is not promoted from the page, nor is a release of an application whose
+rollout is under way.
 
 Each action is a form posted from the dashboard's own page, carrying a
 token of the session's own, so another site cannot act through a

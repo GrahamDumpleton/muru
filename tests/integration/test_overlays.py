@@ -334,8 +334,12 @@ latch = true
 
 
 def test_warm_up_starts_a_release_ahead_of_its_window(site: Site) -> None:
+    # The apply holds r1 beside r2, which serves, so it is stopped first
+    # for the warm-up to start.
+
     site.apply(OVERLAYS, prune=True)
-    assert eventually(lambda: site.state("r1") == "retained", timeout=30)
+    site.daemon.muructl("drain", "clients@r1")
+    assert site.state("r1") == "stopped"
 
     cutover = f"""
 [overlay.cutover]
