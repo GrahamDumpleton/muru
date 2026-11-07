@@ -278,9 +278,12 @@ release the daemon does not have (in id order, so the last declared
 release of an application is the one that serves, unless the
 application's [`serving` key](#which-release-serves) names another),
 creates or updates the hosts and routes, and leaves anything already
-recorded as declared alone. Releases are immutable: a declared release
-whose settings differ from the recorded ones is an error, and the file
-is applied only when it has no errors at all. Unknown
+recorded as declared alone. Id order puts ids of the form `rN` first, by
+number, so `r10` comes after `r9`, and every other id after them, by
+name: files declaring `r9` and `2026-11-06` serve `2026-11-06`.
+Releases are immutable: a declared release whose settings differ from
+the recorded ones is an error, and the file is applied only when it has
+no errors at all. Unknown
 keys, invalid names, a missing source directory and a source without an
 entrypoint are errors too. `[[listener]]` entries and the `[limits]`
 table belong in the daemon's own configuration file; in an applied file
