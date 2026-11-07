@@ -5,8 +5,8 @@
 //! certificate chain and a private key; under the daemon the certificates
 //! come with each snapshot and a [`Resolver`] picks one for each
 //! connection, by its listener, the name it asks for and the address it
-//! arrived on, so they rotate live. Each accepted connection records what was negotiated so
-//! the application sees it as `muru.tls` (appendix D).
+//! arrived on, so they rotate live. Each accepted connection records what
+//! was negotiated so the application sees it as `muru.tls` (appendix D).
 
 use std::collections::HashMap;
 use std::net::IpAddr;

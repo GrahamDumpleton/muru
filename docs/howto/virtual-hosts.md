@@ -21,9 +21,10 @@ tls = true
 
 Every host answers on every listener unless its `listeners` key names
 some. A TLS listener has no certificate of its own: it serves the
-certificates of the virtual hosts that answer on it, chosen as
-[TLS](#tls) describes. Without any listener, the daemon serves plain HTTP on 127.0.0.1:8080,
-and `muructl daemon run --listen` serves plain HTTP on one address alone.
+certificates of the virtual hosts that answer on it, chosen as [TLS](#tls)
+describes. Without any listener, the daemon serves plain HTTP on
+127.0.0.1:8080, and `muructl daemon run --listen` serves plain HTTP on one
+address alone.
 
 ## Hosts and routes
 
