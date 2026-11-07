@@ -515,8 +515,11 @@ order:
    container exits 0.
 
 All of it fits inside `--shutdown-budget`; whatever has not finished by
-then is killed. A second SIGTERM, or a second Ctrl-C, ends the delay
-early.
+then is killed. A project command running through the container, as
+`kubectl exec` starts one, gets SIGTERM when the stop begins and SIGKILL
+if it is still running when the budget ends, and the `muructl command run`
+that started it says it was stopped. A second SIGTERM, or a second Ctrl-C,
+ends the delay early.
 
 The delay is 0 by default, which suits Docker and Compose, where a
 stopping container stops receiving connections at once. Under Kubernetes

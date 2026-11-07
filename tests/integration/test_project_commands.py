@@ -43,11 +43,12 @@ run = ['python', 'tasks.py', 'hold']
 exclusive = true
 
 [tool.muru.commands.slow]
-run = ['python', 'tasks.py', 'hold']
+run = ['python', 'tasks.py', 'hold', 'tidy']
 timeout = '1s'
 """
 
 TASKS = """import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -71,7 +72,26 @@ if __name__ == "__main__":
         print("to standard error", file=sys.stderr)
         sys.exit(int(sys.argv[3]))
 
-    Path("hold.pid").write_text(str(os.getpid()))
+    # A stop is noted before the signal does what it would have done, or,
+    # tidying up, before the command exits with 0.
+
+    def stopped(signum, frame):
+        Path("hold.stopped").write_text(signal.Signals(signum).name)
+
+        if "tidy" in sys.argv:
+            sys.exit(0)
+
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    signal.signal(signal.SIGTERM, stopped)
+
+    # The pid is written under another name and renamed into place, so
+    # the test, which waits for hold.pid to appear, never reads it half
+    # written.
+
+    Path("hold.pid.part").write_text(str(os.getpid()))
+    os.replace("hold.pid.part", "hold.pid")
     print("holding", flush=True)
     time.sleep(60)
 """
@@ -208,7 +228,7 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
     assert called.returncode == 4, called.stderr
     lines = [json.loads(line) for line in called.stdout.splitlines()]
     assert lines[0]["line"] == "report to out for report"
-    assert lines[-1]["finished"] and lines[-1]["exit_code"] == 4
+    assert lines[-1]["finished"] and lines[-1]["exit_code"] == 4 and not lines[-1]["ok"]
 
     # A one-off command gets the same interpreter and environment.
 
@@ -225,12 +245,17 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
     assert one_off.returncode == 0, one_off.stderr
     assert one_off.stdout == f"{sys.executable} hello\n"
 
-    # Its timeout stops it, and so does a signal that ends muructl.
+    # Its timeout stops it, and so does a signal that ends muructl: the
+    # command gets SIGTERM, and muructl exits once it has ended. A command
+    # that exits with 0 once stopped has not succeeded. SIGHUP, as from a
+    # terminal closed, is taken as SIGINT and SIGTERM are.
 
     slow = muructl(runtime, project, "command", "run", "slow", *python)
-    assert slow.returncode == 128 + signal.SIGTERM
-    assert "ran past its timeout of 1s" in slow.stderr
+    assert slow.returncode == 1
+    assert "ran past its timeout of 1s; it exited with status 0" in slow.stderr
+    assert (project / "hold.stopped").read_text() == "SIGTERM"
     (project / "hold.pid").unlink()
+    (project / "hold.stopped").unlink()
 
     held = subprocess.Popen(
         command(runtime, project, "command", "run", "hold", *python),
@@ -245,9 +270,12 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
     try:
         wait_until((project / "hold.pid").exists, "the command never started")
         pid = int((project / "hold.pid").read_text())
-        held.send_signal(signal.SIGTERM)
-        assert held.wait(timeout=30) == 128 + signal.SIGTERM
+        held.send_signal(signal.SIGHUP)
+        _, stderr = held.communicate(timeout=30)
+        assert held.returncode == 128 + signal.SIGHUP
         assert gone(pid)
+        assert (project / "hold.stopped").read_text() == "SIGTERM"
+        assert "muru: the command stopped because muructl got SIGHUP" in stderr, stderr
     finally:
         held.kill()
 
@@ -360,5 +388,32 @@ def test_a_command_runs_through_a_development_run_of_the_project(
         assert server.wait_for_log("command.failed: hold: stopped because its caller went away"), (
             server.log()
         )
+
+        # The run stopping stops a command running through it, which gets
+        # SIGTERM, and its caller hears how it ended.
+
+        (project / "hold.pid").unlink()
+        (project / "hold.stopped").unlink()
+        held = subprocess.Popen(
+            command(runtime, project, "command", "run", "hold"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            cwd=project,
+            env=environment(runtime),
+        )
+
+        try:
+            wait_until((project / "hold.pid").exists, "the command never started")
+            pid = int((project / "hold.pid").read_text())
+            server.stop()
+            _, stderr = held.communicate(timeout=30)
+            assert held.returncode == 128 + signal.SIGTERM, stderr
+            assert "muru: the command stopped because muructl run shut down" in stderr, stderr
+            assert gone(pid)
+            assert (project / "hold.stopped").read_text() == "SIGTERM"
+        finally:
+            held.kill()
     finally:
         server.stop()

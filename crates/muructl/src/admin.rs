@@ -2975,7 +2975,10 @@ impl ReleaseArgs {
     /// These settings as the deploy request that carries them, for the
     /// application and its source, with the interpreter as the caller
     /// has it written. What says how the deploy is carried out is left
-    /// for the caller to set.
+    /// for the caller to set. No flag sets the handoff or the build's
+    /// source_builds and compile_bytecode: a deploy takes them from the
+    /// source's settings, and only a release's table in an applied file
+    /// gives them.
     pub(crate) fn request(self, app: &str, source: &str, python: String) -> pb::DeployRequest {
         pb::DeployRequest {
             app: app.to_owned(),
@@ -3006,6 +3009,9 @@ impl ReleaseArgs {
             build_extras: self.build_extra,
             build_groups: self.build_group,
             bytecode: self.bytecode.unwrap_or_default(),
+            handoff: String::new(),
+            build_source_builds: None,
+            build_compile_bytecode: None,
             processes: self.processes,
             threads: self.threads,
             sync_threads: self.sync_threads,
@@ -6482,36 +6488,50 @@ async fn run_command(
     anyhow::bail!("the daemon stopped answering before the command ended")
 }
 
-/// Print a message of a command's stream, and give its exit status when
-/// it is the last.
+/// Print a message of a command's stream, and give muructl's exit status
+/// when it is the last. Output that cannot be written, to a terminal that
+/// has gone or a pipe nothing reads, is an error rather than a panic.
 fn show_output(output: &pb::CommandOutput, json: bool) -> anyhow::Result<Option<i32>> {
     use std::io::Write as _;
 
+    let mut stdout = std::io::stdout().lock();
+
     if json {
-        println!("{}", serde_json::to_string(output)?);
+        writeln!(stdout, "{}", serde_json::to_string(output)?)?;
     } else if output.finished {
-        if output.exit_code != 0 {
-            eprintln!("muru: the command {}", output.message);
+        if !output.ok {
+            writeln!(std::io::stderr(), "muru: the command {}", output.message)?;
         }
     } else if output.stderr {
-        eprintln!("{}", output.line);
+        writeln!(std::io::stderr(), "{}", output.line)?;
     } else {
-        println!("{}", output.line);
+        writeln!(stdout, "{}", output.line)?;
     }
 
     if output.finished {
-        std::io::stdout().flush()?;
-        return Ok(Some(output.exit_code));
+        stdout.flush()?;
+        return Ok(Some(exit_status(output)));
     }
 
     Ok(None)
 }
 
+/// muructl's exit status for how a command ended: the command's own, or
+/// 1 for a command that was stopped and exited with 0 all the same.
+fn exit_status(output: &pb::CommandOutput) -> i32 {
+    if !output.ok && output.exit_code == 0 {
+        1
+    } else {
+        output.exit_code
+    }
+}
+
 /// Run a command of the project here in this process (section 9.12):
 /// nothing else is running to ask, as in a Kubernetes Job. The command
 /// gets what muructl serve and muructl run would serve the application
-/// with, and a signal that would end muructl stops it first, as a caller
-/// going away does under the daemon.
+/// with. SIGINT, SIGTERM or SIGHUP stops it as a caller going away does
+/// under the daemon, and so does output muructl can no longer write; a
+/// second signal kills it at once.
 async fn run_own(
     request: pb::RunCommandRequest,
     project: &crate::project_commands::ProjectArgs,
@@ -6524,42 +6544,117 @@ async fn run_own(
     let context = crate::project_commands::own(project).await?;
     let prepared =
         crate::project_commands::prepare(&context, request).map_err(anyhow::Error::msg)?;
+
+    // The signals are taken before the command starts, so none that comes
+    // once it has is missed.
+
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    let (signalled, signals) = tokio::sync::mpsc::unbounded_channel();
 
-    let mut output = muru_controller::commands::run(
+    tokio::spawn(async move {
+        loop {
+            let signal = tokio::select! {
+                _ = interrupt.recv() => libc::SIGINT,
+                _ = terminate.recv() => libc::SIGTERM,
+                _ = hangup.recv() => libc::SIGHUP,
+            };
+
+            if signalled.send(signal).is_err() {
+                return;
+            }
+        }
+    });
+
+    let running = muru_controller::commands::run(
         prepared,
         std::sync::Arc::new(muru_controller::commands::Unrecorded),
     )
     .map_err(anyhow::Error::msg)?;
 
-    let signalled = loop {
+    relay(running, signals, |message| show_output(message, json)).await
+}
+
+/// What ended relaying a command's output before the command ended.
+enum Interrupted {
+    /// muructl got this signal.
+    Signal(i32),
+    /// Its output could not be written.
+    Unwritable(anyhow::Error),
+}
+
+/// Relay a running command's output with `show` and give muructl's exit
+/// status. A signal, or output `show` cannot write, stops the command as
+/// at its timeout; the output is read on to the last message, which comes
+/// once the command has ended and been reaped, so muructl exits only after
+/// it. Another signal kills the command's session at once.
+async fn relay(
+    running: muru_controller::commands::Running,
+    mut signals: tokio::sync::mpsc::UnboundedReceiver<i32>,
+    mut show: impl FnMut(&pb::CommandOutput) -> anyhow::Result<Option<i32>>,
+) -> anyhow::Result<i32> {
+    let muru_controller::commands::Running {
+        mut output,
+        stopper,
+    } = running;
+
+    let interrupted = loop {
         tokio::select! {
             message = output.recv() => {
                 let Some(message) = message else {
                     anyhow::bail!("the command's end was not reported");
                 };
 
-                if let Some(code) = show_output(&message, json)? {
-                    return Ok(code);
+                match show(&message) {
+                    Ok(Some(code)) => return Ok(code),
+                    Ok(None) => {}
+                    Err(error) => {
+                        break Interrupted::Unwritable(
+                            error.context("writing the command's output"),
+                        );
+                    }
                 }
             }
-            _ = interrupt.recv() => break libc::SIGINT,
-            _ = terminate.recv() => break libc::SIGTERM,
+            Some(signal) = signals.recv() => break Interrupted::Signal(signal),
         }
     };
 
-    // The stream closed is the caller gone: the command's session gets
-    // SIGTERM and, after the grace period, SIGKILL, and the stream ends
-    // once the command has.
+    let why = match interrupted {
+        Interrupted::Signal(libc::SIGINT) => "muructl got SIGINT",
+        Interrupted::Signal(libc::SIGHUP) => "muructl got SIGHUP",
+        Interrupted::Signal(_) => "muructl got SIGTERM",
+        Interrupted::Unwritable(_) => "muructl could not write its output",
+    };
 
-    output.close();
+    stopper.stop(why);
 
-    while let Some(message) = output.recv().await {
-        show_output(&message, json)?;
+    loop {
+        tokio::select! {
+            message = output.recv() => {
+                let Some(message) = message else {
+                    anyhow::bail!("the command's end was not reported");
+                };
+
+                // After a signal the output is shown while it can be: after
+                // SIGHUP the terminal may be gone, and that does not stop
+                // muructl waiting for the command. Output that could not be
+                // written is not tried again.
+
+                if matches!(interrupted, Interrupted::Signal(_)) {
+                    let _ = show(&message);
+                }
+
+                if message.finished {
+                    return match interrupted {
+                        Interrupted::Signal(signal) => Ok(128 + signal),
+                        Interrupted::Unwritable(error) => Err(error),
+                    };
+                }
+            }
+            Some(_) = signals.recv() => stopper.kill(),
+        }
     }
-
-    Ok(128 + signalled)
 }
 
 /// What `muructl logs` takes: a release's output, or the access log,
@@ -6875,6 +6970,71 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 #[cfg(test)]
 mod tests {
     use super::metric_samples;
+
+    #[tokio::test]
+    async fn output_that_cannot_be_written_stops_the_command_and_waits_for_it() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let cleaned = dir.path().join("cleaned");
+        let script = format!(
+            "trap 'sleep 0.5; echo done > {}; exit 0' TERM; while :; do echo tick; sleep 0.1; done",
+            cleaned.display()
+        );
+        let running = muru_controller::commands::run(
+            muru_controller::commands::Prepared {
+                app: "shop".to_owned(),
+                release: String::new(),
+                label: "exec".to_owned(),
+                argv: vec!["sh".to_owned(), "-c".to_owned(), script],
+                env: Vec::new(),
+                cwd: dir.path().to_owned(),
+                identity: None,
+                log: None,
+                timeout: None,
+                declared: None,
+                exclusive: false,
+                inputs: String::new(),
+                secrets: None,
+            },
+            std::sync::Arc::new(muru_controller::commands::Unrecorded),
+        )
+        .expect("started");
+        let (_signalled, signals) = tokio::sync::mpsc::unbounded_channel();
+
+        // The first line cannot be written, as to a pipe nothing reads.
+
+        let mut tried = 0;
+        let relayed = super::relay(running, signals, |_| {
+            tried += 1;
+            Err(anyhow::anyhow!("Broken pipe (os error 32)"))
+        })
+        .await;
+
+        let error = relayed.expect_err("the output could not be written");
+        assert!(format!("{error:#}").contains("Broken pipe"), "{error:#}");
+        assert_eq!(
+            tried, 1,
+            "output that could not be written is not tried again"
+        );
+        assert!(
+            cleaned.exists(),
+            "the command was stopped with SIGTERM, and waited for"
+        );
+    }
+
+    #[test]
+    fn muructl_exits_with_the_status_or_1_for_a_stopped_command_that_exited_with_0() {
+        let ending = |exit_code, ok| super::pb::CommandOutput {
+            finished: true,
+            exit_code,
+            ok,
+            ..Default::default()
+        };
+
+        assert_eq!(super::exit_status(&ending(0, true)), 0);
+        assert_eq!(super::exit_status(&ending(3, false)), 3);
+        assert_eq!(super::exit_status(&ending(143, false)), 143);
+        assert_eq!(super::exit_status(&ending(0, false)), 1);
+    }
 
     #[test]
     fn metric_samples_carry_names_types_labels_and_values() {

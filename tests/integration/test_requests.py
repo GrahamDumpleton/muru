@@ -56,11 +56,16 @@ def test_requests_counts_queued_and_running_by_group_and_lists_them() -> None:
         assert words("requests", "--list") == "no requests in flight"
 
         # One thread, three slow requests: one runs, two queue, and the
-        # ages are as of now, from each request's arrival.
+        # ages are as of now, from each request's arrival. The first goes
+        # alone and holds the thread before the others are sent, since
+        # requests that arrive together can reach the thread in another
+        # order than the one they were stamped in (issue 423).
 
-        waiting = in_background(server, "/sleep?seconds=4", 3)
+        waiting = in_background(server, "/sleep?seconds=4", 1)
 
         try:
+            wait_for(lambda: " 1/1 " in words("requests"))
+            waiting += in_background(server, "/sleep?seconds=4", 2)
             wait_for(lambda: " 2 " in words("requests") and " 1/1 " in words("requests"))
             time.sleep(1.1)
             answer = json.loads(muructl(runtime, "requests", "--json", cwd=support.FIXTURES).stdout)
@@ -80,6 +85,12 @@ def test_requests_counts_queued_and_running_by_group_and_lists_them() -> None:
             assert [row[1] for row in rows] == ["running", "queued", "queued"], listed
             assert rows[0][2:4] == ["wsgi", "0"] and rows[1][2:4] == ["-", "-"]
             assert all(row[4:6] == ["GET", "/sleep?seconds=4"] for row in rows)
+
+            # The listing is the oldest first, by each request's arrival.
+
+            listing = muructl(runtime, "requests", "--list", "--json", cwd=support.FIXTURES)
+            ages = [int(request["age_ms"]) for request in json.loads(listing.stdout)["requests"]]
+            assert len(ages) == 3 and ages == sorted(ages, reverse=True), ages
 
             limited = muructl(
                 runtime, "requests", "--list", "--limit", "1", cwd=support.FIXTURES

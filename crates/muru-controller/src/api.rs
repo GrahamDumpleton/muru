@@ -724,14 +724,17 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
 
-        let output = crate::commands::run(
-            prepared,
-            std::sync::Arc::new(crate::commands::Recorded {
-                events: self.handle.events.clone(),
-                store: self.handle.store.clone(),
-            }),
-        )
-        .map_err(Status::failed_precondition)?;
+        let output = self
+            .handle
+            .underway
+            .run(
+                prepared,
+                std::sync::Arc::new(crate::commands::Recorded {
+                    events: self.handle.events.clone(),
+                    store: self.handle.store.clone(),
+                }),
+            )
+            .map_err(Status::failed_precondition)?;
         let stream =
             tokio_stream::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(output), Ok);
         Ok(Response::new(Box::pin(stream)))

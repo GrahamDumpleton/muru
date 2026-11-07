@@ -317,6 +317,9 @@ message DeployRequest {
   repeated string build_extras = 53;        // extras the built environment includes, beside the table's
   repeated string build_groups = 54;        // dependency groups the built environment includes, beside the table's
   string bytecode = 55;                     // section 8.2: redirect, source or off; the table's, else redirect, when empty
+  string handoff = 56;                      // section 6.14: asgi or wsgi; the table's, else the previous release's, when empty
+  optional bool build_source_builds = 57;   // section 8.2: allow sdists to be built on the node; the table's, else false, when absent
+  optional bool build_compile_bytecode = 58; // section 8.2: compile bytecode at build time; the table's, else true, when absent
 }
 
 // What a deploy would do. With refusals nothing would be deployed.
@@ -944,6 +947,7 @@ message CommandOutput {
   bool finished = 4;                // the last message: the command has ended
   int32 exit_code = 5;              // on the last message: its exit status, 128 + the signal when killed
   string message = 6;               // on the last message: how it ended, as a sentence
+  bool ok = 7;                      // on the last message: it exited with 0 and was not stopped
 }
 
 message ReopenLogsRequest {

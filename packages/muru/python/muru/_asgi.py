@@ -238,6 +238,7 @@ class Loop:
             _native.sync_pool(POOL_ASGIREF, 1)
 
     def _run(self) -> None:
+        _name_thread()
         asyncio.set_event_loop(self.loop)
         self.loop.call_soon(self.started.set)
 

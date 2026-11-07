@@ -520,6 +520,9 @@ pub struct Handle {
     pub commands: mpsc::Sender<Command>,
     /// The daemon's locations and listener, for status.
     pub info: Arc<Info>,
+    /// The commands running for the API's callers, which the daemon stops
+    /// and waits for before it exits.
+    pub underway: crate::commands::Underway,
 }
 
 /// Facts about the running daemon, for status.
@@ -1160,11 +1163,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
     });
+    let underway = crate::commands::Underway::default();
     let handle = Handle {
         store: Arc::clone(&store),
         events: events.clone(),
         commands,
         info: Arc::clone(&info),
+        underway: underway.clone(),
     };
 
     // The metrics listener (section 11.1), on an internal address.
@@ -1458,6 +1463,28 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         crate::notify::stopping();
     }
 
+    // Section 9.12: a command cannot outlive the daemon it runs under, so
+    // the commands under way are stopped as at their timeout, inside the
+    // shutdown's budget when there is one, while the rest stops. They are
+    // waited for before the API goes, so each caller hears how its
+    // command ended.
+
+    let (why, commands_deadline) = if drain_on_exit {
+        (
+            "the daemon shut down",
+            Instant::now() + daemon.shutdown.budget,
+        )
+    } else {
+        (
+            "the daemon stopped",
+            Instant::now() + crate::commands::STOP_GRACE,
+        )
+    };
+
+    let stopping_commands = tokio::spawn(async move {
+        underway.stop_all(why, commands_deadline.into()).await;
+    });
+
     if drain_on_exit {
         // The shutdown, as the stop signal and muructl daemon stop
         // --shutdown both run it, inside the policy's budget: the delay
@@ -1504,6 +1531,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // socket is unlinked; a stop command polling the socket then gets a
     // refusal straight away instead of waiting on a silent connection.
 
+    let _ = stopping_commands.await;
     let _ = api_stop.send(());
 
     if tokio::time::timeout(Duration::from_secs(5), &mut api)

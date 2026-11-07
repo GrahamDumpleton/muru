@@ -205,13 +205,15 @@ impl Record for Printed {
 }
 
 /// Start a command of the project and stream what it writes, for the
-/// admin socket of a development run or `muructl serve`.
+/// admin socket of a development run or `muructl serve`, keeping it among
+/// the commands under way that the process's shutdown stops.
 pub fn run(
     context: &Context,
     request: CommandRequest,
     record: Arc<dyn Record>,
+    underway: &muru_controller::commands::Underway,
 ) -> Result<tokio::sync::mpsc::Receiver<muru_proto::admin::v1::CommandOutput>, String> {
-    muru_controller::commands::run(prepare(context, request)?, record)
+    underway.run(prepare(context, request)?, record)
 }
 
 /// How a command finds the project when it runs on its own: the few
