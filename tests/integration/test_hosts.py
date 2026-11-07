@@ -278,6 +278,28 @@ def test_tls_listener_picks_the_certificate_by_name_and_redirects_when_asked(
     assert headers["location"] == f"https://echo.test:{secure}/info?x=1"
     assert daemon.request("/", host="shop.test").status == 200, "other hosts are not redirected"
 
+    # A host naming the address a connection arrives on is given it when
+    # the client names no host, ahead of the first host's certificate.
+
+    local_cert, local_key = certificate(tmp_path, "local", "127.0.0.1")
+    config.write_text(
+        config.read_text()
+        + f"""
+[host.local]
+names = ["127.0.0.1"]
+tls = {{ certificate = "{local_cert.name}", key = "{local_key.name}" }}
+
+[[route]]
+host = "local"
+app = "echo"
+"""
+    )
+    assert apply(daemon, config).returncode == 0
+    by_address = daemon.request(
+        "/info", host="127.0.0.1", port=secure, cafile=local_cert, server_hostname="127.0.0.1"
+    )
+    assert environ_of(by_address)["muru.tls"]["server_name"] == ""
+
 
 def test_a_replaced_certificate_is_served_once_the_host_is_applied_again(
     daemon: Daemon, tmp_path: Path

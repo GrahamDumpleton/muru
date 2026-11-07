@@ -2430,7 +2430,7 @@ pub(crate) fn host_only(host: &str) -> String {
 }
 
 /// Whether `*.suffix` matches a name: one label before the suffix.
-fn wildcard_matches(suffix: &str, name: &str) -> bool {
+pub(crate) fn wildcard_matches(suffix: &str, name: &str) -> bool {
     match name.strip_suffix(suffix) {
         Some(label) => !label.is_empty() && !label.contains('.'),
         None => false,

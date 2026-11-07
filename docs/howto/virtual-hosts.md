@@ -21,8 +21,8 @@ tls = true
 
 Every host answers on every listener unless its `listeners` key names
 some. A TLS listener has no certificate of its own: it serves the
-certificates of the virtual hosts, chosen by the name the client asks
-for. Without any listener, the daemon serves plain HTTP on 127.0.0.1:8080,
+certificates of the virtual hosts that answer on it, chosen as
+[TLS](#tls) describes. Without any listener, the daemon serves plain HTTP on 127.0.0.1:8080,
 and `muructl daemon run --listen` serves plain HTTP on one address alone.
 
 ## Hosts and routes
@@ -93,18 +93,31 @@ A host's `tls` table names its certificate chain (leaf first) and private
 key as PEM files; relative paths are taken from the file's directory. The
 daemon reads them when the host is applied, refuses the apply when they
 cannot be read or do not go together, and sends them to the edge with its
-routing snapshot, so no private key is read by the edge itself. A TLS
-listener presents the certificate of the host whose name the client asks
-for (exact, then wildcard); a client asking for no name, or a name no
-host with a certificate claims, is given the default host's certificate,
-or the first host's. A host without a `tls` table still answers on a TLS
-listener under another host's certificate when the client accepts it.
+routing snapshot, so no private key is read by the edge itself.
 
-A client connecting by IP address, as to `https://192.0.2.10/`, asks for
-no name, so it is given that certificate, which it accepts only when the
-certificate lists the address. Its request's host is then the address,
-so a host must list the address in its `names`, or be the default, for
-the request not to be refused with 421.
+A TLS listener presents the certificate of one of the hosts that answer
+on it, chosen in this order:
+
+1. The host whose name the client asks for: exact, then wildcard.
+
+2. When the client asks for no name, as one connecting by IP address
+   does, the host whose `names` include the address the connection
+   arrived on.
+
+3. The default host.
+
+4. The first host with a certificate.
+
+A listener with no host that has a certificate refuses the handshake. A
+host without a `tls` table still answers on a TLS listener under
+another host's certificate when the client accepts it.
+
+So a site reached by address, as `https://192.0.2.10/`, lists the
+address in its host's `names` and has a certificate that lists it too.
+The request's host is then the address, which selects the same host;
+without a host naming it, the request goes to the default host, or is
+refused with 421. An IPv6 address is written in brackets, as
+`"[2001:db8::10]"`.
 
 A replaced certificate file is picked up by `muructl daemon reload` (or
 SIGHUP), by an apply of a file that declares the host, changed or not,

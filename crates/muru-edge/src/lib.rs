@@ -27,7 +27,7 @@ use hyper_util::server::conn::auto;
 use muru_proto::worker::v1 as pb;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 
 pub mod access;
 pub mod auth;
@@ -697,9 +697,19 @@ impl Drainer {
     }
 }
 
+/// How a TLS listener chooses the certificate it presents.
+#[derive(Clone)]
+enum Tls {
+    /// The one certificate of a development server.
+    Single(TlsAcceptor),
+    /// The hosts' certificates under the daemon, chosen for each
+    /// connection once its ClientHello has been read.
+    Hosts(Arc<tls::Resolver>),
+}
+
 /// A bound edge, ready to run.
 pub struct Edge {
-    listeners: Vec<(TcpListener, SocketAddr, Option<TlsAcceptor>)>,
+    listeners: Vec<(TcpListener, SocketAddr, Option<Tls>)>,
     local: SocketAddr,
     shared: Arc<Shared>,
 }
@@ -720,7 +730,7 @@ impl Edge {
     /// the listening sockets and hands them to the edge process (section
     /// 2.3), so the edge can be replaced without refusing connections. TLS
     /// listeners take their certificates from the resolver, which each
-    /// snapshot fills.
+    /// snapshot fills and which chooses one for each connection.
     pub async fn adopt(
         config: Config,
         inherited: Vec<Inherited>,
@@ -730,16 +740,13 @@ impl Edge {
             !inherited.is_empty(),
             "the edge needs at least one listener"
         );
-        let tls_config = tls::server_config_with_resolver(resolver)?;
         let mut listeners = Vec::new();
 
         for inherited in inherited {
             inherited.listener.set_nonblocking(true)?;
             let listener = TcpListener::from_std(inherited.listener)?;
-            let acceptor = inherited
-                .tls
-                .then(|| TlsAcceptor::from(Arc::clone(&tls_config)));
-            listeners.push((listener, acceptor));
+            let tls = inherited.tls.then(|| Tls::Hosts(Arc::clone(&resolver)));
+            listeners.push((listener, tls));
         }
 
         Self::with_listeners(config, listeners).await
@@ -751,7 +758,7 @@ impl Edge {
 
     async fn with_listeners(
         config: Config,
-        mut listeners: Vec<(TcpListener, Option<TlsAcceptor>)>,
+        mut listeners: Vec<(TcpListener, Option<Tls>)>,
     ) -> anyhow::Result<Self> {
         let local = listeners[0].0.local_addr()?;
         let mut redirect_to = None;
@@ -771,7 +778,10 @@ impl Edge {
                 redirect_to = Some(listener.local_addr()?);
             }
 
-            listeners.push((listener, Some(TlsAcceptor::from(secure.config))));
+            listeners.push((
+                listener,
+                Some(Tls::Single(TlsAcceptor::from(secure.config))),
+            ));
         }
 
         let pools = Arc::new(Pools {
@@ -1004,7 +1014,7 @@ struct Accepting {
 async fn accept(
     listener: TcpListener,
     local: SocketAddr,
-    acceptor: Option<TlsAcceptor>,
+    acceptor: Option<Tls>,
     shared: Arc<Shared>,
     index: usize,
 ) -> anyhow::Result<()> {
@@ -1121,7 +1131,9 @@ async fn accept(
                         // before the handshake takes it.
 
                         let ja4 = ja4::peek(&stream, head_timeout).await;
-                        acceptor.accept(stream).await.map(|stream| (stream, ja4))
+                        handshake(acceptor, stream, &local)
+                            .await
+                            .map(|stream| (stream, ja4))
                     })
                     .await;
 
@@ -1161,6 +1173,32 @@ async fn accept(
             }
         }
     }
+}
+
+/// Complete a TLS handshake. Under the daemon the ClientHello is read
+/// first, so the certificate can be chosen by the listener, the name the
+/// client asks for and the address the connection arrived on.
+async fn handshake(
+    tls: Tls,
+    stream: tokio::net::TcpStream,
+    listener: &SocketAddr,
+) -> std::io::Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+    let resolver = match tls {
+        Tls::Single(acceptor) => return acceptor.accept(stream).await,
+        Tls::Hosts(resolver) => resolver,
+    };
+
+    let local = stream.local_addr()?.ip();
+    let start = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?;
+    let config = resolver
+        .config_for(
+            start.client_hello().server_name(),
+            &listener.to_string(),
+            local,
+        )
+        .ok_or_else(|| std::io::Error::other("no host on the listener has a certificate"))?;
+
+    start.into_stream(config).await
 }
 
 /// The connection preface an HTTP/2 client opens with (RFC 9113).
